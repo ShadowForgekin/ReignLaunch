@@ -2,7 +2,7 @@
 
 用 **C++17 + Win32 GDI** 从零手写的 Minecraft 启动器，无第三方 UI 框架，单窗口多页面。
 
-**v1.0.0 Beta 2** · 制作人：加纳Brightchaserove（抖音）
+**v1.0.0 Beta 3** · 制作人：加纳Brightchaserove（抖音）
 
 ![启动页](screenshots/ui_launch.jpg)
 

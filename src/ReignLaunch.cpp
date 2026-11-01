@@ -1923,7 +1923,7 @@ static void DrawAboutBlock(HDC dc) {
 
     struct AboutRow { const wchar_t* k; const wchar_t* v; };
     const AboutRow rows[] = {
-        { L"版本",   L"v1.0.0 Beta 2" },
+        { L"版本",   L"v1.0.0 Beta 3" },
         { L"制作人", L"加纳Brightchaserove（抖音）" },
         { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
         { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
