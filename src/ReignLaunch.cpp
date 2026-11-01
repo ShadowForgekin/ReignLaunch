@@ -47,6 +47,7 @@ enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, P
 // ============================ 配置 ============================
 struct Config {
     std::string gameDir;
+    bool versionIsolation = true;   // 版本隔离：gameDir 指向 versions/<id>
     std::string javaPath;
     int         maxMemMB = 4096;
     std::string playerName = "Steve";
@@ -89,7 +90,7 @@ static HWND hBtnLogin, hBtnLogout, hBtnOffline;
 
 static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
-static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave;
+static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso;
 
 // ============================ 颜色 ============================
 static const COLORREF C_BG       = RGB(24, 25, 28);
@@ -204,6 +205,7 @@ static std::string LogTail(int n = 400) {
 static void SaveConfig() {
     json j;
     j["gameDir"]       = g_cfg.gameDir;
+    j["versionIsolation"] = g_cfg.versionIsolation;
     j["javaPath"]      = g_cfg.javaPath;
     j["maxMemMB"]      = g_cfg.maxMemMB;
     j["playerName"]    = g_cfg.playerName;
@@ -223,6 +225,7 @@ static void LoadConfig() {
     try {
         json j; f >> j;
         g_cfg.gameDir        = j.value("gameDir", std::string());
+    g_cfg.versionIsolation = j.value("versionIsolation", true);
         g_cfg.javaPath       = j.value("javaPath", std::string());
         g_cfg.maxMemMB       = j.value("maxMemMB", 4096);
         g_cfg.playerName     = j.value("playerName", std::string("Steve"));
@@ -650,6 +653,13 @@ static std::string OfflineUUID(const std::string& name) {
 
 static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std::string& error) {
     fs::path mcDir = fs::u8path(g_cfg.gameDir);
+
+    // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
+    std::string gameDirEff = g_cfg.gameDir;
+    if (g_cfg.versionIsolation) {
+        fs::path isoDir = mcDir / L"versions" / fs::u8path(versionId);
+        if (DirExists(isoDir)) gameDirEff = WToU8(isoDir.wstring());
+    }
     json vj = ResolveVersion(versionId);
     if (!vj.is_object()) { error = "版本 JSON 读取或解析失败"; return false; }
 
@@ -736,7 +746,7 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
     std::map<std::string, std::string> ph;
     ph["auth_player_name"]   = userName;
     ph["version_name"]       = versionId;
-    ph["game_directory"]     = g_cfg.gameDir;
+    ph["game_directory"]     = gameDirEff;
     ph["assets_root"]        = WToU8((mcDir / L"assets").wstring());
     ph["assets_index_name"]  = assetIndex;
     ph["auth_uuid"]          = userUuid;
@@ -812,7 +822,7 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
     for (auto& a : gameArgs) cmd += L" " + U8ToW(QuoteIfNeeded(a));
 
     plan.commandLine = cmd;
-    plan.workDir = U8ToW(g_cfg.gameDir);
+    plan.workDir = U8ToW(gameDirEff);
     plan.javaPath = U8ToW(javaExe);
     return true;
 }
@@ -822,6 +832,13 @@ struct DownloadStats { int existed = 0, downloaded = 0, failed = 0; };
 
 static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
     fs::path mcDir = fs::u8path(g_cfg.gameDir);
+
+    // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
+    std::string gameDirEff = g_cfg.gameDir;
+    if (g_cfg.versionIsolation) {
+        fs::path isoDir = mcDir / L"versions" / fs::u8path(versionId);
+        if (DirExists(isoDir)) gameDirEff = WToU8(isoDir.wstring());
+    }
     fs::path libRoot = mcDir / L"libraries";
     json vj = ResolveVersion(versionId);
     if (!vj.is_object()) { st.failed++; return; }
@@ -911,6 +928,13 @@ static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
 // 启动前快速检查：只查文件是否存在，不做哈希校验（快）
 static int CountMissing(const std::string& versionId) {
     fs::path mcDir = fs::u8path(g_cfg.gameDir);
+
+    // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
+    std::string gameDirEff = g_cfg.gameDir;
+    if (g_cfg.versionIsolation) {
+        fs::path isoDir = mcDir / L"versions" / fs::u8path(versionId);
+        if (DirExists(isoDir)) gameDirEff = WToU8(isoDir.wstring());
+    }
     fs::path libRoot = mcDir / L"libraries";
     json vj = ResolveVersion(versionId);
     if (!vj.is_object()) return -1;
@@ -1167,6 +1191,7 @@ static std::string        g_loginErr;
 #define ID_BTN_JAVADROP  1316
 #define ID_BTN_INSTARROW 1317
 #define ID_BTN_SAVE     1320
+#define ID_BTN_ISO      1321
 
 static void FillRoundRect(HDC dc, RECT r, int radius, COLORREF color) {
     HRGN rgn = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
@@ -1305,6 +1330,7 @@ static void LayoutControls() {
         MoveWindow(hEdMem,  x + Scale(110), y + rowH * 2, Scale(110), edH, TRUE);
 
         MoveWindow(hBtnSave, x + Scale(110), y + rowH * 3 + Scale(10), Scale(140), Scale(40), TRUE);
+        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 3 + Scale(10), Scale(170), Scale(40), TRUE);
     }
 }
 
@@ -1330,7 +1356,7 @@ static void ShowPage(Page p) {
 
     ShowWindow(hEdDir, S); ShowWindow(hBtnAutoDir, S); ShowWindow(hBtnBrowseDir, S); ShowWindow(hBtnDirDrop, S);
     ShowWindow(hEdJava, S); ShowWindow(hBtnAutoJava, S); ShowWindow(hBtnBrowseJava, S); ShowWindow(hBtnJavaDrop, S);
-    ShowWindow(hEdMem, S); ShowWindow(hBtnSave, S);
+    ShowWindow(hEdMem, S); ShowWindow(hBtnSave, S); ShowWindow(hBtnIso, S);
 
     LayoutControls();
     SyncSettingsVisibility();
@@ -1462,6 +1488,7 @@ static void SyncSettingsVisibility() {
     ShowWindow(hBtnBrowseJava, onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hEdMem,   onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnSave, onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnIso,  onSettings ? SW_SHOW : SW_HIDE);
 }
 static void DrawCandList(HDC dc, bool isDir) {
     const std::vector<Cand>& list = isDir ? g_dirCands : g_javaCands;
@@ -1944,6 +1971,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnBrowseJava = MakeBtn(hwnd, L"浏览", ID_BTN_BROWSEJAVA);
         hBtnJavaDrop   = MakeBtn(hwnd, L"▾", ID_BTN_JAVADROP);
         hBtnSave       = MakeBtn(hwnd, L"保存设置", ID_BTN_SAVE);
+        hBtnIso        = MakeBtn(hwnd, g_cfg.versionIsolation ? L"版本隔离：开" : L"版本隔离：关", ID_BTN_ISO);
 
         SetTimer(hwnd, 1, 300, nullptr);
         return 0;
@@ -2241,7 +2269,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         }
-        case ID_BTN_SAVE: {
+        case ID_BTN_ISO: {
+        g_cfg.versionIsolation = !g_cfg.versionIsolation;
+        SetWindowTextW(hBtnIso, g_cfg.versionIsolation ? L"版本隔离：开" : L"版本隔离：关");
+        SaveConfig();
+        g_status = g_cfg.versionIsolation
+            ? L"版本隔离已开启（模组读 versions\\<版本>\\mods）"
+            : L"版本隔离已关闭（模组读 .minecraft\\mods）";
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+    }
+
+    case ID_BTN_SAVE: {
             g_cfg.gameDir = WToU8(CtlText(hEdDir));
             g_cfg.javaPath = WToU8(CtlText(hEdJava));
             g_cfg.playerName = WToU8(CtlText(hEdName));
