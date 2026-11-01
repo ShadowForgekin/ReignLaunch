@@ -24,6 +24,9 @@
 - 用 `java.exe` + `CREATE_NO_WINDOW` 启动：**不弹黑窗口**，但能抓到完整日志
 
 ### 账号
+- 用户页左侧账户卡片：皮肤头像 + 名字 + 登录方式
+- **更换皮肤**：选 64x64 / 64x32 的 PNG，自动存到 `%APPDATA%\ReignLaunch\skins\` 并写入
+  `.minecraft\CustomSkinLoader\LocalSkin\textures\<玩家名>.png`（装了 CustomSkinLoader 就能在游戏里看到）
 - **离线模式**：UUID = `MD5("OfflinePlayer:名字")` + version 3 / variant 位，与官方一致
 - **第三方登录**：标准 Yggdrasil（`POST {server}/authserver/authenticate`），自动注入
   `-javaagent:authlib-injector.jar=<服务器>`（jar 已编译进 exe，运行时不需外部文件）

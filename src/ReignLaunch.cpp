@@ -14,6 +14,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -49,6 +51,7 @@ enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, P
 // ============================ 配置 ============================
 struct Config {
     std::string gameDir;
+    std::string skinPath;   // 当前皮肤 PNG
     int  isoMode = 0;               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
     std::string javaPath;
     int         maxMemMB = 4096;
@@ -78,6 +81,9 @@ static std::atomic<int> g_progTotal{ 0 };
 static bool g_overlay = false;                       // 启动浮层
 static std::atomic<int>  g_stepCur{ 0 };             // 已完成步骤 0..4
 static std::atomic<bool> g_cancelLaunch{ false };
+static ULONG_PTR g_gpToken = 0;
+static bool      g_gpOk = false;
+static HBITMAP   g_skinBmp = nullptr;
 static DWORD g_overlayDoneTick = 0;   // 全部步骤完成的时刻，用于自动收起浮层
 static int         g_dpi = 96;
 
@@ -97,7 +103,7 @@ static RECT OverlayCardRect();
 static void ApplyOverlayVisibility();
 
 static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
-static HWND hBtnLogin, hBtnLogout, hBtnOffline;
+static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin;
 
 static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
@@ -218,6 +224,7 @@ static void SaveConfig() {
     json j;
     j["gameDir"]       = g_cfg.gameDir;
     j["isoMode"] = g_cfg.isoMode;
+    j["skinPath"] = g_cfg.skinPath;
     j["javaPath"]      = g_cfg.javaPath;
     j["maxMemMB"]      = g_cfg.maxMemMB;
     j["playerName"]    = g_cfg.playerName;
@@ -238,6 +245,7 @@ static void LoadConfig() {
         json j; f >> j;
         g_cfg.gameDir        = j.value("gameDir", std::string());
     g_cfg.isoMode = j.value("isoMode", 0);
+    g_cfg.skinPath = j.value("skinPath", std::string());
     if (j.contains("versionIsolation"))            // 兼容上一版布尔配置
         g_cfg.isoMode = j.value("versionIsolation", true) ? 0 : 2;
         g_cfg.javaPath       = j.value("javaPath", std::string());
@@ -1321,6 +1329,7 @@ static std::string        g_loginErr;
 #define ID_BTN_JAVADROP  1316
 #define ID_BTN_INSTARROW 1317
 #define ID_BTN_OVCANCEL  1330
+#define ID_BTN_SKIN      1340
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1444,6 +1453,9 @@ static void LayoutControls() {
         MoveWindow(hBtnLogout, x + Scale(246), y + rowH * 3, Scale(140), Scale(36), TRUE);
         MoveWindow(hEdName, x + Scale(110), y + rowH * 4 + Scale(16), Scale(240), edH, TRUE);
         MoveWindow(hBtnOffline, x + Scale(366), y + rowH * 4 + Scale(14), Scale(110), Scale(34), TRUE);
+
+        RECT sb = g_ly.sidebar;
+        MoveWindow(hBtnSkin, sb.left + Scale(12), sb.top + Scale(134), (sb.right - sb.left) - Scale(24), Scale(36), TRUE);
     }
 
     // 设置页
@@ -1493,7 +1505,7 @@ static void ShowPage(Page p) {
     ApplyOverlayVisibility();
 
     ShowWindow(hEdServer, U); ShowWindow(hEdUser, U); ShowWindow(hEdPass, U);
-    ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U);
+    ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U); ShowWindow(hBtnSkin, U);
 
     ShowWindow(hEdDir, S); ShowWindow(hBtnAutoDir, S); ShowWindow(hBtnBrowseDir, S); ShowWindow(hBtnDirDrop, S);
     ShowWindow(hEdJava, S); ShowWindow(hBtnAutoJava, S); ShowWindow(hBtnBrowseJava, S); ShowWindow(hBtnJavaDrop, S);
@@ -1505,6 +1517,77 @@ static void ShowPage(Page p) {
 }
 
 // ---------------- 绘制 ----------------
+// ============================ 皮肤 ============================
+static void LoadSkinBitmap() {
+    if (g_skinBmp) { DeleteObject(g_skinBmp); g_skinBmp = nullptr; }
+    if (!g_gpOk || g_cfg.skinPath.empty()) return;
+    std::wstring wp = U8ToW(g_cfg.skinPath);
+    Gdiplus::Bitmap bmp(wp.c_str());
+    if (bmp.GetLastStatus() != Gdiplus::Ok) return;
+    HBITMAP hb = nullptr;
+    if (bmp.GetHBITMAP(Gdiplus::Color(0, 0, 0, 0), &hb) == Gdiplus::Ok) g_skinBmp = hb;
+}
+
+// 画头像（取 64x64 皮肤的头部正面 8x8 区域）
+static void DrawAvatar(HDC dc, int x, int y, int size) {
+    if (g_skinBmp) {
+        HDC src = CreateCompatibleDC(dc);
+        HBITMAP old = (HBITMAP)SelectObject(src, g_skinBmp);
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchBlt(dc, x, y, size, size, src, 8, 8, 8, 8, SRCCOPY);
+        SelectObject(src, old);
+        DeleteDC(src);
+    } else {
+        RECT r = { x, y, x + size, y + size };
+        HBRUSH b = CreateSolidBrush(RGB(72, 76, 86));
+        FillRect(dc, &r, b);
+        DeleteObject(b);
+    }
+}
+
+static std::string CurrentPlayerName() {
+    return (g_cfg.authType == "thirdparty" && !g_cfg.authName.empty()) ? g_cfg.authName : g_cfg.playerName;
+}
+
+// 应用皮肤：校验尺寸 -> 存到配置目录 -> 写入 CustomSkinLoader 本地皮肤
+static bool ApplySkin(const std::string& srcPath, std::wstring& err) {
+    std::wstring wp = U8ToW(srcPath);
+    if (g_gpOk) {
+        Gdiplus::Bitmap bmp(wp.c_str());
+        if (bmp.GetLastStatus() != Gdiplus::Ok) { err = L"无法读取该图片"; return false; }
+        int w = (int)bmp.GetWidth(), h = (int)bmp.GetHeight();
+        if (!((w == 64 && h == 64) || (w == 64 && h == 32))) {
+            err = L"皮肤必须是 64x64 或 64x32 的 PNG";
+            return false;
+        }
+    }
+
+    wchar_t appdata[MAX_PATH] = { 0 };
+    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
+    fs::path skins = fs::path(appdata) / L"ReignLaunch" / L"skins";
+    std::error_code ec;
+    fs::create_directories(skins, ec);
+
+    std::string player = CurrentPlayerName();
+    if (player.empty()) player = "player";
+
+    fs::path local = skins / fs::u8path(player + ".png");
+    fs::copy_file(fs::u8path(srcPath), local, fs::copy_options::overwrite_existing, ec);
+    if (ec) { err = L"保存皮肤失败"; return false; }
+
+    // CustomSkinLoader 本地皮肤（装了 CSL 模组就能在游戏里看到）
+    if (!g_cfg.gameDir.empty()) {
+        fs::path csl = fs::u8path(g_cfg.gameDir) / L"CustomSkinLoader" / L"LocalSkin" / L"textures";
+        fs::create_directories(csl, ec);
+        fs::copy_file(local, csl / fs::u8path(player + ".png"), fs::copy_options::overwrite_existing, ec);
+    }
+
+    g_cfg.skinPath = WToU8(local.wstring());
+    SaveConfig();
+    LoadSkinBitmap();
+    return true;
+}
 // ---------------- 检测候选列表 ----------------
 struct Cand { std::string path; std::string label; };
 static std::vector<Cand> g_dirCands, g_javaCands;
@@ -1926,6 +2009,31 @@ static void PaintMain(HDC dc, int w, int h) {
         }
     }
     else if (g_page == PAGE_USER) {
+        // 左侧账户卡片
+        {
+            RECT sb = g_ly.sidebar;
+            HBRUSH bg = CreateSolidBrush(RGB(30, 31, 35));
+            FillRect(dc, &sb, bg);
+            DeleteObject(bg);
+
+            RECT lb = { sb.left + Scale(20), sb.top + Scale(12), sb.right, sb.top + Scale(36) };
+            DrawTextIn(dc, L"账户", lb, C_DIM, g_fSmall);
+
+            RECT card = { sb.left + Scale(12), sb.top + Scale(46), sb.right - Scale(12), sb.top + Scale(46) + Scale(76) };
+            FillRoundRect(dc, card, 8, C_CARD_SEL);
+            DrawAvatar(dc, card.left + Scale(12), card.top + Scale(12), Scale(52));
+
+            std::wstring nm = U8ToW(CurrentPlayerName());
+            RECT n1 = { card.left + Scale(76), card.top + Scale(12), card.right - Scale(8), card.top + Scale(38) };
+            DrawTextIn(dc, nm, n1, C_TEXT, g_fUi);
+
+            std::wstring ty = (g_cfg.authType == "thirdparty")
+                ? (L"外置登录 · " + U8ToW(g_cfg.authServer))
+                : L"离线模式";
+            RECT n2 = { card.left + Scale(76), card.top + Scale(40), card.right - Scale(8), card.top + Scale(64) };
+            DrawTextIn(dc, ty, n2, C_DIM, g_fSmall);
+        }
+
         int panelW = Scale(620);
         int x = g_ly.main.left + (g_ly.main.right - g_ly.main.left - panelW) / 2;
         if (x < g_ly.main.left + Scale(20)) x = g_ly.main.left + Scale(20);
@@ -2239,6 +2347,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnLogin = MakeBtn(hwnd, L"登录", ID_BTN_LOGIN);
         hBtnLogout= MakeBtn(hwnd, L"退出登录", ID_BTN_LOGOUT);
         hBtnOffline = MakeBtn(hwnd, L"使用离线", ID_BTN_OFFLINE);
+        hBtnSkin    = MakeBtn(hwnd, L"更换皮肤", ID_BTN_SKIN);
 
         hEdDir  = MakeEdit(hwnd, ID_ED_DIR, U8ToW(g_cfg.gameDir).c_str());
         hEdJava = MakeEdit(hwnd, ID_ED_JAVA, U8ToW(g_cfg.javaPath).c_str());
@@ -2475,7 +2584,29 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
 
-        case ID_BTN_LOGIN: {
+        case ID_BTN_SKIN: {
+        OPENFILENAMEW ofn{};
+        wchar_t file[MAX_PATH] = L"";
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = L"皮肤 PNG (*.png)\0*.png\0所有文件\0*.*\0";
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&ofn)) break;
+
+        std::wstring err;
+        if (ApplySkin(WToU8(file), err)) {
+            g_status = L"皮肤已应用：" + fs::u8path(g_cfg.skinPath).filename().wstring();
+        } else {
+            g_status = L"更换皮肤失败：" + err;
+            MessageBoxW(hwnd, err.c_str(), L"更换皮肤", MB_OK | MB_ICONWARNING);
+        }
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+    }
+
+    case ID_BTN_LOGIN: {
             if (g_loginState == 1) return 0;
             std::string srv  = WToU8(CtlText(hEdServer));
             std::string user = WToU8(CtlText(hEdUser));
@@ -2736,6 +2867,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int) {
     }
     g_dataDir = WToU8(fs::path(g_cfgPath).parent_path().wstring());
     LoadConfig();
+
+    Gdiplus::GdiplusStartupInput gpsi;
+    g_gpOk = (Gdiplus::GdiplusStartup(&g_gpToken, &gpsi, nullptr) == Gdiplus::Ok);
+    LoadSkinBitmap();
 
     if (g_cfg.gameDir.empty()) g_cfg.gameDir = DetectGameDir();
     if (g_cfg.javaPath.empty()) g_cfg.javaPath = DetectJava();
