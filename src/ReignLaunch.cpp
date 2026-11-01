@@ -42,7 +42,7 @@ using json = nlohmann::json;
 #define IDI_APP         100   // 应用图标
 
 // ============================ 页面 ============================
-enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3 };
+enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, PAGE_INSTANCES = 4 };
 
 // ============================ 配置 ============================
 struct Config {
@@ -81,7 +81,7 @@ static HWND g_hwnd = nullptr;
 static HFONT g_fTitle = nullptr, g_fUi = nullptr, g_fSmall = nullptr;
 
 // ============================ 控件 ============================
-static HWND hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout;
+static HWND hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout, hBtnTabInst;
 static HWND hBtnLaunch, hBtnFill, hBtnRefresh, hBtnInstArrow;
 
 static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
@@ -1145,6 +1145,7 @@ static std::string        g_loginErr;
 #define ID_TAB_USER     1002
 #define ID_TAB_SET      1003
 #define ID_TAB_ABOUT    1004
+#define ID_TAB_INST     1005
 #define ID_BTN_LAUNCH   1101
 #define ID_BTN_FILL     1102
 #define ID_BTN_REFRESH  1103
@@ -1222,7 +1223,7 @@ static RECT TabRect(int i) {
 static RECT LaunchBtnRect() {
     int pad = Scale(24), bw = Scale(260), bh = Scale(64);
     RECT r;
-    r.right = g_ly.main.right - pad;
+    r.right = g_ly.main.right - pad - Scale(52);
     r.left = r.right - bw;
     r.bottom = g_ly.main.bottom - pad;
     r.top = r.bottom - bh;
@@ -1245,8 +1246,8 @@ static void LayoutControls() {
     int w = g_ly.content.right, h = g_ly.content.bottom;
 
     // 顶部标签
-    HWND tabBtns[3] = { hBtnTabLaunch, hBtnTabUser, hBtnTabSettings };
-    for (int i = 0; i < 3; ++i) {
+    HWND tabBtns[4] = { hBtnTabLaunch, hBtnTabInst, hBtnTabUser, hBtnTabSettings };
+    for (int i = 0; i < 4; ++i) {
         RECT r = TabRect(i);
         MoveWindow(tabBtns[i], r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
     }
@@ -1255,7 +1256,7 @@ static void LayoutControls() {
     {
         RECT b = LaunchBtnRect();
         MoveWindow(hBtnLaunch, b.left, b.top, b.right - b.left, b.bottom - b.top, TRUE);
-        MoveWindow(hBtnInstArrow, b.left - Scale(52), b.top, Scale(44), b.bottom - b.top, TRUE);
+        MoveWindow(hBtnInstArrow, b.right + Scale(8), b.top, Scale(44), b.bottom - b.top, TRUE);
         RECT s0 = SmallBtnRect(0), s1 = SmallBtnRect(1);
         MoveWindow(hBtnFill, s0.left, s0.top, s0.right - s0.left, s0.bottom - s0.top, TRUE);
         MoveWindow(hBtnRefresh, s1.left, s1.top, s1.right - s1.left, s1.bottom - s1.top, TRUE);
@@ -1318,6 +1319,7 @@ static void ShowPage(Page p) {
     ShowWindow(hBtnTabLaunch, SW_SHOW);
     ShowWindow(hBtnTabUser, SW_SHOW);
     ShowWindow(hBtnTabSettings, SW_SHOW);
+    ShowWindow(hBtnTabInst, SW_SHOW);
 
 
 
@@ -1573,50 +1575,12 @@ static void PaintMain(HDC dc, int w, int h) {
 
     // 当前页标题
     RECT pt = { g_ly.main.left + Scale(40), g_ly.content.top + Scale(12), g_ly.main.right, g_ly.content.top + Scale(44) };
-    const wchar_t* titles[] = { L"", L"用户", L"设置", L"关于" };
+    const wchar_t* titles[] = { L"", L"用户", L"设置", L"关于", L"" };
     if (g_page != PAGE_LAUNCH && g_page != PAGE_ABOUT) DrawTextIn(dc, titles[g_page], pt, C_DIM, g_fSmall);
 
     if (g_page == PAGE_LAUNCH) {
-        // 侧栏
-        RECT sb = g_ly.sidebar;
-        HBRUSH sbb = CreateSolidBrush(RGB(30, 31, 35));
-        FillRect(dc, &sb, sbb);
-        DeleteObject(sbb);
-
-        RECT lbl = { sb.left + Scale(20), sb.top + Scale(12), sb.right, sb.top + Scale(36) };
-        DrawTextIn(dc, L"实例 (" + std::to_wstring(g_versions.size()) + L")", lbl, C_DIM, g_fSmall);
-
-        std::wstring curInst = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
-            ? U8ToW(g_versions[g_selVersion]) : std::wstring(L"（未选择）");
-        RECT curLbl = { sb.left + Scale(20), sb.top + Scale(32), sb.right - Scale(12), sb.top + Scale(64) };
-        DrawTextIn(dc, curInst, curLbl, C_TEXT, g_fUi);
-
-        int itemH = Scale(46);
-        int y = sb.top + Scale(86) - g_listScroll;
-        for (size_t i = 0; i < g_versions.size(); ++i) {
-            RECT item = { sb.left + Scale(12), y, sb.right - Scale(12), y + itemH - Scale(8) };
-            if (item.bottom > sb.top + Scale(86) && item.top < sb.bottom) {
-                bool sel = ((int)i == g_selVersion);
-                FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                RECT tx = item; tx.left += Scale(14);
-                DrawTextIn(dc, U8ToW(g_versions[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
-                if (sel) {
-                    RECT bar = { item.left, item.top + Scale(8), item.left + Scale(3), item.bottom - Scale(8) };
-                    HBRUSH b = CreateSolidBrush(C_ACCENT2);
-                    FillRect(dc, &bar, b);
-                    DeleteObject(b);
-                }
-            }
-            y += itemH;
-        }
-        if (g_versions.empty()) {
-            RECT e = { sb.left + Scale(20), sb.top + Scale(60), sb.right - Scale(20), sb.top + Scale(150) };
-            DrawTextIn(dc, L"没有找到版本\n请到【设置】里\n指定 .minecraft 目录", e, C_DIM, g_fSmall,
-                       DT_LEFT | DT_TOP | DT_WORDBREAK);
-        }
-
         // 主区信息
-        int x = g_ly.main.left + Scale(40);
+        int x = g_ly.content.left + Scale(40);
         RECT l1 = { x, g_ly.content.top + Scale(40), g_ly.main.right, g_ly.content.top + Scale(66) };
         DrawTextIn(dc, L"启动设置", l1, C_DIM, g_fSmall);
 
@@ -1686,6 +1650,37 @@ static void PaintMain(HDC dc, int w, int h) {
         DrawTextIn(dc, L"支持 authlib-injector 协议的认证服务器（如 LittleSkin）。\n"
                        L"authlib-injector 已内置在程序里，无需外部 jar。",
                    hint, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    }
+    else if (g_page == PAGE_INSTANCES) {
+        int x   = g_ly.content.left + Scale(24);
+        int top = g_ly.content.top + Scale(16);
+
+        RECT lbl = { x, top, g_ly.content.right - Scale(24), top + Scale(26) };
+        DrawTextIn(dc, L"实例 (" + std::to_wstring(g_versions.size()) + L")", lbl, C_DIM, g_fSmall);
+
+        int itemH = Scale(56);
+        int y = top + Scale(34) - g_listScroll;
+        for (size_t i = 0; i < g_versions.size(); ++i) {
+            RECT item = { x, y, g_ly.content.right - Scale(24), y + itemH - Scale(8) };
+            if (item.bottom > top + Scale(34) && item.top < g_ly.content.bottom) {
+                bool sel = ((int)i == g_selVersion);
+                FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
+                RECT tx = item; tx.left += Scale(16); tx.right -= Scale(12);
+                DrawTextIn(dc, U8ToW(g_versions[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
+                if (sel) {
+                    RECT bar = { item.left, item.top + Scale(8), item.left + Scale(3), item.bottom - Scale(8) };
+                    HBRUSH b = CreateSolidBrush(C_ACCENT2);
+                    FillRect(dc, &bar, b);
+                    DeleteObject(b);
+                }
+            }
+            y += itemH;
+        }
+        if (g_versions.empty()) {
+            RECT e = { x, top + Scale(50), g_ly.content.right - Scale(24), top + Scale(140) };
+            DrawTextIn(dc, L"没有找到实例\n请到【设置】里指定 .minecraft 目录", e, C_DIM, g_fSmall,
+                       DT_LEFT | DT_TOP | DT_WORDBREAK);
+        }
     }
     else if (g_page == PAGE_ABOUT) {
         DrawAboutBlock(dc);
@@ -1923,6 +1918,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnTabUser     = MakeBtn(hwnd, L"用户", ID_TAB_USER);
         hBtnTabSettings = MakeBtn(hwnd, L"设置", ID_TAB_SET);
         hBtnTabAbout    = MakeBtn(hwnd, L"关于", ID_TAB_ABOUT);
+        hBtnTabInst     = MakeBtn(hwnd, L"实例", ID_TAB_INST);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnFill    = MakeBtn(hwnd, L"补全文件", ID_BTN_FILL);
@@ -1989,11 +1985,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         int id = (int)d->CtlID;
         bool accent = (id == ID_BTN_LAUNCH || id == ID_BTN_LOGIN || id == ID_BTN_SAVE);
-        bool tab = (id == ID_TAB_LAUNCH || id == ID_TAB_USER || id == ID_TAB_SET || id == ID_TAB_ABOUT);
+        bool tab = (id == ID_TAB_LAUNCH || id == ID_TAB_USER || id == ID_TAB_SET || id == ID_TAB_ABOUT || id == ID_TAB_INST);
         bool activeTab = tab && ((id == ID_TAB_LAUNCH && g_page == PAGE_LAUNCH) ||
                                  (id == ID_TAB_USER && g_page == PAGE_USER) ||
                                  (id == ID_TAB_SET && g_page == PAGE_SETTINGS) ||
-                                 (id == ID_TAB_ABOUT && g_page == PAGE_ABOUT));
+                                 (id == ID_TAB_ABOUT && g_page == PAGE_ABOUT) ||
+                                 (id == ID_TAB_INST && g_page == PAGE_INSTANCES));
 
         COLORREF bg;
         if (accent) bg = (g_launching && id == ID_BTN_LAUNCH) ? C_CARD : (sel ? RGB(29, 78, 216) : C_ACCENT);
@@ -2055,6 +2052,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
+        if (g_page == PAGE_INSTANCES) {
+            int itemH = Scale(56);
+            int top = g_ly.content.top + Scale(16) + Scale(34);
+            if (pt.y >= top) {
+                int idx = (pt.y - top + g_listScroll) / itemH;
+                if (idx >= 0 && idx < (int)g_versions.size()) {
+                    g_selVersion = idx;
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+            }
+            return 0;
+        }
+
         if (g_page != PAGE_LAUNCH) return 0;
 
         // 版本列表点击
@@ -2092,6 +2102,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_TAB_USER:   ShowPage(PAGE_USER);   break;
         case ID_TAB_SET:    ShowPage(PAGE_SETTINGS); break;
         case ID_TAB_ABOUT:  ShowPage(PAGE_ABOUT);    break;
+        case ID_TAB_INST:   ShowPage(PAGE_INSTANCES); break;
 
         case ID_BTN_REFRESH:
             ScanVersions();
