@@ -47,7 +47,7 @@ enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, P
 // ============================ 配置 ============================
 struct Config {
     std::string gameDir;
-    bool versionIsolation = true;   // 版本隔离：gameDir 指向 versions/<id>
+    int  isoMode = 0;               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
     std::string javaPath;
     int         maxMemMB = 4096;
     std::string playerName = "Steve";
@@ -205,7 +205,7 @@ static std::string LogTail(int n = 400) {
 static void SaveConfig() {
     json j;
     j["gameDir"]       = g_cfg.gameDir;
-    j["versionIsolation"] = g_cfg.versionIsolation;
+    j["isoMode"] = g_cfg.isoMode;
     j["javaPath"]      = g_cfg.javaPath;
     j["maxMemMB"]      = g_cfg.maxMemMB;
     j["playerName"]    = g_cfg.playerName;
@@ -225,7 +225,9 @@ static void LoadConfig() {
     try {
         json j; f >> j;
         g_cfg.gameDir        = j.value("gameDir", std::string());
-    g_cfg.versionIsolation = j.value("versionIsolation", true);
+    g_cfg.isoMode = j.value("isoMode", 0);
+    if (j.contains("versionIsolation"))            // 兼容上一版布尔配置
+        g_cfg.isoMode = j.value("versionIsolation", true) ? 0 : 2;
         g_cfg.javaPath       = j.value("javaPath", std::string());
         g_cfg.maxMemMB       = j.value("maxMemMB", 4096);
         g_cfg.playerName     = j.value("playerName", std::string("Steve"));
@@ -651,14 +653,49 @@ static std::string OfflineUUID(const std::string& name) {
     return hex.substr(0,8) + "-" + hex.substr(8,4) + "-" + hex.substr(12,4) + "-" + hex.substr(16,4) + "-" + hex.substr(20,12);
 }
 
+// 判断实例是否算「模组实例」：有 mods 里的 jar，或版本 id / 主类带加载器名
+static bool IsModdedInstance(const std::string& id, const fs::path& mcDir) {
+    fs::path vd = mcDir / L"versions" / fs::u8path(id);
+    std::error_code ec;
+    fs::path mods = vd / L"mods";
+    if (DirExists(mods)) {
+        for (auto& e : fs::directory_iterator(mods, ec)) {
+            std::wstring n = e.path().filename().wstring();
+            if (n.size() > 4 && n.substr(n.size() - 4) == L".jar") return true;
+        }
+    }
+    std::string low = id;
+    for (auto& c : low) c = (char)tolower((unsigned char)c);
+    if (low.find("forge") != std::string::npos || low.find("fabric") != std::string::npos ||
+        low.find("quilt") != std::string::npos || low.find("neoforge") != std::string::npos)
+        return true;
+
+    std::string vjson = WToU8((vd / L"json").wstring());
+    std::ifstream vf{ fs::u8path(vjson) };
+    if (vf) {
+        std::stringstream ss; ss << vf.rdbuf();
+        std::string body = ss.str();
+        for (auto& c : body) c = (char)tolower((unsigned char)c);
+        if (body.find("net.minecraftforge") != std::string::npos ||
+            body.find("net.fabricmc") != std::string::npos ||
+            body.find("net.neoforged") != std::string::npos) return true;
+    }
+    return false;
+}
+
+static bool ShouldIsolate(const std::string& id, const fs::path& mcDir) {
+    if (g_cfg.isoMode == 2) return false;
+    if (!DirExists(mcDir / L"versions" / fs::u8path(id))) return false;
+    if (g_cfg.isoMode == 1) return IsModdedInstance(id, mcDir);
+    return true;
+}
 static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std::string& error) {
     fs::path mcDir = fs::u8path(g_cfg.gameDir);
 
     // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
     std::string gameDirEff = g_cfg.gameDir;
-    if (g_cfg.versionIsolation) {
-        fs::path isoDir = mcDir / L"versions" / fs::u8path(versionId);
-        if (DirExists(isoDir)) gameDirEff = WToU8(isoDir.wstring());
+    if (ShouldIsolate(versionId, mcDir)) {
+        gameDirEff = WToU8((mcDir / L"versions" / fs::u8path(versionId)).wstring());
     }
     json vj = ResolveVersion(versionId);
     if (!vj.is_object()) { error = "版本 JSON 读取或解析失败"; return false; }
@@ -835,9 +872,8 @@ static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
 
     // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
     std::string gameDirEff = g_cfg.gameDir;
-    if (g_cfg.versionIsolation) {
-        fs::path isoDir = mcDir / L"versions" / fs::u8path(versionId);
-        if (DirExists(isoDir)) gameDirEff = WToU8(isoDir.wstring());
+    if (ShouldIsolate(versionId, mcDir)) {
+        gameDirEff = WToU8((mcDir / L"versions" / fs::u8path(versionId)).wstring());
     }
     fs::path libRoot = mcDir / L"libraries";
     json vj = ResolveVersion(versionId);
@@ -931,9 +967,8 @@ static int CountMissing(const std::string& versionId) {
 
     // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
     std::string gameDirEff = g_cfg.gameDir;
-    if (g_cfg.versionIsolation) {
-        fs::path isoDir = mcDir / L"versions" / fs::u8path(versionId);
-        if (DirExists(isoDir)) gameDirEff = WToU8(isoDir.wstring());
+    if (ShouldIsolate(versionId, mcDir)) {
+        gameDirEff = WToU8((mcDir / L"versions" / fs::u8path(versionId)).wstring());
     }
     fs::path libRoot = mcDir / L"libraries";
     json vj = ResolveVersion(versionId);
@@ -1267,6 +1302,13 @@ static RECT SmallBtnRect(int idx) {   // 0=补全文件 1=刷新
 
 static void SettingsGeom(int row, RECT& ed, RECT& drop, RECT& autoB, RECT& browse);
 
+static const wchar_t* IsoLabel() {
+    switch (g_cfg.isoMode) {
+    case 0: return L"隔离所有实例";
+    case 1: return L"隔离模组实例";
+    default: return L"不隔离实例";
+    }
+}
 static void LayoutControls() {
     int w = g_ly.content.right, h = g_ly.content.bottom;
 
@@ -1330,7 +1372,7 @@ static void LayoutControls() {
         MoveWindow(hEdMem,  x + Scale(110), y + rowH * 2, Scale(110), edH, TRUE);
 
         MoveWindow(hBtnSave, x + Scale(110), y + rowH * 3 + Scale(10), Scale(140), Scale(40), TRUE);
-        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 3 + Scale(10), Scale(170), Scale(40), TRUE);
+        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 3 + Scale(10), Scale(240), Scale(40), TRUE);
     }
 }
 
@@ -1853,10 +1895,8 @@ static LRESULT CALLBACK DropProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 FillRect(dc, &it, hb);
                 DeleteObject(hb);
             }
-            std::wstring txt = (g_dropMode == 0)
-                ? U8ToW(g_dropItems[i].path)
-                : ((g_dropMode == 1) ? (U8ToW(g_dropItems[i].label) + L"    " + U8ToW(g_dropItems[i].path))
-                                     : U8ToW(g_dropItems[i].path));
+            std::wstring txt = U8ToW(g_dropItems[i].path);
+            if (g_dropMode == 1) txt = U8ToW(g_dropItems[i].label) + L"    " + U8ToW(g_dropItems[i].path);
             RECT tt = it; tt.left += Scale(8); tt.right -= Scale(4);
             DrawTextIn(dc, txt, tt, C_TEXT, g_fSmall);
             y += itemH;
@@ -1899,16 +1939,22 @@ static void ShowDropPopup(int mode) {
     g_dropItems.clear();
     if (mode == 0)      g_dropItems = g_dirCands;
     else if (mode == 1) g_dropItems = g_javaCands;
-    else for (auto& v : g_versions) g_dropItems.push_back({ v, v });
+    else if (mode == 2) { for (auto& v : g_versions) g_dropItems.push_back({ v, v }); }
+    else {
+        g_dropItems.push_back({ "隔离所有实例", "隔离所有实例" });
+        g_dropItems.push_back({ "隔离模组实例", "隔离模组实例" });
+        g_dropItems.push_back({ "不隔离实例",   "不隔离实例" });
+    }
     if (g_dropItems.empty()) return;
 
     RECT er{};
     if (mode == 0)      GetWindowRect(hEdDir, &er);
     else if (mode == 1) GetWindowRect(hEdJava, &er);
-    else                GetWindowRect(hBtnInstArrow, &er);
+    else if (mode == 2) GetWindowRect(hBtnInstArrow, &er);
+    else                GetWindowRect(hBtnIso, &er);
 
     int itemH = Scale(28);
-    int w = Scale(mode == 2 ? 300 : 420);
+    int w = Scale(mode == 2 ? 300 : (mode == 3 ? 300 : 420));
     int h = itemH * (int)g_dropItems.size() + Scale(8);
 
     static bool reg = false;
@@ -1971,7 +2017,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnBrowseJava = MakeBtn(hwnd, L"浏览", ID_BTN_BROWSEJAVA);
         hBtnJavaDrop   = MakeBtn(hwnd, L"▾", ID_BTN_JAVADROP);
         hBtnSave       = MakeBtn(hwnd, L"保存设置", ID_BTN_SAVE);
-        hBtnIso        = MakeBtn(hwnd, g_cfg.versionIsolation ? L"版本隔离：开" : L"版本隔离：关", ID_BTN_ISO);
+        hBtnIso        = MakeBtn(hwnd, (std::wstring(L"版本隔离：") + IsoLabel() + L"  ▾").c_str(), ID_BTN_ISO);
 
         SetTimer(hwnd, 1, 300, nullptr);
         return 0;
@@ -2269,16 +2315,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         }
-        case ID_BTN_ISO: {
-        g_cfg.versionIsolation = !g_cfg.versionIsolation;
-        SetWindowTextW(hBtnIso, g_cfg.versionIsolation ? L"版本隔离：开" : L"版本隔离：关");
-        SaveConfig();
-        g_status = g_cfg.versionIsolation
-            ? L"版本隔离已开启（模组读 versions\\<版本>\\mods）"
-            : L"版本隔离已关闭（模组读 .minecraft\\mods）";
-        InvalidateRect(hwnd, nullptr, TRUE);
+        case ID_BTN_ISO:
+        ShowDropPopup(3);
         break;
-    }
 
     case ID_BTN_SAVE: {
             g_cfg.gameDir = WToU8(CtlText(hEdDir));
@@ -2310,6 +2349,22 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DROP_PICK: {
         int idx = (int)wp;
         int mode = (int)lp;
+        if (mode == 3) {
+            if (idx >= 0 && idx < 3) {
+                g_cfg.isoMode = idx;
+                SetWindowTextW(hBtnIso, (std::wstring(L"版本隔离：") + IsoLabel() + L"  ▾").c_str());
+                SaveConfig();
+                const wchar_t* tips[] = {
+                    L"已设为：隔离所有实例",
+                    L"已设为：隔离模组实例（带 mods 或 Forge/Fabric 的实例才隔离）",
+                    L"已设为：不隔离实例（模组读 .minecraft\mods）"
+                };
+                g_status = tips[idx];
+            }
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        }
+
         if (mode == 2) {
             if (idx >= 0 && idx < (int)g_versions.size()) {
                 g_selVersion = idx;
