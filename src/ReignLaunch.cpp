@@ -63,7 +63,8 @@ struct Config {
     int activeAcc = -1;
     std::string gameDir;
     std::string skinPath;   // 当前皮肤 PNG
-    int  isoMode = 0;               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
+    int  isoMode = 0;
+    int  dlThreads = 4;             // 下载线程数 1..128               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
     std::string javaPath;
     int         maxMemMB = 4096;
     std::string playerName = "Steve";
@@ -111,6 +112,7 @@ static std::string JavaVersionOf(const fs::path& javaw);
 static int RequiredJavaMajor(const std::string& id);
 static std::string PickJavaFor(int need);
 static RECT OverlayCardRect();
+static RECT OverlayCancelRect();
 static void ApplyOverlayVisibility();
 
 static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
@@ -118,7 +120,7 @@ static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin, hBtnDelAcc;
 
 static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
-static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso;
+static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads;
 
 // ============================ 颜色 ============================
 static const COLORREF C_BG       = RGB(24, 25, 28);
@@ -235,6 +237,7 @@ static void SaveConfig() {
     json j;
     j["gameDir"]       = g_cfg.gameDir;
     j["isoMode"] = g_cfg.isoMode;
+    j["dlThreads"] = g_cfg.dlThreads;
     j["skinPath"] = g_cfg.skinPath;
     {
         json arr = json::array();
@@ -271,6 +274,7 @@ static void LoadConfig() {
         json j; f >> j;
         g_cfg.gameDir        = j.value("gameDir", std::string());
     g_cfg.isoMode = j.value("isoMode", 0);
+    g_cfg.dlThreads = j.value("dlThreads", 4);
     g_cfg.skinPath = j.value("skinPath", std::string());
 
     g_cfg.activeAcc = j.value("activeAcc", -1);
@@ -943,17 +947,54 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
 // ============================ 下载 ============================
 struct DownloadStats { int existed = 0, downloaded = 0, failed = 0; };
 
+// ---------------- 多线程下载 ----------------
+struct DLTask { std::string url; fs::path dest; std::string label; };
+
+static void RunDownloads(std::vector<DLTask>& tasks, DownloadStats& st, int threads = 0) {
+    if (tasks.empty()) return;
+    if (threads <= 0) threads = g_cfg.dlThreads;
+    if (threads < 1) threads = 1;
+    if (threads > 128) threads = 128;
+    if (threads > (int)tasks.size()) threads = (int)tasks.size();
+
+    std::atomic<size_t> next{ 0 };
+    std::atomic<int> okCount{ 0 }, failCount{ 0 };
+    std::mutex logMu;
+
+    g_progTotal = (int)tasks.size();
+    g_progCur = 0;
+
+    std::vector<std::thread> pool;
+    for (int i = 0; i < threads; ++i) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                size_t idx = next.fetch_add(1);
+                if (idx >= tasks.size()) break;
+                std::string err;
+                if (DownloadFile(tasks[idx].url, tasks[idx].dest, err)) {
+                    okCount.fetch_add(1);
+                } else {
+                    failCount.fetch_add(1);
+                    std::lock_guard<std::mutex> lk(logMu);
+                    Log("[失败] " + tasks[idx].label + " : " + err);
+                }
+                g_progCur = okCount.load() + failCount.load();
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+
+    st.downloaded += okCount.load();
+    st.failed += failCount.load();
+}
+
 static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
     fs::path mcDir = fs::u8path(g_cfg.gameDir);
-
-    // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
-    std::string gameDirEff = g_cfg.gameDir;
-    if (ShouldIsolate(versionId, mcDir)) {
-        gameDirEff = WToU8((mcDir / L"versions" / fs::u8path(versionId)).wstring());
-    }
     fs::path libRoot = mcDir / L"libraries";
     json vj = ResolveVersion(versionId);
     if (!vj.is_object()) { st.failed++; return; }
+
+    std::vector<DLTask> batch1;
 
     if (vj.contains("libraries") && vj["libraries"].is_array()) {
         for (auto& lib : vj["libraries"]) {
@@ -970,23 +1011,17 @@ static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
             if (rel.empty() || url.empty()) continue;
 
             fs::path dest = libRoot / fs::u8path(rel);
+            bool need = true;
             if (FileExists(dest)) {
+                need = false;
                 if (!sha1.empty()) {
                     std::ifstream f{ dest, std::ios::binary };
                     std::vector<unsigned char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                    if (Sha1Hex(buf) != sha1) {
-                        std::string err;
-                        if (DownloadFile(url, dest, err)) st.downloaded++;
-                        else st.failed++;
-                        continue;
-                    }
+                    if (Sha1Hex(buf) != sha1) need = true;
                 }
-                st.existed++;
-                continue;
+                if (!need) st.existed++;
             }
-            std::string err;
-            if (DownloadFile(url, dest, err)) { st.downloaded++; }
-            else { st.failed++; Log("[失败] " + rel + " : " + err); }
+            if (need) batch1.push_back({ url, dest, rel });
         }
     }
 
@@ -995,13 +1030,11 @@ static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
         std::string url = vj["downloads"]["client"].value("url", std::string());
         if (!url.empty()) {
             if (FileExists(clientJar)) st.existed++;
-            else {
-                std::string err;
-                if (DownloadFile(url, clientJar, err)) st.downloaded++;
-                else st.failed++;
-            }
+            else batch1.push_back({ url, clientJar, versionId + ".jar" });
         }
     }
+
+    RunDownloads(batch1, st);
 
     std::string indexId, indexUrl;
     if (vj.contains("assetIndex") && vj["assetIndex"].is_object()) {
@@ -1018,20 +1051,15 @@ static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
 
         json idx = ReadJsonFile(idxPath);
         if (idx.is_object() && idx.contains("objects") && idx["objects"].is_object()) {
-            int present = 0, fetched = 0, failedA = 0;
+            std::vector<DLTask> batch2;
             for (auto& it : idx["objects"].items()) {
                 std::string hash = it.value().value("hash", std::string());
                 if (hash.size() < 3) continue;
                 fs::path obj = mcDir / L"assets" / L"objects" / fs::u8path(hash.substr(0, 2)) / fs::u8path(hash);
-                if (FileExists(obj)) { present++; continue; }
-                std::string err;
-                if (DownloadFile("https://resources.download.minecraft.net/" + hash.substr(0, 2) + "/" + hash, obj, err))
-                    fetched++;
-                else failedA++;
+                if (FileExists(obj)) { st.existed++; continue; }
+                batch2.push_back({ "https://resources.download.minecraft.net/" + hash.substr(0, 2) + "/" + hash, obj, hash });
             }
-            st.existed += present;
-            st.downloaded += fetched;
-            st.failed += failedA;
+            RunDownloads(batch2, st);
         }
     }
 }
@@ -1387,6 +1415,7 @@ static std::string        g_loginErr;
 #define ID_BTN_OVCANCEL  1330
 #define ID_BTN_SKIN      1340
 #define ID_BTN_DELACC    1341
+#define ID_ED_THREADS    1360
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1487,11 +1516,10 @@ static void LayoutControls() {
         MoveWindow(hBtnLaunch, b.left, b.top, b.right - b.left, b.bottom - b.top, TRUE);
         MoveWindow(hBtnInstArrow, b.right + Scale(8), b.top, Scale(44), b.bottom - b.top, TRUE);
 
-        RECT card = OverlayCardRect();
-        MoveWindow(hBtnOverlayCancel, card.right - Scale(140), card.bottom - Scale(58), Scale(104), Scale(38), TRUE);
+        RECT ocr = OverlayCancelRect();
+        MoveWindow(hBtnOverlayCancel, ocr.left, ocr.top, ocr.right - ocr.left, ocr.bottom - ocr.top, TRUE);
         RECT s0 = SmallBtnRect(0), s1 = SmallBtnRect(1);
-        MoveWindow(hBtnFill, s0.left, s0.top, s0.right - s0.left, s0.bottom - s0.top, TRUE);
-        MoveWindow(hBtnRefresh, s1.left, s1.top, s1.right - s1.left, s1.bottom - s1.top, TRUE);
+        MoveWindow(hBtnRefresh, g_ly.content.right - Scale(134), g_ly.content.top + Scale(12), Scale(110), Scale(32), TRUE);
     }
 
     // 用户页：居中面板
@@ -1542,6 +1570,7 @@ static void LayoutControls() {
 
         MoveWindow(hBtnSave, x + Scale(110), y + rowH * 3 + Scale(10), Scale(140), Scale(40), TRUE);
         MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 3 + Scale(10), Scale(240), Scale(40), TRUE);
+        MoveWindow(hEdThreads, x + Scale(110), y + rowH * 4 + Scale(6), Scale(90), Scale(30), TRUE);
     }
 }
 
@@ -1877,6 +1906,7 @@ static void SyncSettingsVisibility() {
     ShowWindow(hEdMem,   onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnSave, onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnIso,  onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hEdThreads, onSettings ? SW_SHOW : SW_HIDE);
 }
 static void DrawCandList(HDC dc, bool isDir) {
     const std::vector<Cand>& list = isDir ? g_dirCands : g_javaCands;
@@ -1975,73 +2005,126 @@ static void DrawSettingsMenu(HDC dc) {
 }
 
 // ============================ 启动浮层 ============================
-static RECT OverlayCardRect() {
-    RECT c = g_ly.content;
-    int w = Scale(560), h = Scale(310);
-    int cx = (c.left + c.right) / 2;
-    int cy = (c.top + c.bottom) / 2;
-    return { cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2 };
-}
-
 static void ApplyOverlayVisibility() {
     bool L = (g_page == PAGE_LAUNCH) && !g_overlay;
     ShowWindow(hBtnLaunch, L ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnFill,   L ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnRefresh, L ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnInstArrow, L ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnRefresh, (g_page == PAGE_INSTANCES && !g_overlay) ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnOverlayCancel, g_overlay ? SW_SHOW : SW_HIDE);
 }
+static RECT OverlayCancelRect() {
+    RECT c = g_ly.content;
+    int w = Scale(96), h = Scale(34);
+    return { c.right - Scale(28) - w, c.bottom - Scale(62), c.right - Scale(28), c.bottom - Scale(28) };
+}
 
+// 颜色线性插值
+static COLORREF MixColor(COLORREF a, COLORREF b, double t) {
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    int r = (int)(GetRValue(a) * (1 - t) + GetRValue(b) * t);
+    int g = (int)(GetGValue(a) * (1 - t) + GetGValue(b) * t);
+    int bl = (int)(GetBValue(a) * (1 - t) + GetBValue(b) * t);
+    return RGB(r, g, bl);
+}
+
+static void FillLine(HDC dc, int left, int right, int y, COLORREF col) {
+    RECT line = { left, y, right, y + 1 };
+    HBRUSH b = CreateSolidBrush(col);
+    FillRect(dc, &line, b);
+    DeleteObject(b);
+}
+
+// 沉浸式启动画面：背景图/深灰渐变 + 底部 200px 渐变压暗 + 左下角状态 + 贴底进度条
 static void DrawOverlay(HDC dc) {
     RECT c = g_ly.content;
-    HBRUSH bg = CreateSolidBrush(RGB(16, 17, 20));
-    FillRect(dc, &c, bg);
-    DeleteObject(bg);
+    int h = c.bottom - c.top;
+    if (h <= 0) return;
 
-    RECT card = OverlayCardRect();
-    FillRoundRect(dc, card, 12, C_CARD);
-
-    int x = card.left + Scale(30);
-    RECT ttl = { x, card.top + Scale(18), card.right - Scale(30), card.top + Scale(48) };
-    DrawTextIn(dc, L"启动游戏", ttl, C_TEXT, g_fUi);
-
-    const wchar_t* steps[4] = { L"检测 Java 版本", L"处理游戏依赖", L"登录", L"等待游戏启动" };
-    int done = g_stepCur.load();
-    int yy = card.top + Scale(62);
-    for (int i = 0; i < 4; ++i) {
-        std::wstring line = (i < done) ? (std::wstring(L"✓  ") + steps[i])
-                          : (i == done) ? (std::wstring(L"→  ") + steps[i])
-                                        : (std::wstring(L"…  ") + steps[i]);
-        COLORREF col = (i < done) ? C_OK : (i == done ? C_TEXT : C_DIM);
-        RECT r = { x, yy, card.right - Scale(30), yy + Scale(28) };
-        DrawTextIn(dc, line, r, col, g_fUi);
-        yy += Scale(32);
-    }
-
+    int done  = g_stepCur.load();
     int total = g_progTotal.load(), cur = g_progCur.load();
     bool downloading = (g_progState.load() == 1 && total > 0);
     double ratio = downloading ? ((double)cur / total) : (done / 4.0);
-    if (ratio > 1.0) ratio = 1.0;
+    if (ratio < 0) ratio = 0;
+    if (ratio > 1) ratio = 1;
 
-    RECT bar = { x, yy + Scale(10), card.right - Scale(30), yy + Scale(20) };
-    FillRoundRect(dc, bar, 5, RGB(42, 44, 50));
-    if (ratio > 0) {
-        RECT f = bar;
-        f.right = bar.left + (int)((bar.right - bar.left) * ratio);
-        FillRoundRect(dc, f, 5, C_ACCENT2);
+    // ---------- 1. 背景：优先用资源位图 102，没有就深灰渐变 ----------
+    bool painted = false;
+    {
+        HINSTANCE hi = GetModuleHandleW(nullptr);
+        HBITMAP bg = (HBITMAP)LoadImageA(hi, MAKEINTRESOURCEA(102), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
+        if (bg) {
+            BITMAP bm{};
+            GetObject(bg, sizeof(bm), &bm);
+            HDC src = CreateCompatibleDC(dc);
+            HBITMAP oldb = (HBITMAP)SelectObject(src, bg);
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            StretchBlt(dc, c.left, c.top, c.right - c.left, h, src, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+            SelectObject(src, oldb);
+            DeleteDC(src);
+            DeleteObject(bg);
+            painted = true;
+        }
+    }
+    if (!painted) {
+        const COLORREF cTop = RGB(30, 32, 38), cBottom = RGB(10, 11, 14);
+        for (int y = c.top; y < c.bottom; ++y) {
+            double t = (double)(y - c.top) / h;
+            FillLine(dc, c.left, c.right, y, MixColor(cTop, cBottom, t));
+        }
     }
 
+    // ---------- 2. 底部 200px 渐变压暗（透明 -> 近黑）----------
+    int gH = Scale(200);
+    if (gH > h) gH = h;
+    for (int i = 0; i < gH; ++i) {
+        int y = c.bottom - gH + i;
+        double t = (double)(y - c.top) / h;
+        double a = (double)i / gH * 0.95;
+        COLORREF base = MixColor(RGB(30, 32, 38), RGB(10, 11, 14), t);
+        FillLine(dc, c.left, c.right, y, MixColor(base, RGB(0, 0, 0), a));
+    }
+
+    // ---------- 3. 左下角状态 ----------
+    std::wstring ver = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
+                     ? U8ToW(g_versions[g_selVersion]) : std::wstring(L"");
     std::wstring st;
     if (downloading)
-        st = L"正在补全文件 " + std::to_wstring(cur) + L" / " + std::to_wstring(total);
+        st = L"正在补全文件  " + std::to_wstring(cur) + L" / " + std::to_wstring(total);
     else if (done >= 4)
-        st = L"游戏已启动，出错的日志会单独弹出";
-    else if (done == 3)
-        st = L"正在处理启动参数…";
+        st = ver.empty() ? std::wstring(L"游戏已启动") : (L"游戏已启动 · " + ver);
+    else if (!ver.empty())
+        st = L"正在启动  " + ver + L" …";
     else
-        st = L"请耐心等待…";
-    RECT sr = { x, yy + Scale(28), card.right - Scale(160), yy + Scale(54) };
-    DrawTextIn(dc, st, sr, C_DIM, g_fSmall);
+        st = L"正在启动 …";
+
+    RECT sr = { c.left + Scale(32), c.bottom - Scale(90), c.right - Scale(180), c.bottom - Scale(56) };
+    DrawTextIn(dc, st, sr, RGB(228, 231, 236), g_fUi);
+
+    const wchar_t* stage = (done == 0) ? L"检测 Java 版本"
+                        : (done == 1) ? L"处理游戏依赖"
+                        : (done == 2) ? L"登录"
+                        : (done == 3) ? L"等待游戏窗口"
+                                      : L"完成";
+    RECT sr2 = { c.left + Scale(32), c.bottom - Scale(54), c.right - Scale(180), c.bottom - Scale(26) };
+    DrawTextIn(dc, stage, sr2, RGB(138, 144, 156), g_fSmall);
+
+    // ---------- 4. 贴底进度条 ----------
+    int barH = Scale(4);
+    RECT barBg = { c.left, c.bottom - barH, c.right, c.bottom };
+    HBRUSH bgB = CreateSolidBrush(RGB(38, 40, 46));
+    FillRect(dc, &barBg, bgB);
+    DeleteObject(bgB);
+
+    if (ratio > 0) {
+        RECT fill = barBg;
+        fill.right = barBg.left + (int)((barBg.right - barBg.left) * ratio);
+        if (fill.right < fill.left + 1) fill.right = fill.left + 1;
+        HBRUSH fb = CreateSolidBrush(C_ACCENT2);
+        FillRect(dc, &fill, fb);
+        DeleteObject(fb);
+    }
 }
 
 static void PaintMain(HDC dc, int w, int h) {
@@ -2185,7 +2268,7 @@ static void PaintMain(HDC dc, int w, int h) {
         int x   = g_ly.content.left + Scale(24);
         int top = g_ly.content.top + Scale(16);
 
-        RECT lbl = { x, top, g_ly.content.right - Scale(24), top + Scale(26) };
+        RECT lbl = { x, top, g_ly.content.right - Scale(160), top + Scale(26) };
         DrawTextIn(dc, L"实例 (" + std::to_wstring(g_versions.size()) + L")", lbl, C_DIM, g_fSmall);
 
         int itemH = Scale(56);
@@ -2234,6 +2317,13 @@ static void PaintMain(HDC dc, int w, int h) {
                    C_DIM, g_fSmall);
 
         if (!g_status.empty()) {
+        {
+            RECT tl = { x, y + rowH * 4 + Scale(6), x + Scale(100), y + rowH * 4 + Scale(36) };
+            DrawTextIn(dc, L"下载线程", tl, C_DIM, g_fUi);
+            RECT th = { x + Scale(210), y + rowH * 4 + Scale(12), g_ly.main.right - Scale(40), y + rowH * 4 + Scale(34) };
+            DrawTextIn(dc, L"1 - 128（默认 4）", th, C_DIM, g_fSmall);
+        }
+
             RECT st = { x, y + rowH * 4 + Scale(56), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
             DrawTextIn(dc, g_status, st, C_OK, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
         }
@@ -2458,7 +2548,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnTabInst     = MakeBtn(hwnd, L"实例", ID_TAB_INST);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
-        hBtnFill    = MakeBtn(hwnd, L"补全文件", ID_BTN_FILL);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
         hBtnInstArrow = MakeBtn(hwnd, L"", ID_BTN_INSTARROW);
         hBtnOverlayCancel = MakeBtn(hwnd, L"取消", ID_BTN_OVCANCEL);
@@ -2471,6 +2560,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnOffline = MakeBtn(hwnd, L"使用离线", ID_BTN_OFFLINE);
         hBtnSkin    = MakeBtn(hwnd, L"更换皮肤", ID_BTN_SKIN);
         hBtnDelAcc  = MakeBtn(hwnd, L"删除账户", ID_BTN_DELACC);
+        hEdThreads = CreateWindowExW(0, L"EDIT", std::to_wstring(g_cfg.dlThreads).c_str(),
+                        WS_CHILD | WS_BORDER | ES_NUMBER | ES_CENTER,
+                        0, 0, 10, 10, hwnd, (HMENU)ID_ED_THREADS, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(hEdThreads, WM_SETFONT, (WPARAM)g_fUi, TRUE);
 
         hEdDir  = MakeEdit(hwnd, ID_ED_DIR, U8ToW(g_cfg.gameDir).c_str());
         hEdJava = MakeEdit(hwnd, ID_ED_JAVA, U8ToW(g_cfg.javaPath).c_str());
@@ -2879,6 +2972,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (mem < 512) mem = 512;
             if (mem > 16384) mem = 16384;
             g_cfg.maxMemMB = mem;
+    {
+        std::string ts = WToU8(CtlText(hEdThreads));
+        int n = ts.empty() ? 4 : atoi(ts.c_str());
+        if (n < 1) n = 1;
+        if (n > 128) n = 128;
+        g_cfg.dlThreads = n;
+        SetWindowTextW(hEdThreads, std::to_wstring(n).c_str());
+    }
             {
         std::string emb = ExtractEmbeddedAuthlib();
         if (!emb.empty()) {
@@ -2909,7 +3010,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const wchar_t* tips[] = {
                     L"已设为：隔离所有实例",
                     L"已设为：隔离模组实例（带 mods 或 Forge/Fabric 的实例才隔离）",
-                    L"已设为：不隔离实例（模组读 .minecraft\mods）"
+                    L"已设为：不隔离实例（模组读 .minecraft\\mods）"
                 };
                 g_status = tips[idx];
             }
