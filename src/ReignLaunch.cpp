@@ -1244,8 +1244,8 @@ static void LayoutControls() {
     int w = g_ly.content.right, h = g_ly.content.bottom;
 
     // 顶部标签
-    HWND tabBtns[4] = { hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout };
-    for (int i = 0; i < 4; ++i) {
+    HWND tabBtns[3] = { hBtnTabLaunch, hBtnTabUser, hBtnTabSettings };
+    for (int i = 0; i < 3; ++i) {
         RECT r = TabRect(i);
         MoveWindow(tabBtns[i], r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
     }
@@ -1316,7 +1316,7 @@ static void ShowPage(Page p) {
     ShowWindow(hBtnTabLaunch, SW_SHOW);
     ShowWindow(hBtnTabUser, SW_SHOW);
     ShowWindow(hBtnTabSettings, SW_SHOW);
-    if (hBtnTabAbout) ShowWindow(hBtnTabAbout, SW_SHOW);
+
 
 
     ShowWindow(hBtnLaunch, L); ShowWindow(hBtnFill, L); ShowWindow(hBtnRefresh, L);
