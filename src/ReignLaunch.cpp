@@ -1593,8 +1593,9 @@ static void PaintMain(HDC dc, int w, int h) {
         RECT l5 = { x, g_ly.content.top + Scale(128), g_ly.main.right, g_ly.content.top + Scale(154) };
         DrawTextIn(dc, acct, l3, C_DIM, g_fUi);
         DrawTextIn(dc, L"内存: " + std::to_wstring(g_cfg.maxMemMB) + L" MB", l4, C_DIM, g_fUi);
-        std::wstring jp = g_cfg.javaPath.empty() ? L"（未设置）" : fs::u8path(EffectiveJavaExe()).filename().wstring();
-        DrawTextIn(dc, L"Java: " + jp, l5, C_DIM, g_fUi);
+        std::wstring verSel = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
+            ? U8ToW(g_versions[g_selVersion]) : std::wstring(L"（未选择）");
+        DrawTextIn(dc, L"版本: " + verSel, l5, C_DIM, g_fUi);
 
         int pst = g_progState.load();
         if (pst != 0) {
