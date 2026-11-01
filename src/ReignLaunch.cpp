@@ -78,6 +78,7 @@ static std::atomic<int> g_progTotal{ 0 };
 static bool g_overlay = false;                       // 启动浮层
 static std::atomic<int>  g_stepCur{ 0 };             // 已完成步骤 0..4
 static std::atomic<bool> g_cancelLaunch{ false };
+static DWORD g_overlayDoneTick = 0;   // 全部步骤完成的时刻，用于自动收起浮层
 static int         g_dpi = 96;
 
 static std::mutex               g_logMutex;
@@ -1049,6 +1050,33 @@ static void PumpOutput(HANDLE hRead) {
     CloseHandle(hRead);
 }
 
+// 等游戏窗口真正出现（不是进程创建就算完成）
+struct WinWaitCtx { DWORD pid; bool found; };
+
+static BOOL CALLBACK FindGameWindowProc(HWND h, LPARAM lp) {
+    WinWaitCtx* c = (WinWaitCtx*)lp;
+    DWORD wp = 0;
+    GetWindowThreadProcessId(h, &wp);
+    if (wp != c->pid) return TRUE;
+    if (!IsWindowVisible(h)) return TRUE;
+    wchar_t title[256] = {0};
+    GetWindowTextW(h, title, 256);
+    if (wcslen(title) == 0) return TRUE;
+    c->found = true;
+    return FALSE;
+}
+
+static bool WaitForGameWindow(DWORD pid, int timeoutMs) {
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < (DWORD)timeoutMs) {
+        WinWaitCtx c{ pid, false };
+        EnumWindows(FindGameWindowProc, (LPARAM)&c);
+        if (c.found) return true;
+        if (g_cancelLaunch) return false;
+        Sleep(250);
+    }
+    return false;
+}
 static void LaunchThread(std::string versionId) {
     g_launching = true;
     Log("=========== 启动 " + versionId + " ===========");
@@ -1171,11 +1199,24 @@ static void LaunchThread(std::string versionId) {
     }
 
     g_progState = 0;
-    g_stepCur = 4;   // 全部完成
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-    Log("[成功] 游戏已启动，PID=" + std::to_string(pi.dwProcessId));
+    Log("[成功] 游戏进程已创建，PID=" + std::to_string(pi.dwProcessId) + "，等待游戏窗口…");
     CloseHandle(pi.hThread);
     g_gameProc = pi.hProcess;
+
+    // 第四步「等待游戏启动」：等窗口真的出现才打勾
+    {
+        DWORD gamePid = pi.dwProcessId;
+        std::thread waiter([gamePid]() {
+            if (WaitForGameWindow(gamePid, 180000)) {
+                g_stepCur = 4;
+                if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+                Log("[成功] 游戏窗口已出现");
+            } else {
+                Log("[提示] 等待 180 秒仍未检测到游戏窗口（可能已崩溃，请看日志）");
+            }
+        });
+        waiter.detach();
+    }
 
     std::thread reader(PumpOutput, rd);
     reader.detach();
@@ -2423,6 +2464,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             {
                 std::string ver = g_versions[g_selVersion];
                 g_overlay = true;
+                g_overlayDoneTick = 0;
                 g_stepCur = 0;
                 g_cancelLaunch = false;
                 g_launching = true;
@@ -2622,6 +2664,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_APP_DONE:
+        if (g_overlay && g_stepCur.load() >= 4 && g_overlayDoneTick == 0)
+            g_overlayDoneTick = GetTickCount();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
 
@@ -2629,7 +2673,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_overlay) {
             if (g_stepCur.load() >= 4) {
                 SetWindowTextW(hBtnOverlayCancel, L"关闭");
-                if (!g_launching) { g_overlay = false; ApplyOverlayVisibility(); }
+                // 窗口已出现：1.5 秒后自动收起，让主界面可用
+                if (g_overlayDoneTick && GetTickCount() - g_overlayDoneTick > 1500) {
+                    g_overlay = false;
+                    g_overlayDoneTick = 0;
+                    ApplyOverlayVisibility();
+                }
             }
             InvalidateRect(hwnd, nullptr, FALSE);
         }
