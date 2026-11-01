@@ -49,7 +49,18 @@ using json = nlohmann::json;
 enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, PAGE_INSTANCES = 4 };
 
 // ============================ 配置 ============================
+struct Account {
+    std::string type;    // offline / thirdparty
+    std::string name;
+    std::string server;
+    std::string token;
+    std::string uuid;
+    std::string skin;    // 该账户的皮肤 PNG
+};
+
 struct Config {
+    std::vector<Account> accounts;
+    int activeAcc = -1;
     std::string gameDir;
     std::string skinPath;   // 当前皮肤 PNG
     int  isoMode = 0;               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
@@ -103,7 +114,7 @@ static RECT OverlayCardRect();
 static void ApplyOverlayVisibility();
 
 static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
-static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin;
+static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin, hBtnDelAcc;
 
 static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
@@ -225,6 +236,21 @@ static void SaveConfig() {
     j["gameDir"]       = g_cfg.gameDir;
     j["isoMode"] = g_cfg.isoMode;
     j["skinPath"] = g_cfg.skinPath;
+    {
+        json arr = json::array();
+        for (auto& a : g_cfg.accounts) {
+            json o;
+            o["type"]   = a.type;
+            o["name"]   = a.name;
+            o["server"] = a.server;
+            o["token"]  = a.token;
+            o["uuid"]   = a.uuid;
+            o["skin"]   = a.skin;
+            arr.push_back(o);
+        }
+        j["accounts"] = arr;
+        j["activeAcc"] = g_cfg.activeAcc;
+    }
     j["javaPath"]      = g_cfg.javaPath;
     j["maxMemMB"]      = g_cfg.maxMemMB;
     j["playerName"]    = g_cfg.playerName;
@@ -246,11 +272,41 @@ static void LoadConfig() {
         g_cfg.gameDir        = j.value("gameDir", std::string());
     g_cfg.isoMode = j.value("isoMode", 0);
     g_cfg.skinPath = j.value("skinPath", std::string());
+
+    g_cfg.activeAcc = j.value("activeAcc", -1);
+    if (j.contains("accounts") && j["accounts"].is_array()) {
+        for (auto& o : j["accounts"]) {
+            Account a;
+            a.type   = o.value("type", std::string("offline"));
+            a.name   = o.value("name", std::string());
+            a.server = o.value("server", std::string());
+            a.token  = o.value("token", std::string());
+            a.uuid   = o.value("uuid", std::string());
+            a.skin   = o.value("skin", std::string());
+            if (!a.name.empty()) g_cfg.accounts.push_back(a);
+        }
+    }
+
     if (j.contains("versionIsolation"))            // 兼容上一版布尔配置
         g_cfg.isoMode = j.value("versionIsolation", true) ? 0 : 2;
         g_cfg.javaPath       = j.value("javaPath", std::string());
         g_cfg.maxMemMB       = j.value("maxMemMB", 4096);
         g_cfg.playerName     = j.value("playerName", std::string("Steve"));
+    // 账户列表为空则用当前单账号迁移（此时 playerName 已读入）
+    if (g_cfg.accounts.empty()) {
+        std::string nm = (g_cfg.authType == "thirdparty") ? g_cfg.authName : g_cfg.playerName;
+        if (!nm.empty()) {
+            Account a;
+            a.type = g_cfg.authType.empty() ? "offline" : g_cfg.authType;
+            a.name = nm;
+            a.server = g_cfg.authServer;
+            a.token = g_cfg.authToken;
+            a.uuid = g_cfg.authUuid;
+            a.skin = g_cfg.skinPath;
+            g_cfg.accounts.push_back(a);
+            g_cfg.activeAcc = 0;
+        }
+    }
         g_cfg.authType       = j.value("authType", std::string("offline"));
         g_cfg.authServer     = j.value("authServer", std::string());
         g_cfg.authToken      = j.value("authToken", std::string());
@@ -1330,6 +1386,7 @@ static std::string        g_loginErr;
 #define ID_BTN_INSTARROW 1317
 #define ID_BTN_OVCANCEL  1330
 #define ID_BTN_SKIN      1340
+#define ID_BTN_DELACC    1341
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1455,7 +1512,8 @@ static void LayoutControls() {
         MoveWindow(hBtnOffline, x + Scale(366), y + rowH * 4 + Scale(14), Scale(110), Scale(34), TRUE);
 
         RECT sb = g_ly.sidebar;
-        MoveWindow(hBtnSkin, sb.left + Scale(12), sb.top + Scale(134), (sb.right - sb.left) - Scale(24), Scale(36), TRUE);
+        MoveWindow(hBtnSkin, sb.left + Scale(12), sb.bottom - Scale(92), (sb.right - sb.left) - Scale(24), Scale(36), TRUE);
+        MoveWindow(hBtnDelAcc, sb.left + Scale(12), sb.bottom - Scale(50), (sb.right - sb.left) - Scale(24), Scale(36), TRUE);
     }
 
     // 设置页
@@ -1505,7 +1563,7 @@ static void ShowPage(Page p) {
     ApplyOverlayVisibility();
 
     ShowWindow(hEdServer, U); ShowWindow(hEdUser, U); ShowWindow(hEdPass, U);
-    ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U); ShowWindow(hBtnSkin, U);
+    ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U); ShowWindow(hBtnSkin, U); ShowWindow(hBtnDelAcc, U);
 
     ShowWindow(hEdDir, S); ShowWindow(hBtnAutoDir, S); ShowWindow(hBtnBrowseDir, S); ShowWindow(hBtnDirDrop, S);
     ShowWindow(hEdJava, S); ShowWindow(hBtnAutoJava, S); ShowWindow(hBtnBrowseJava, S); ShowWindow(hBtnJavaDrop, S);
@@ -1587,6 +1645,48 @@ static bool ApplySkin(const std::string& srcPath, std::wstring& err) {
     SaveConfig();
     LoadSkinBitmap();
     return true;
+}
+// ---- 账户切换 ----
+static void ApplyActiveAccount() {
+    if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) return;
+    Account& a = g_cfg.accounts[g_cfg.activeAcc];
+    g_cfg.authType   = a.type;
+    g_cfg.authServer = a.server;
+    g_cfg.authToken  = a.token;
+    g_cfg.authUuid   = a.uuid;
+    if (a.type == "thirdparty") g_cfg.authName = a.name;
+    else                        g_cfg.playerName = a.name;
+    g_cfg.skinPath = a.skin;
+}
+
+static void CaptureActiveAccount() {
+    if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) return;
+    Account& a = g_cfg.accounts[g_cfg.activeAcc];
+    a.type   = g_cfg.authType;
+    a.server = g_cfg.authServer;
+    a.token  = g_cfg.authToken;
+    a.uuid   = g_cfg.authUuid;
+    a.skin   = g_cfg.skinPath;
+    if (a.type == "thirdparty") a.name = g_cfg.authName;
+    else                        a.name = g_cfg.playerName;
+}
+
+// 找一个同名账户，找不到就新建；返回下标
+static int UpsertAccount(const std::string& type, const std::string& name,
+                         const std::string& server = "", const std::string& token = "",
+                         const std::string& uuid = "") {
+    for (size_t i = 0; i < g_cfg.accounts.size(); ++i) {
+        if (g_cfg.accounts[i].name == name && g_cfg.accounts[i].type == type) {
+            g_cfg.accounts[i].server = server;
+            g_cfg.accounts[i].token  = token;
+            g_cfg.accounts[i].uuid   = uuid;
+            return (int)i;
+        }
+    }
+    Account a;
+    a.type = type; a.name = name; a.server = server; a.token = token; a.uuid = uuid;
+    g_cfg.accounts.push_back(a);
+    return (int)g_cfg.accounts.size() - 1;
 }
 // ---------------- 检测候选列表 ----------------
 struct Cand { std::string path; std::string label; };
@@ -2009,29 +2109,48 @@ static void PaintMain(HDC dc, int w, int h) {
         }
     }
     else if (g_page == PAGE_USER) {
-        // 左侧账户卡片
+        // 左侧账户列表
         {
             RECT sb = g_ly.sidebar;
             HBRUSH bg = CreateSolidBrush(RGB(30, 31, 35));
             FillRect(dc, &sb, bg);
             DeleteObject(bg);
 
-            RECT lb = { sb.left + Scale(20), sb.top + Scale(12), sb.right, sb.top + Scale(36) };
-            DrawTextIn(dc, L"账户", lb, C_DIM, g_fSmall);
+            RECT lb = { sb.left + Scale(20), sb.top + Scale(10), sb.right, sb.top + Scale(34) };
+            DrawTextIn(dc, L"账户 (" + std::to_wstring(g_cfg.accounts.size()) + L")", lb, C_DIM, g_fSmall);
 
-            RECT card = { sb.left + Scale(12), sb.top + Scale(46), sb.right - Scale(12), sb.top + Scale(46) + Scale(76) };
-            FillRoundRect(dc, card, 8, C_CARD_SEL);
-            DrawAvatar(dc, card.left + Scale(12), card.top + Scale(12), Scale(52));
+            int itemH = Scale(64);
+            int y = sb.top + Scale(38);
+            for (size_t i = 0; i < g_cfg.accounts.size(); ++i) {
+                RECT card = { sb.left + Scale(10), y, sb.right - Scale(10), y + itemH - Scale(6) };
+                bool sel = ((int)i == g_cfg.activeAcc);
+                FillRoundRect(dc, card, 8, sel ? C_CARD_SEL : C_CARD);
 
-            std::wstring nm = U8ToW(CurrentPlayerName());
-            RECT n1 = { card.left + Scale(76), card.top + Scale(12), card.right - Scale(8), card.top + Scale(38) };
-            DrawTextIn(dc, nm, n1, C_TEXT, g_fUi);
+                DrawAvatar(dc, card.left + Scale(10), card.top + Scale(8), Scale(42));
 
-            std::wstring ty = (g_cfg.authType == "thirdparty")
-                ? (L"外置登录 · " + U8ToW(g_cfg.authServer))
-                : L"离线模式";
-            RECT n2 = { card.left + Scale(76), card.top + Scale(40), card.right - Scale(8), card.top + Scale(64) };
-            DrawTextIn(dc, ty, n2, C_DIM, g_fSmall);
+                RECT n1 = { card.left + Scale(60), card.top + Scale(10), card.right - Scale(8), card.top + Scale(34) };
+                DrawTextIn(dc, U8ToW(g_cfg.accounts[i].name), n1, sel ? C_TEXT : C_DIM, g_fUi);
+
+                std::wstring ty = (g_cfg.accounts[i].type == "thirdparty")
+                    ? (L"外置登录 · " + U8ToW(g_cfg.accounts[i].server))
+                    : L"离线模式";
+                RECT n2 = { card.left + Scale(60), card.top + Scale(34), card.right - Scale(8), card.top + Scale(54) };
+                DrawTextIn(dc, ty, n2, C_DIM, g_fSmall);
+
+                if (sel) {
+                    RECT bar = { card.left + Scale(2), card.top + Scale(10), card.left + Scale(5), card.bottom - Scale(10) };
+                    HBRUSH b = CreateSolidBrush(C_ACCENT2);
+                    FillRect(dc, &bar, b);
+                    DeleteObject(b);
+                }
+                y += itemH;
+            }
+
+            if (g_cfg.accounts.empty()) {
+                RECT e = { sb.left + Scale(16), sb.top + Scale(44), sb.right - Scale(16), sb.top + Scale(120) };
+                DrawTextIn(dc, L"还没有账户\n在右边填名字后点「使用离线」", e, C_DIM, g_fSmall,
+                           DT_LEFT | DT_TOP | DT_WORDBREAK);
+            }
         }
 
         int panelW = Scale(620);
@@ -2155,6 +2274,9 @@ static void ShowErrorWindow() {
 static void LoginThread(std::string srv, std::string user, std::string pass) {
     AuthResult r = YggdrasilLogin(srv, user, pass);
     if (r.ok) {
+        CaptureActiveAccount();
+        int accIdx = UpsertAccount("thirdparty", r.name, TrimSlash(srv), r.accessToken, r.uuid);
+        g_cfg.activeAcc = accIdx;
         g_cfg.authType = "thirdparty";
         g_cfg.authServer = TrimSlash(srv);
         g_cfg.authToken = r.accessToken;
@@ -2348,6 +2470,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnLogout= MakeBtn(hwnd, L"退出登录", ID_BTN_LOGOUT);
         hBtnOffline = MakeBtn(hwnd, L"使用离线", ID_BTN_OFFLINE);
         hBtnSkin    = MakeBtn(hwnd, L"更换皮肤", ID_BTN_SKIN);
+        hBtnDelAcc  = MakeBtn(hwnd, L"删除账户", ID_BTN_DELACC);
 
         hEdDir  = MakeEdit(hwnd, ID_ED_DIR, U8ToW(g_cfg.gameDir).c_str());
         hEdJava = MakeEdit(hwnd, ID_ED_JAVA, U8ToW(g_cfg.javaPath).c_str());
@@ -2484,6 +2607,25 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
+        if (g_page == PAGE_USER) {
+            RECT sb = g_ly.sidebar;
+            int itemH = Scale(64);
+            int top = sb.top + Scale(38);
+            if (pt.x >= sb.left && pt.x <= sb.right && pt.y >= top) {
+                int idx = (pt.y - top) / itemH;
+                if (idx >= 0 && idx < (int)g_cfg.accounts.size() && idx != g_cfg.activeAcc) {
+                    CaptureActiveAccount();
+                    g_cfg.activeAcc = idx;
+                    ApplyActiveAccount();
+                    LoadSkinBitmap();
+                    SaveConfig();
+                    g_status = L"已切换到账户：" + U8ToW(g_cfg.accounts[idx].name);
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+                return 0;
+            }
+        }
+
         if (g_page != PAGE_LAUNCH) return 0;
 
         // 版本列表点击
@@ -2584,7 +2726,32 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
 
-        case ID_BTN_SKIN: {
+        case ID_BTN_DELACC: {
+        if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) {
+            g_status = L"没有可删除的账户";
+            InvalidateRect(hwnd, nullptr, TRUE);
+            break;
+        }
+        g_cfg.accounts.erase(g_cfg.accounts.begin() + g_cfg.activeAcc);
+        if (g_cfg.accounts.empty()) {
+            g_cfg.activeAcc = -1;
+            g_cfg.authType = "offline";
+            g_cfg.authToken.clear();
+            g_cfg.authUuid.clear();
+            g_cfg.skinPath.clear();
+            LoadSkinBitmap();
+        } else {
+            if (g_cfg.activeAcc >= (int)g_cfg.accounts.size()) g_cfg.activeAcc = (int)g_cfg.accounts.size() - 1;
+            ApplyActiveAccount();
+            LoadSkinBitmap();
+        }
+        SaveConfig();
+        g_status = L"账户已删除";
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+    }
+
+    case ID_BTN_SKIN: {
         OPENFILENAMEW ofn{};
         wchar_t file[MAX_PATH] = L"";
         ofn.lStructSize = sizeof(ofn);
@@ -2624,14 +2791,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
 
-        case ID_BTN_OFFLINE:
-            g_cfg.authType = "offline";
-            g_cfg.playerName = WToU8(CtlText(hEdName));
+        case ID_BTN_OFFLINE: {
+            std::string nm = WToU8(CtlText(hEdName));
+            if (nm.empty()) nm = "玩家" + std::to_string(g_cfg.accounts.size() + 1);
+            CaptureActiveAccount();
+            int idx = UpsertAccount("offline", nm);
+            g_cfg.activeAcc = idx;
+            ApplyActiveAccount();
             SaveConfig();
             g_loginState = 0;
-            g_status = L"已切换到离线账号：" + U8ToW(g_cfg.playerName);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            g_status = L"已切换到离线账户：" + U8ToW(nm);
+            InvalidateRect(hwnd, nullptr, TRUE);
             break;
+        }
 
         case ID_BTN_LOGOUT:
             g_cfg.authType = "offline";
@@ -2867,6 +3039,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int) {
     }
     g_dataDir = WToU8(fs::path(g_cfgPath).parent_path().wstring());
     LoadConfig();
+    ApplyActiveAccount();
+
 
     Gdiplus::GdiplusStartupInput gpsi;
     g_gpOk = (Gdiplus::GdiplusStartup(&g_gpToken, &gpsi, nullptr) == Gdiplus::Ok);
