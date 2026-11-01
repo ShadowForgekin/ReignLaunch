@@ -13,6 +13,7 @@
 // ============================================================================
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -25,6 +26,7 @@
 #include <cwchar>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -73,6 +75,9 @@ static bool        g_launching = false;
 static std::atomic<int> g_progState{ 0 };   // 0 空闲 1 补全 2 启动
 static std::atomic<int> g_progCur{ 0 };
 static std::atomic<int> g_progTotal{ 0 };
+static bool g_overlay = false;                       // 启动浮层
+static std::atomic<int>  g_stepCur{ 0 };             // 已完成步骤 0..4
+static std::atomic<bool> g_cancelLaunch{ false };
 static int         g_dpi = 96;
 
 static std::mutex               g_logMutex;
@@ -83,7 +88,12 @@ static HFONT g_fTitle = nullptr, g_fUi = nullptr, g_fSmall = nullptr;
 
 // ============================ 控件 ============================
 static HWND hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout, hBtnTabInst;
-static HWND hBtnLaunch, hBtnFill, hBtnRefresh, hBtnInstArrow;
+static HWND hBtnLaunch, hBtnFill, hBtnRefresh, hBtnInstArrow, hBtnOverlayCancel;
+static std::string JavaVersionOf(const fs::path& javaw);
+static int RequiredJavaMajor(const std::string& id);
+static std::string PickJavaFor(int need);
+static RECT OverlayCardRect();
+static void ApplyOverlayVisibility();
 
 static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
 static HWND hBtnLogin, hBtnLogout, hBtnOffline;
@@ -110,6 +120,7 @@ static HBRUSH g_brInput = nullptr;
 // ============================ 消息 ============================
 #define WM_APP_DONE  (WM_APP + 1)
 #define WM_APP_ERROR (WM_APP + 2)
+#define WM_APP_NEEDJAVA (WM_APP + 9)
 
 // ============================ 工具 ============================
 static std::wstring U8ToW(const std::string& s) {
@@ -1043,12 +1054,47 @@ static void LaunchThread(std::string versionId) {
     Log("=========== 启动 " + versionId + " ===========");
     Log("账号: " + (g_cfg.authType == "thirdparty" ? (g_cfg.authName + " (第三方)") : (g_cfg.playerName + " (离线)")));
 
+    g_stepCur = 0;
+
+    // 按 MC 版本自动匹配 Java
+    {
+        int need = RequiredJavaMajor(versionId);
+        if (need > 0) {
+            std::string cur = g_cfg.javaPath.empty() ? "" : JavaVersionOf(fs::u8path(g_cfg.javaPath));
+            int curVer = 0;
+            try { if (!cur.empty()) curVer = std::stoi(cur); } catch (...) {}
+
+            std::string pick = PickJavaFor(need);
+            int pickVer = 0;
+            if (!pick.empty()) {
+                try { pickVer = std::stoi(JavaVersionOf(fs::u8path(pick))); } catch (...) {}
+            }
+
+            if (pickVer > 0 && pickVer != curVer) {
+                // 优先用最贴近的版本：1.20.1 用 17 而不是 25
+                g_cfg.javaPath = pick;
+                SaveConfig();
+                Log("[Java] 自动切换到 Java " + std::to_string(pickVer) +
+                    "（该版本需要 Java " + std::to_string(need) + "）");
+            } else if (curVer < need) {
+                Log("[错误] 该版本需要 Java " + std::to_string(need) + "，未检测到可用 Java");
+                if (g_hwnd) PostMessageW(g_hwnd, WM_APP_NEEDJAVA, (WPARAM)need, 0);
+                g_launching = false;
+                g_progState = 0;
+                return;
+            }
+        }
+    }
+
     if (g_cfg.javaPath.empty() || !FileExists(fs::u8path(g_cfg.javaPath))) {
         Log("[错误] Java 路径无效");
         g_launching = false;
         PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
         return;
     }
+
+    g_stepCur = 1;   // 已通过 Java 检测
+    if (g_cancelLaunch) { g_launching = false; g_progState = 0; return; }
 
     // 启动前自动检查缺失文件并补全
     {
@@ -1077,6 +1123,9 @@ static void LaunchThread(std::string versionId) {
         }
     }
 
+    g_stepCur = 2;   // 依赖处理完
+    if (g_cancelLaunch) { g_launching = false; g_progState = 0; return; }
+
     LaunchPlan plan;
     plan.maxMem = g_cfg.maxMemMB;
     std::string err;
@@ -1086,6 +1135,9 @@ static void LaunchThread(std::string versionId) {
         PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
         return;
     }
+
+    g_stepCur = 3;   // 登录完成
+    if (g_cancelLaunch) { g_launching = false; g_progState = 0; return; }
 
     SECURITY_ATTRIBUTES sa{ sizeof(sa) };
     sa.bInheritHandle = TRUE;
@@ -1119,6 +1171,8 @@ static void LaunchThread(std::string versionId) {
     }
 
     g_progState = 0;
+    g_stepCur = 4;   // 全部完成
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
     Log("[成功] 游戏已启动，PID=" + std::to_string(pi.dwProcessId));
     CloseHandle(pi.hThread);
     g_gameProc = pi.hProcess;
@@ -1225,6 +1279,7 @@ static std::string        g_loginErr;
 #define ID_BTN_DIRDROP   1315
 #define ID_BTN_JAVADROP  1316
 #define ID_BTN_INSTARROW 1317
+#define ID_BTN_OVCANCEL  1330
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1324,6 +1379,9 @@ static void LayoutControls() {
         RECT b = LaunchBtnRect();
         MoveWindow(hBtnLaunch, b.left, b.top, b.right - b.left, b.bottom - b.top, TRUE);
         MoveWindow(hBtnInstArrow, b.right + Scale(8), b.top, Scale(44), b.bottom - b.top, TRUE);
+
+        RECT card = OverlayCardRect();
+        MoveWindow(hBtnOverlayCancel, card.right - Scale(140), card.bottom - Scale(58), Scale(104), Scale(38), TRUE);
         RECT s0 = SmallBtnRect(0), s1 = SmallBtnRect(1);
         MoveWindow(hBtnFill, s0.left, s0.top, s0.right - s0.left, s0.bottom - s0.top, TRUE);
         MoveWindow(hBtnRefresh, s1.left, s1.top, s1.right - s1.left, s1.bottom - s1.top, TRUE);
@@ -1391,7 +1449,7 @@ static void ShowPage(Page p) {
 
 
 
-    ShowWindow(hBtnLaunch, L); ShowWindow(hBtnFill, L); ShowWindow(hBtnRefresh, L); ShowWindow(hBtnInstArrow, L);
+    ApplyOverlayVisibility();
 
     ShowWindow(hEdServer, U); ShowWindow(hEdUser, U); ShowWindow(hEdPass, U);
     ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U);
@@ -1495,6 +1553,70 @@ static void RefreshJavaCands() {
     }
 }
 
+// ============================ Java 版本匹配 ============================
+static int ReadJavaMajorFromJson(const fs::path& p) {
+    std::ifstream f{ p };
+    if (!f) return 0;
+    std::stringstream ss; ss << f.rdbuf();
+    std::string s = ss.str();
+    std::regex re("\"majorVersion\"\\s*:\\s*(\\d+)");
+    std::smatch m;
+    if (std::regex_search(s, m, re)) {
+        try { return std::stoi(m[1].str()); } catch (...) { return 0; }
+    }
+    return 0;
+}
+
+// 该版本需要哪个大版本 Java
+static int RequiredJavaMajor(const std::string& id) {
+    fs::path base = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id);
+    fs::path j1 = base / fs::u8path(id + ".json");
+
+    int m = ReadJavaMajorFromJson(j1);
+    if (m > 0) return m;
+
+    // 顺着 inheritsFrom 找一层
+    std::ifstream f{ j1 };
+    if (f) {
+        std::stringstream ss; ss << f.rdbuf();
+        std::string s = ss.str();
+        std::regex re("\"inheritsFrom\"\\s*:\\s*\"([^\"]+)\"");
+        std::smatch mm;
+        if (std::regex_search(s, mm, re)) {
+            std::string parent = mm[1].str();
+            int pm = ReadJavaMajorFromJson(base / fs::u8path(parent + ".json"));
+            if (pm > 0) return pm;
+        }
+    }
+
+    // 兜底：按版本号猜
+    std::regex vre("1\\.(\\d+)(?:\\.(\\d+))?");
+    std::smatch vm;
+    if (std::regex_search(id, vm, vre)) {
+        int minor = std::stoi(vm[1].str());
+        int patch = vm[2].matched ? std::stoi(vm[2].str()) : 0;
+        if (minor > 20 || (minor == 20 && patch >= 5)) return 21;
+        if (minor >= 18) return 17;
+        if (minor == 17) return 17;
+        return 8;
+    }
+    return 0;
+}
+
+// 在候选里挑一个满足要求的 Java，返回路径；找不到返回空
+static std::string PickJavaFor(int need) {
+    if (g_javaCands.empty()) RefreshJavaCands();
+    std::string best;
+    int bestVer = 9999;
+    for (auto& c : g_javaCands) {
+        std::string v = JavaVersionOf(fs::u8path(c.path));
+        if (v.empty()) continue;
+        int iv = 0;
+        try { iv = std::stoi(v); } catch (...) { continue; }
+        if (iv >= need && iv < bestVer) { bestVer = iv; best = c.path; }
+    }
+    return best;
+}
 // ---------------- 设置页几何 ----------------
 static void SettingsGeom(int row, RECT& ed, RECT& drop, RECT& autoB, RECT& browse) {
     int x  = g_ly.main.left + Scale(40);
@@ -1577,7 +1699,7 @@ static void DrawAboutBlock(HDC dc) {
 
     struct AboutRow { const wchar_t* k; const wchar_t* v; };
     const AboutRow rows[] = {
-        { L"版本",   L"v0.9.9 Beta 2" },
+        { L"版本",   L"v1.0.0 Beta 2" },
         { L"制作人", L"加纳Brightchaserove（抖音）" },
         { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
         { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
@@ -1626,6 +1748,76 @@ static void DrawSettingsMenu(HDC dc) {
         }
         y += itemH;
     }
+}
+
+// ============================ 启动浮层 ============================
+static RECT OverlayCardRect() {
+    RECT c = g_ly.content;
+    int w = Scale(560), h = Scale(310);
+    int cx = (c.left + c.right) / 2;
+    int cy = (c.top + c.bottom) / 2;
+    return { cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2 };
+}
+
+static void ApplyOverlayVisibility() {
+    bool L = (g_page == PAGE_LAUNCH) && !g_overlay;
+    ShowWindow(hBtnLaunch, L ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnFill,   L ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnRefresh, L ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnInstArrow, L ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnOverlayCancel, g_overlay ? SW_SHOW : SW_HIDE);
+}
+
+static void DrawOverlay(HDC dc) {
+    RECT c = g_ly.content;
+    HBRUSH bg = CreateSolidBrush(RGB(16, 17, 20));
+    FillRect(dc, &c, bg);
+    DeleteObject(bg);
+
+    RECT card = OverlayCardRect();
+    FillRoundRect(dc, card, 12, C_CARD);
+
+    int x = card.left + Scale(30);
+    RECT ttl = { x, card.top + Scale(18), card.right - Scale(30), card.top + Scale(48) };
+    DrawTextIn(dc, L"启动游戏", ttl, C_TEXT, g_fUi);
+
+    const wchar_t* steps[4] = { L"检测 Java 版本", L"处理游戏依赖", L"登录", L"等待游戏启动" };
+    int done = g_stepCur.load();
+    int yy = card.top + Scale(62);
+    for (int i = 0; i < 4; ++i) {
+        std::wstring line = (i < done) ? (std::wstring(L"✓  ") + steps[i])
+                          : (i == done) ? (std::wstring(L"→  ") + steps[i])
+                                        : (std::wstring(L"…  ") + steps[i]);
+        COLORREF col = (i < done) ? C_OK : (i == done ? C_TEXT : C_DIM);
+        RECT r = { x, yy, card.right - Scale(30), yy + Scale(28) };
+        DrawTextIn(dc, line, r, col, g_fUi);
+        yy += Scale(32);
+    }
+
+    int total = g_progTotal.load(), cur = g_progCur.load();
+    bool downloading = (g_progState.load() == 1 && total > 0);
+    double ratio = downloading ? ((double)cur / total) : (done / 4.0);
+    if (ratio > 1.0) ratio = 1.0;
+
+    RECT bar = { x, yy + Scale(10), card.right - Scale(30), yy + Scale(20) };
+    FillRoundRect(dc, bar, 5, RGB(42, 44, 50));
+    if (ratio > 0) {
+        RECT f = bar;
+        f.right = bar.left + (int)((bar.right - bar.left) * ratio);
+        FillRoundRect(dc, f, 5, C_ACCENT2);
+    }
+
+    std::wstring st;
+    if (downloading)
+        st = L"正在补全文件 " + std::to_wstring(cur) + L" / " + std::to_wstring(total);
+    else if (done >= 4)
+        st = L"游戏已启动，出错的日志会单独弹出";
+    else if (done == 3)
+        st = L"正在处理启动参数…";
+    else
+        st = L"请耐心等待…";
+    RECT sr = { x, yy + Scale(28), card.right - Scale(160), yy + Scale(54) };
+    DrawTextIn(dc, st, sr, C_DIM, g_fSmall);
 }
 
 static void PaintMain(HDC dc, int w, int h) {
@@ -1998,6 +2190,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnFill    = MakeBtn(hwnd, L"补全文件", ID_BTN_FILL);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
         hBtnInstArrow = MakeBtn(hwnd, L"", ID_BTN_INSTARROW);
+        hBtnOverlayCancel = MakeBtn(hwnd, L"取消", ID_BTN_OVCANCEL);
 
         hEdServer = MakeEdit(hwnd, ID_ED_SERVER, U8ToW(g_cfg.authServer).c_str());
         hEdUser   = MakeEdit(hwnd, ID_ED_USER, L"");
@@ -2039,6 +2232,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
         HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
         PaintMain(mem, rc.right, rc.bottom);
+        if (g_overlay) DrawOverlay(mem);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
         EndPaint(hwnd, &ps);
@@ -2212,7 +2406,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
 
-        case ID_BTN_LAUNCH:
+        case ID_BTN_OVCANCEL:
+        if (g_launching && g_stepCur.load() < 4) g_cancelLaunch = true;
+        g_overlay = false;
+        ApplyOverlayVisibility();
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+
+    case ID_BTN_LAUNCH:
             if (g_launching) return 0;
             if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size()) {
                 g_status = L"请先选择版本";
@@ -2221,6 +2422,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             {
                 std::string ver = g_versions[g_selVersion];
+                g_overlay = true;
+                g_stepCur = 0;
+                g_cancelLaunch = false;
+                g_launching = true;
+                SetWindowTextW(hBtnOverlayCancel, L"取消");
+                ApplyOverlayVisibility();
                 std::thread(LaunchThread, ver).detach();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -2395,7 +2602,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
 
+    case WM_APP_NEEDJAVA: {
+        int need = (int)wp;
+        if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
+        std::wstring msg = L"当前版本需要 Java " + std::to_wstring(need) +
+                           L"，但本机没有检测到合适的 Java。\n\n是否打开 Adoptium 下载页面？";
+        if (MessageBoxW(hwnd, msg.c_str(), L"缺少 Java", MB_YESNO | MB_ICONWARNING) == IDYES) {
+            std::wstring url = L"https://adoptium.net/temurin/releases/?version=" + std::to_wstring(need);
+            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    }
+
     case WM_APP_ERROR:
+        if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
         ShowErrorWindow();
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
@@ -2405,7 +2626,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_TIMER:
-        if (g_launching || g_downloading || g_progState != 0) InvalidateRect(hwnd, nullptr, FALSE);
+        if (g_overlay) {
+            if (g_stepCur.load() >= 4) {
+                SetWindowTextW(hBtnOverlayCancel, L"关闭");
+                if (!g_launching) { g_overlay = false; ApplyOverlayVisibility(); }
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        else if (g_launching || g_downloading || g_progState != 0) InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
 
     case WM_DESTROY:
