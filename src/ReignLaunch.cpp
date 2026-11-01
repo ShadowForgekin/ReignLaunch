@@ -1127,6 +1127,7 @@ static LRESULT CALLBACK ErrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 static std::atomic<bool> g_downloading{ false };
 static bool g_uiTest = false;
 static bool g_showDirList = false;
+static int  g_settingsTab = 0;   // 设置页左侧菜单：0=设置 1=关于
 static bool g_showJavaList = false;
 static int Scale(int v) { return (int)(v * g_dpi / 96.0); }
 
@@ -1444,7 +1445,7 @@ static RECT CandListRect(int row, int count) {
 
 // 下拉打开时，把会被列表盖住的控件先藏起来（子控件永远画在父窗口绘制之上）
 static void SyncSettingsVisibility() {
-    bool onSettings = (g_page == PAGE_SETTINGS);
+    bool onSettings = (g_page == PAGE_SETTINGS) && (g_settingsTab == 0);
     if (!hEdMem) return;
     ShowWindow(hEdJava,        onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnJavaDrop,   onSettings ? SW_SHOW : SW_HIDE);
@@ -1469,6 +1470,82 @@ static void DrawCandList(HDC dc, bool isDir) {
             ? U8ToW(list[i].path)
             : (U8ToW(list[i].label) + L"    " + U8ToW(list[i].path));
         DrawTextIn(dc, txt, it, C_TEXT, g_fSmall);
+        y += itemH;
+    }
+}
+
+// 关于信息块（关于页和设置页共用）
+static void DrawAboutBlock(HDC dc) {
+    int x  = g_ly.main.left + Scale(40);
+    int y  = g_ly.content.top + Scale(50);
+    int lw = Scale(110);
+
+    RECT k1 = { x, y, x + lw, y + Scale(34) };
+    DrawTextIn(dc, L"关于", k1, C_DIM, g_fUi);
+
+    int iconSz = Scale(64);
+    HICON ic = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, iconSz, iconSz, LR_DEFAULTCOLOR);
+    if (ic) {
+        DrawIconEx(dc, x + lw, y - Scale(12), ic, iconSz, iconSz, 0, nullptr, DI_NORMAL);
+        DestroyIcon(ic);
+    }
+
+    int tx = x + lw + iconSz + Scale(14);
+    RECT t1 = { tx, y - Scale(6), g_ly.main.right - Scale(40), y + Scale(30) };
+    DrawTextIn(dc, L"ReignLaunch", t1, C_TEXT, g_fTitle);
+
+    RECT t2 = { tx, y + Scale(30), g_ly.main.right - Scale(40), y + Scale(54) };
+    DrawTextIn(dc, L"Minecraft 启动器", t2, C_DIM, g_fUi);
+
+    struct AboutRow { const wchar_t* k; const wchar_t* v; };
+    const AboutRow rows[] = {
+        { L"版本",   L"v1.0 Beta 1" },
+        { L"制作人", L"加纳Brightchaserove（抖音）" },
+        { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
+        { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
+        { L"下载",   L"Mojang 官方源 + BMCLAPI 镜像，SHA1 校验" },
+        { L"定位",   L"实例化管理、启动前自动补全、出错才弹日志窗口" },
+    };
+
+    int ry = y + Scale(84);
+    for (const auto& r : rows) {
+        RECT kk = { x, ry, x + lw, ry + Scale(28) };
+        RECT vv = { x + lw, ry, g_ly.main.right - Scale(40), ry + Scale(28) };
+        DrawTextIn(dc, r.k, kk, C_DIM, g_fUi);
+        DrawTextIn(dc, r.v, vv, C_TEXT, g_fUi);
+        ry += Scale(38);
+    }
+
+    RECT footer = { x + lw, ry + Scale(20), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
+    DrawTextIn(dc, L"本程序仅用于学习交流，与 Mojang Studios / 微软无关。",
+               footer, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+}
+
+// 设置页左侧子菜单
+static void DrawSettingsMenu(HDC dc) {
+    RECT sb = g_ly.sidebar;
+    HBRUSH sbb = CreateSolidBrush(RGB(30, 31, 35));
+    FillRect(dc, &sb, sbb);
+    DeleteObject(sbb);
+
+    RECT lbl = { sb.left + Scale(20), sb.top + Scale(14), sb.right, sb.top + Scale(44) };
+    DrawTextIn(dc, L"设置", lbl, C_DIM, g_fSmall);
+
+    const wchar_t* items[] = { L"设置", L"关于" };
+    int itemH = Scale(46);
+    int y = sb.top + Scale(50);
+    for (int i = 0; i < 2; ++i) {
+        RECT it = { sb.left + Scale(12), y, sb.right - Scale(12), y + itemH - Scale(8) };
+        bool sel = (g_settingsTab == i);
+        FillRoundRect(dc, it, 8, sel ? C_CARD_SEL : C_CARD);
+        RECT tx = it; tx.left += Scale(14);
+        DrawTextIn(dc, items[i], tx, sel ? C_TEXT : C_DIM, g_fUi);
+        if (sel) {
+            RECT bar = { it.left, it.top + Scale(8), it.left + Scale(3), it.bottom - Scale(8) };
+            HBRUSH b = CreateSolidBrush(C_ACCENT2);
+            FillRect(dc, &bar, b);
+            DeleteObject(b);
+        }
         y += itemH;
     }
 }
@@ -1604,51 +1681,13 @@ static void PaintMain(HDC dc, int w, int h) {
                    hint, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
     }
     else if (g_page == PAGE_ABOUT) {
-        int x  = g_ly.main.left + Scale(40);
-        int y  = g_ly.content.top + Scale(50);
-        int lw = Scale(110);
-
-        RECT k1 = { x, y, x + lw, y + Scale(34) };
-        DrawTextIn(dc, L"关于", k1, C_DIM, g_fUi);
-
-        int iconSz = Scale(64);
-        HICON ic = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, iconSz, iconSz, LR_DEFAULTCOLOR);
-        if (ic) {
-            DrawIconEx(dc, x + lw, y - Scale(12), ic, iconSz, iconSz, 0, nullptr, DI_NORMAL);
-            DestroyIcon(ic);
-        }
-
-        int tx = x + lw + iconSz + Scale(14);
-        RECT t1 = { tx, y - Scale(6), g_ly.main.right - Scale(40), y + Scale(30) };
-        DrawTextIn(dc, L"ReignLaunch", t1, C_TEXT, g_fTitle);
-
-        RECT t2 = { tx, y + Scale(30), g_ly.main.right - Scale(40), y + Scale(54) };
-        DrawTextIn(dc, L"Minecraft 启动器", t2, C_DIM, g_fUi);
-
-        struct AboutRow { const wchar_t* k; const wchar_t* v; };
-        const AboutRow rows[] = {
-            { L"版本",   L"v1.0 Beta 1" },
-            { L"制作人", L"加纳Brightchaserove（抖音）" },
-            { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
-            { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
-            { L"下载",   L"Mojang 官方源 + BMCLAPI 镜像，SHA1 校验" },
-            { L"定位",   L"实例化管理、启动前自动补全、出错才弹日志窗口" },
-        };
-
-        int ry = y + Scale(84);
-        for (const auto& r : rows) {
-            RECT kk = { x, ry, x + lw, ry + Scale(28) };
-            RECT vv = { x + lw, ry, g_ly.main.right - Scale(40), ry + Scale(28) };
-            DrawTextIn(dc, r.k, kk, C_DIM, g_fUi);
-            DrawTextIn(dc, r.v, vv, C_TEXT, g_fUi);
-            ry += Scale(38);
-        }
-
-        RECT footer = { x + lw, ry + Scale(20), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
-        DrawTextIn(dc, L"本程序仅用于学习交流，与 Mojang Studios / 微软无关。",
-                   footer, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        DrawAboutBlock(dc);
     }
     else {
+        DrawSettingsMenu(dc);
+        if (g_settingsTab == 1) {
+            DrawAboutBlock(dc);
+        } else {
         int x = g_ly.main.left + Scale(40);
         int y = g_ly.content.top + Scale(50);
         int rowH = Scale(62);
@@ -1665,6 +1704,7 @@ static void PaintMain(HDC dc, int w, int h) {
         if (!g_status.empty()) {
             RECT st = { x, y + rowH * 4 + Scale(56), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
             DrawTextIn(dc, g_status, st, C_OK, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        }
         }
     }
 
@@ -1977,6 +2017,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (g_dropWnd) { DestroyWindow(g_dropWnd); }
 
+        if (g_page == PAGE_SETTINGS) {
+            RECT sb = g_ly.sidebar;
+            int itemH = Scale(46);
+            int top = sb.top + Scale(50);
+            if (pt.x >= sb.left && pt.x <= sb.right && pt.y >= top && pt.y < top + itemH * 2) {
+                int idx = (pt.y - top) / itemH;
+                if (idx >= 0 && idx < 2 && idx != g_settingsTab) {
+                    g_settingsTab = idx;
+                    SyncSettingsVisibility();
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+                return 0;
+            }
+        }
+
         if (g_page != PAGE_LAUNCH) return 0;
 
         // 版本列表点击
@@ -1992,8 +2047,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEWHEEL: {
-        if (g_dropWnd) { DestroyWindow(g_dropWnd); }
-
         if (g_page != PAGE_LAUNCH) return 0;
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
