@@ -1447,6 +1447,11 @@ static RECT CandListRect(int row, int count) {
 static void SyncSettingsVisibility() {
     bool onSettings = (g_page == PAGE_SETTINGS) && (g_settingsTab == 0);
     if (!hEdMem) return;
+
+    ShowWindow(hEdDir,        onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnDirDrop,   onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnAutoDir,   onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnBrowseDir, onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hEdJava,        onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnJavaDrop,   onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnAutoJava,   onSettings ? SW_SHOW : SW_HIDE);
@@ -1499,7 +1504,7 @@ static void DrawAboutBlock(HDC dc) {
 
     struct AboutRow { const wchar_t* k; const wchar_t* v; };
     const AboutRow rows[] = {
-        { L"版本",   L"v1.0 Beta 1" },
+        { L"版本",   L"v0.9.0" },
         { L"制作人", L"加纳Brightchaserove（抖音）" },
         { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
         { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
