@@ -1,0 +1,20 @@
+# 构建产物
+*.exe
+*.o
+*.obj
+src/res.o
+src/ReignLaunch.exe
+
+# 第三方 jar（构建时自行提供，不随仓库分发）
+src/authlib-injector*.jar
+
+# 编辑器 / 系统
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
+
+# 运行产物
+dump.txt
+*.log
