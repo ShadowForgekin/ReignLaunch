@@ -1571,9 +1571,9 @@ static void LayoutControls() {
 
         MoveWindow(hEdMem,  x + Scale(110), y + rowH * 2, Scale(110), edH, TRUE);
 
-        MoveWindow(hBtnSave, x + Scale(110), y + rowH * 3 + Scale(10), Scale(140), Scale(40), TRUE);
-        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 3 + Scale(10), Scale(240), Scale(40), TRUE);
-        MoveWindow(hEdThreads, x + Scale(110), y + rowH * 4 + Scale(6), Scale(90), Scale(30), TRUE);
+        MoveWindow(hBtnSave, x + Scale(110), y + rowH * 4 + Scale(10), Scale(140), Scale(40), TRUE);
+        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 4 + Scale(10), Scale(240), Scale(40), TRUE);
+        MoveWindow(hEdThreads, x + Scale(110), y + rowH * 3 + Scale(6), Scale(90), Scale(30), TRUE);
     }
 }
 
@@ -2319,15 +2319,16 @@ static void PaintMain(HDC dc, int w, int h) {
         DrawTextIn(dc, L"", { x + Scale(360), y + rowH * 3, x + Scale(600), y + rowH * 3 + Scale(30) },
                    C_DIM, g_fSmall);
 
-        if (!g_status.empty()) {
         {
-            RECT tl = { x, y + rowH * 4 + Scale(6), x + Scale(100), y + rowH * 4 + Scale(36) };
+            RECT tl = { x, y + rowH * 3 + Scale(6), x + Scale(100), y + rowH * 3 + Scale(36) };
             DrawTextIn(dc, L"下载线程", tl, C_DIM, g_fUi);
-            RECT th = { x + Scale(210), y + rowH * 4 + Scale(12), g_ly.main.right - Scale(40), y + rowH * 4 + Scale(34) };
+            RECT th = { x + Scale(210), y + rowH * 3 + Scale(12), g_ly.main.right - Scale(40), y + rowH * 3 + Scale(34) };
             DrawTextIn(dc, L"1 - 128（默认 4）", th, C_DIM, g_fSmall);
         }
 
-            RECT st = { x, y + rowH * 4 + Scale(56), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
+
+        if (!g_status.empty()) {
+            RECT st = { x, y + rowH * 5 + Scale(50), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
             DrawTextIn(dc, g_status, st, C_OK, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
         }
         }
