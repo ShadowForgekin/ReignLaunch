@@ -1122,6 +1122,7 @@ static int CountMissing(const std::string& versionId) {
 
 // ============================ 启动线程 ============================
 static HANDLE g_gameProc = nullptr;
+static std::atomic<DWORD> g_gamePid{ 0 };
 
 static void PumpOutput(HANDLE hRead) {
     char buf[4096];
@@ -1294,6 +1295,7 @@ static void LaunchThread(std::string versionId) {
     Log("[成功] 游戏进程已创建，PID=" + std::to_string(pi.dwProcessId) + "，等待游戏窗口…");
     CloseHandle(pi.hThread);
     g_gameProc = pi.hProcess;
+    g_gamePid = pi.dwProcessId;
 
     // 第四步「等待游戏启动」：等窗口真的出现才打勾
     {
@@ -1319,6 +1321,7 @@ static void LaunchThread(std::string versionId) {
     Log("=========== 游戏退出，退出码 " + std::to_string(code) + " ===========");
     CloseHandle(pi.hProcess);
     g_gameProc = nullptr;
+    g_gamePid = 0;
     g_launching = false;
 
     if (code != 0) PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
@@ -2792,7 +2795,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case ID_BTN_OVCANCEL:
-        if (g_launching && g_stepCur.load() < 4) g_cancelLaunch = true;
+        g_cancelLaunch = true;
+        // 立刻终止已经起来的游戏进程
+        {
+            DWORD pid = g_gamePid.load();
+            HANDLE hp = g_gameProc;
+            if (hp) {
+                TerminateProcess(hp, 0);
+                Log("[取消] 已强制结束游戏进程（句柄）");
+            } else if (pid != 0) {
+                HANDLE h2 = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+                if (h2) {
+                    TerminateProcess(h2, 0);
+                    CloseHandle(h2);
+                    Log("[取消] 已强制结束游戏进程（PID " + std::to_string(pid) + "）");
+                }
+            }
+        }
         g_overlay = false;
         ApplyOverlayVisibility();
         InvalidateRect(hwnd, nullptr, TRUE);
