@@ -82,7 +82,7 @@ static HFONT g_fTitle = nullptr, g_fUi = nullptr, g_fSmall = nullptr;
 
 // ============================ 控件 ============================
 static HWND hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout;
-static HWND hBtnLaunch, hBtnFill, hBtnRefresh;
+static HWND hBtnLaunch, hBtnFill, hBtnRefresh, hBtnInstArrow;
 
 static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
 static HWND hBtnLogin, hBtnLogout, hBtnOffline;
@@ -1164,6 +1164,7 @@ static std::string        g_loginErr;
 #define ID_BTN_BROWSEJAVA 1314
 #define ID_BTN_DIRDROP   1315
 #define ID_BTN_JAVADROP  1316
+#define ID_BTN_INSTARROW 1317
 #define ID_BTN_SAVE     1320
 
 static void FillRoundRect(HDC dc, RECT r, int radius, COLORREF color) {
@@ -1254,6 +1255,7 @@ static void LayoutControls() {
     {
         RECT b = LaunchBtnRect();
         MoveWindow(hBtnLaunch, b.left, b.top, b.right - b.left, b.bottom - b.top, TRUE);
+        MoveWindow(hBtnInstArrow, b.left - Scale(52), b.top, Scale(44), b.bottom - b.top, TRUE);
         RECT s0 = SmallBtnRect(0), s1 = SmallBtnRect(1);
         MoveWindow(hBtnFill, s0.left, s0.top, s0.right - s0.left, s0.bottom - s0.top, TRUE);
         MoveWindow(hBtnRefresh, s1.left, s1.top, s1.right - s1.left, s1.bottom - s1.top, TRUE);
@@ -1319,7 +1321,7 @@ static void ShowPage(Page p) {
 
 
 
-    ShowWindow(hBtnLaunch, L); ShowWindow(hBtnFill, L); ShowWindow(hBtnRefresh, L);
+    ShowWindow(hBtnLaunch, L); ShowWindow(hBtnFill, L); ShowWindow(hBtnRefresh, L); ShowWindow(hBtnInstArrow, L);
 
     ShowWindow(hEdServer, U); ShowWindow(hEdUser, U); ShowWindow(hEdPass, U);
     ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U);
@@ -1581,14 +1583,19 @@ static void PaintMain(HDC dc, int w, int h) {
         FillRect(dc, &sb, sbb);
         DeleteObject(sbb);
 
-        RECT lbl = { sb.left + Scale(20), sb.top + Scale(14), sb.right, sb.top + Scale(44) };
+        RECT lbl = { sb.left + Scale(20), sb.top + Scale(12), sb.right, sb.top + Scale(36) };
         DrawTextIn(dc, L"实例 (" + std::to_wstring(g_versions.size()) + L")", lbl, C_DIM, g_fSmall);
 
+        std::wstring curInst = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
+            ? U8ToW(g_versions[g_selVersion]) : std::wstring(L"（未选择）");
+        RECT curLbl = { sb.left + Scale(20), sb.top + Scale(32), sb.right - Scale(12), sb.top + Scale(64) };
+        DrawTextIn(dc, curInst, curLbl, C_TEXT, g_fUi);
+
         int itemH = Scale(46);
-        int y = sb.top + Scale(50) - g_listScroll;
+        int y = sb.top + Scale(86) - g_listScroll;
         for (size_t i = 0; i < g_versions.size(); ++i) {
             RECT item = { sb.left + Scale(12), y, sb.right - Scale(12), y + itemH - Scale(8) };
-            if (item.bottom > sb.top + Scale(50) && item.top < sb.bottom) {
+            if (item.bottom > sb.top + Scale(86) && item.top < sb.bottom) {
                 bool sel = ((int)i == g_selVersion);
                 FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
                 RECT tx = item; tx.left += Scale(14);
@@ -1611,20 +1618,15 @@ static void PaintMain(HDC dc, int w, int h) {
         // 主区信息
         int x = g_ly.main.left + Scale(40);
         RECT l1 = { x, g_ly.content.top + Scale(40), g_ly.main.right, g_ly.content.top + Scale(66) };
-        DrawTextIn(dc, L"当前实例", l1, C_DIM, g_fSmall);
-
-        std::wstring ver = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
-                         ? U8ToW(g_versions[g_selVersion]) : L"（未选择版本）";
-        RECT l2 = { x, g_ly.content.top + Scale(68), g_ly.main.right - Scale(20), g_ly.content.top + Scale(116) };
-        DrawTextIn(dc, ver, l2, C_TEXT, g_fTitle);
+        DrawTextIn(dc, L"启动设置", l1, C_DIM, g_fSmall);
 
         std::wstring acct = (g_cfg.authType == "thirdparty")
             ? (L"账号: " + U8ToW(g_cfg.authName) + L"（第三方）")
             : (L"账号: " + U8ToW(g_cfg.playerName) + L"（离线）");
 
-        RECT l3 = { x, g_ly.content.top + Scale(132), g_ly.main.right, g_ly.content.top + Scale(158) };
-        RECT l4 = { x, g_ly.content.top + Scale(158), g_ly.main.right, g_ly.content.top + Scale(184) };
-        RECT l5 = { x, g_ly.content.top + Scale(184), g_ly.main.right, g_ly.content.top + Scale(210) };
+        RECT l3 = { x, g_ly.content.top + Scale(76), g_ly.main.right, g_ly.content.top + Scale(102) };
+        RECT l4 = { x, g_ly.content.top + Scale(102), g_ly.main.right, g_ly.content.top + Scale(128) };
+        RECT l5 = { x, g_ly.content.top + Scale(128), g_ly.main.right, g_ly.content.top + Scale(154) };
         DrawTextIn(dc, acct, l3, C_DIM, g_fUi);
         DrawTextIn(dc, L"内存: " + std::to_wstring(g_cfg.maxMemMB) + L" MB", l4, C_DIM, g_fUi);
         std::wstring jp = g_cfg.javaPath.empty() ? L"（未设置）" : fs::u8path(EffectiveJavaExe()).filename().wstring();
@@ -1804,7 +1806,7 @@ static bool PickJava(HWND owner, std::string& out) {
 #define WM_DROP_PICK (WM_APP + 10)
 
 static HWND  g_dropWnd = nullptr;
-static bool  g_dropIsDir = false;
+static int   g_dropMode = 0;   // 0=dir 1=java 2=instance
 static int   g_dropHot = -1;
 static DWORD g_dropBorn = 0;
 static std::vector<Cand> g_dropItems;
@@ -1828,9 +1830,10 @@ static LRESULT CALLBACK DropProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 FillRect(dc, &it, hb);
                 DeleteObject(hb);
             }
-            std::wstring txt = g_dropIsDir
+            std::wstring txt = (g_dropMode == 0)
                 ? U8ToW(g_dropItems[i].path)
-                : (U8ToW(g_dropItems[i].label) + L"    " + U8ToW(g_dropItems[i].path));
+                : ((g_dropMode == 1) ? (U8ToW(g_dropItems[i].label) + L"    " + U8ToW(g_dropItems[i].path))
+                                     : U8ToW(g_dropItems[i].path));
             RECT tt = it; tt.left += Scale(8); tt.right -= Scale(4);
             DrawTextIn(dc, txt, tt, C_TEXT, g_fSmall);
             y += itemH;
@@ -1847,7 +1850,7 @@ static LRESULT CALLBACK DropProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         int idx = (GET_Y_LPARAM(lp) - Scale(4)) / Scale(28);
         if (idx >= 0 && idx < (int)g_dropItems.size())
-            PostMessageW(g_hwnd, WM_DROP_PICK, (WPARAM)idx, (LPARAM)(g_dropIsDir ? 1 : 0));
+            PostMessageW(g_hwnd, WM_DROP_PICK, (WPARAM)idx, (LPARAM)g_dropMode);
         DestroyWindow(hwnd);
         return 0;
     }
@@ -1867,17 +1870,22 @@ static LRESULT CALLBACK DropProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // 浮层只是一个小方块，无标题栏、不进任务栏，看起来仍是一个窗口
-static void ShowDropPopup(bool isDir) {
+static void ShowDropPopup(int mode) {
     if (g_dropWnd) { DestroyWindow(g_dropWnd); return; }
 
-    g_dropItems = isDir ? g_dirCands : g_javaCands;
+    g_dropItems.clear();
+    if (mode == 0)      g_dropItems = g_dirCands;
+    else if (mode == 1) g_dropItems = g_javaCands;
+    else for (auto& v : g_versions) g_dropItems.push_back({ v, v });
     if (g_dropItems.empty()) return;
 
     RECT er{};
-    GetWindowRect(isDir ? hEdDir : hEdJava, &er);
+    if (mode == 0)      GetWindowRect(hEdDir, &er);
+    else if (mode == 1) GetWindowRect(hEdJava, &er);
+    else                GetWindowRect(hBtnInstArrow, &er);
 
     int itemH = Scale(28);
-    int w = Scale(420);
+    int w = Scale(mode == 2 ? 300 : 420);
     int h = itemH * (int)g_dropItems.size() + Scale(8);
 
     static bool reg = false;
@@ -1891,11 +1899,13 @@ static void ShowDropPopup(bool isDir) {
         reg = true;
     }
 
-    g_dropIsDir = isDir;
+    g_dropMode = mode;
     g_dropHot = -1;
+    int px2 = er.left;
+    int py2 = (mode == 2) ? (er.top - h - Scale(2)) : (er.bottom + Scale(2));
     g_dropWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"ReignLaunchDrop", L"",
         WS_POPUP | WS_BORDER,
-        er.left, er.bottom + Scale(2), w, h,
+        px2, py2, w, h,
         g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!g_dropWnd) return;
     g_dropBorn = GetTickCount();
@@ -1917,6 +1927,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnFill    = MakeBtn(hwnd, L"补全文件", ID_BTN_FILL);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
+        hBtnInstArrow = MakeBtn(hwnd, L"", ID_BTN_INSTARROW);
 
         hEdServer = MakeEdit(hwnd, ID_ED_SERVER, U8ToW(g_cfg.authServer).c_str());
         hEdUser   = MakeEdit(hwnd, ID_ED_USER, L"");
@@ -1991,12 +2002,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         FillRoundRect(d->hDC, r, 8, bg);
 
-        if (id == ID_BTN_DIRDROP || id == ID_BTN_JAVADROP) {
+        if (id == ID_BTN_DIRDROP || id == ID_BTN_JAVADROP || id == ID_BTN_INSTARROW) {
             int cx = (r.left + r.right) / 2;
             int cy = (r.top + r.bottom) / 2;
-            POINT tri[3] = { { cx - Scale(6), cy - Scale(3) },
-                             { cx + Scale(6), cy - Scale(3) },
-                             { cx,            cy + Scale(4) } };
+            POINT tri[3];
+            if (id == ID_BTN_INSTARROW) {
+                tri[0] = { cx - Scale(8), cy + Scale(4) };
+                tri[1] = { cx + Scale(8), cy + Scale(4) };
+                tri[2] = { cx,            cy - Scale(6) };
+            } else {
+                tri[0] = { cx - Scale(6), cy - Scale(3) };
+                tri[1] = { cx + Scale(6), cy - Scale(3) };
+                tri[2] = { cx,            cy + Scale(4) };
+            }
             HBRUSH tb = CreateSolidBrush(C_TEXT);
             HPEN   tp = CreatePen(PS_SOLID, 1, C_TEXT);
             HBRUSH ob = (HBRUSH)SelectObject(d->hDC, tb);
@@ -2040,9 +2058,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_page != PAGE_LAUNCH) return 0;
 
         // 版本列表点击
-        if (PtInRect(&g_ly.sidebar, pt) && pt.y > g_ly.sidebar.top + Scale(50)) {
+        if (PtInRect(&g_ly.sidebar, pt) && pt.y > g_ly.sidebar.top + Scale(86)) {
             int itemH = Scale(46);
-            int idx = (pt.y - (g_ly.sidebar.top + Scale(50)) + g_listScroll) / itemH;
+            int idx = (pt.y - (g_ly.sidebar.top + Scale(86)) + g_listScroll) / itemH;
             if (idx >= 0 && idx < (int)g_versions.size()) {
                 g_selVersion = idx;
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -2059,7 +2077,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
         int itemH = Scale(46);
-        int listH = (int)(g_ly.sidebar.bottom - g_ly.sidebar.top) - Scale(60);
+        int listH = (int)(g_ly.sidebar.bottom - g_ly.sidebar.top) - Scale(96);
         int maxScroll = std::max(0, (int)g_versions.size() * itemH - listH);
         g_listScroll -= delta * itemH;
         g_listScroll = std::max(0, std::min(maxScroll, g_listScroll));
@@ -2160,14 +2178,19 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
 
-        case ID_BTN_DIRDROP:
+        case ID_BTN_INSTARROW:
+        if (g_versions.empty()) ScanVersions();
+        ShowDropPopup(2);
+        break;
+
+    case ID_BTN_DIRDROP:
             if (g_dirCands.empty()) RefreshDirCands();
-            ShowDropPopup(true);
+            ShowDropPopup(0);
             break;
 
         case ID_BTN_JAVADROP:
             if (g_javaCands.empty()) RefreshJavaCands();
-            ShowDropPopup(false);
+            ShowDropPopup(1);
             break;
 
         case ID_BTN_AUTODIR: {
@@ -2235,7 +2258,16 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DROP_PICK: {
         int idx = (int)wp;
-        bool isDir = (lp != 0);
+        int mode = (int)lp;
+        if (mode == 2) {
+            if (idx >= 0 && idx < (int)g_versions.size()) {
+                g_selVersion = idx;
+                g_status = L"已切换到实例：" + U8ToW(g_versions[idx]);
+            }
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        }
+        bool isDir = (mode == 0);
         if (isDir && idx >= 0 && idx < (int)g_dirCands.size()) {
             g_cfg.gameDir = g_dirCands[idx].path;
             SetWindowTextW(hEdDir, U8ToW(g_cfg.gameDir).c_str());
