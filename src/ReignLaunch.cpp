@@ -127,7 +127,7 @@ static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
-static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl, hBtnDlFilterSel;
+static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl, hBtnDlFilterSel, hBtnDlCancel;
 
 struct McVer { std::string id, type, url, date; };
 static std::vector<McVer> g_mcVers;
@@ -146,7 +146,12 @@ static std::vector<std::string> g_ldVers;   // 当前加载器的可选版本
 static std::vector<std::string> g_ldFiles;  // 对应 mod 的下载地址（0/1/2/3/4 为空）
 static int g_ldSel = -1;
 static std::atomic<int> g_ldVersState{ 0 };
-static std::atomic<bool> g_dlBusy{ false };   // 正在下载/安装 // 0未取 1取中 2成功 3失败
+static std::atomic<bool> g_dlBusy{ false };   // 正在下载/安装
+static std::atomic<bool> g_dlCancel{ false }; // 用户取消
+static std::atomic<long long> g_dlBytes{ 0 };
+static long long g_dlLastBytes = 0;
+static DWORD     g_dlLastTick = 0;
+static double    g_dlSpeed = 0; // 0未取 1取中 2成功 3失败
 static void FetchLoaderVersThread();
 static void RebuildDlView();
 static void FetchManifestThread();
@@ -682,6 +687,7 @@ static bool DownloadFile(const std::string& url, const fs::path& dest, std::stri
         if (!f) { err = "写入失败"; return false; }
         f.write((const char*)data.data(), (std::streamsize)data.size());
     }
+    g_dlBytes += (long long)data.size();
     fs::rename(part, dest, ec);
     if (ec) { fs::remove(part, ec); err = "重命名失败"; return false; }
     return true;
@@ -1040,6 +1046,7 @@ static void RunDownloads(std::vector<DLTask>& tasks, DownloadStats& st, int thre
     for (int i = 0; i < threads; ++i) {
         pool.emplace_back([&]() {
             for (;;) {
+                if (g_dlCancel) break;
                 size_t idx = next.fetch_add(1);
                 if (idx >= tasks.size()) break;
                 std::string err;
@@ -1512,6 +1519,7 @@ static std::string        g_loginErr;
 #define ID_DL_FAPI       1387
 #define ID_DL_QSL        1388
 #define ID_DL_FILTERSEL  1389
+#define ID_DL_CANCEL     1390
 #define ID_ED_SEARCH     1385
 #define ID_DL_BACK       1386
 #define ID_BTN_SAVE     1320
@@ -1682,6 +1690,8 @@ static void LayoutControls() {
         MoveWindow(hBtnFull,   x + Scale(322), y + rowH * 6 + Scale(4), Scale(230), Scale(36), TRUE);
         MoveWindow(hBtnUpdate, g_ly.main.left + Scale(40), g_ly.content.bottom - Scale(70), Scale(140), Scale(38), TRUE);
 
+    }
+
         {
             int tx0 = g_ly.content.left + Scale(24);
             int ty0 = g_ly.content.top + Scale(16);
@@ -1701,8 +1711,10 @@ static void LayoutControls() {
             MoveWindow(hBtnDlInstall, g_ly.content.right - Scale(24) - Scale(130),
                        g_ly.content.bottom - Scale(58), Scale(130), Scale(38), TRUE);
             MoveWindow(hBtnDlBack, g_ly.content.left + Scale(24), g_ly.content.bottom - Scale(58), Scale(100), Scale(32), TRUE);
-
-        }
+            {
+                int cy2 = (g_ly.content.top + g_ly.content.bottom) / 2 + Scale(55);
+                MoveWindow(hBtnDlCancel, g_ly.content.right - Scale(24) - Scale(130), cy2, Scale(130), Scale(32), TRUE);
+            }
     }
 }
 
@@ -1717,6 +1729,7 @@ static void SyncDownloadControls() {
     ShowWindow(hBtnDlFapi, showDet);
     ShowWindow(hBtnDlQsl,  showDet);
     ShowWindow(hBtnDlFilterSel, showDl);
+    ShowWindow(hBtnDlCancel, (g_dlBusy.load() && (g_page == PAGE_DOWNLOAD)) ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnDlF0, SW_HIDE);
     ShowWindow(hBtnDlF1, SW_HIDE);
     ShowWindow(hBtnDlF2, SW_HIDE);
@@ -2678,6 +2691,55 @@ static void FillLine(HDC dc, int left, int right, int y, COLORREF col) {
 }
 
 // 沉浸式启动画面：背景图/深灰渐变 + 底部 200px 渐变压暗 + 左下角状态 + 贴底进度条
+// 下载任务面板（下载页中央卡片）
+static void DrawDlTaskPanel(HDC dc) {
+    if (!g_dlBusy.load()) return;
+
+    RECT c = g_ly.content;
+    int w = Scale(560), h = Scale(190);
+    int cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2;
+    RECT card = { cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2 };
+
+    // 遮罩
+    HBRUSH dim = CreateSolidBrush(RGB(18, 19, 22));
+    FillRect(dc, &c, dim);
+    DeleteObject(dim);
+
+    FillRoundRect(dc, card, 12, C_CARD);
+
+    int x = card.left + Scale(24);
+    RECT ttl = { x, card.top + Scale(18), card.right - Scale(24), card.top + Scale(46) };
+    DrawTextIn(dc, g_status.empty() ? L"正在下载…" : g_status, ttl, C_TEXT, g_fUi);
+
+    int total = g_progTotal.load(), cur = g_progCur.load();
+    double ratio = (total > 0) ? ((double)cur / total) : 0.0;
+    if (ratio > 1) ratio = 1;
+
+    RECT bar = { x, card.top + Scale(56), card.right - Scale(24), card.top + Scale(72) };
+    FillRoundRect(dc, bar, 6, RGB(40, 42, 48));
+    if (ratio > 0) {
+        RECT fg = bar;
+        fg.right = bar.left + (int)((bar.right - bar.left) * ratio);
+        if (fg.right < fg.left + 2) fg.right = fg.left + 2;
+        FillRoundRect(dc, fg, 6, C_ACCENT2);
+    }
+
+    // 已完成 / 剩余
+    std::wstring s1 = L"已完成 " + std::to_wstring(cur) + L" 个文件";
+    if (total > 0) s1 += L"    剩余 " + std::to_wstring(total - cur) + L" 个";
+    RECT r1 = { x, card.top + Scale(82), card.right - Scale(24), card.top + Scale(108) };
+    DrawTextIn(dc, s1, r1, C_TEXT, g_fSmall);
+
+    // 百分比 + 速度
+    std::wstring sp;
+    if (g_dlSpeed > 1024.0 * 1024.0) sp = std::to_wstring(g_dlSpeed / 1024.0 / 1024.0).substr(0, 4) + L" MB/s";
+    else if (g_dlSpeed > 0)          sp = std::to_wstring((int)(g_dlSpeed / 1024.0)) + L" KB/s";
+    else                             sp = L"— KB/s";
+
+    std::wstring s2 = (total > 0 ? (std::to_wstring((int)(ratio * 100)) + L"%") : L"…") + L"    " + sp;
+    RECT r2 = { x, card.top + Scale(112), card.right - Scale(24), card.top + Scale(140) };
+    DrawTextIn(dc, s2, r2, C_DIM, g_fSmall);
+}
 // 下载进度条（下载页底部）
 static void DrawDlProgress(HDC dc) {
     if (g_progState.load() != 1 && !g_dlBusy.load()) return;
@@ -3053,6 +3115,7 @@ static void PaintMain(HDC dc, int w, int h) {
                 }
             }
             DrawDlProgress(dc);
+            DrawDlTaskPanel(dc);
             return;
         }
 
@@ -3109,6 +3172,7 @@ static void PaintMain(HDC dc, int w, int h) {
             }
         }
         DrawDlProgress(dc);
+            DrawDlTaskPanel(dc);
     }
     else if (g_page == PAGE_ABOUT) {
         DrawAboutBlock(dc);
@@ -3399,6 +3463,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnDlFapi    = MakeBtn(hwnd, L"Fabric API", ID_DL_FAPI);
         hBtnDlQsl     = MakeBtn(hwnd, L"QSL", ID_DL_QSL);
         hBtnDlFilterSel = MakeBtn(hwnd, L"正式版  ▾", ID_DL_FILTERSEL);
+        hBtnDlCancel    = MakeBtn(hwnd, L"取消下载", ID_DL_CANCEL);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
@@ -3735,7 +3800,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
 
-        case ID_DL_FILTERSEL:
+        case ID_DL_CANCEL:
+        g_dlCancel = true;
+        g_status = L"正在取消下载…";
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+
+    case ID_DL_FILTERSEL:
         ShowDropPopup(7);
         break;
 
@@ -3775,9 +3846,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::string url = g_mcVers[realIdx].url;
 
             if (g_dlLoader == 0) {
-                std::wstring cmsg = L"安装原版 " + U8ToW(mc) + L"（不安装加载器）？";
-                if (MessageBoxW(hwnd, cmsg.c_str(), L"下载原版", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
                 g_status = L"开始安装：" + U8ToW(mc);
+            g_dlCancel = false;
+            g_dlBytes = 0;
                 std::thread(InstallVersionThread, mc, url).detach();
             } else if (g_dlLoader >= 5) {
                 if (g_ldSel < 0 || g_ldSel >= (int)g_ldFiles.size()) {
@@ -3814,11 +3885,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     break;
                 }
                 std::string lv = g_ldVers[g_ldSel];
-                std::wstring cmsg = L"为 " + U8ToW(mc) + L" 安装 " +
-                                    (g_dlLoader == 1 ? L"Fabric " : g_dlLoader == 2 ? L"Quilt " :
-                                     g_dlLoader == 3 ? L"Forge " : L"NeoForge ") +
-                                    U8ToW(lv) + L"？";
-                if (MessageBoxW(hwnd, cmsg.c_str(), L"安装加载器", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
+                g_dlCancel = false;
+                g_dlBytes = 0;
                 if (g_dlLoader == 1)      std::thread(InstallMetaLoaderThread, mc, false, lv).detach();
                 else if (g_dlLoader == 2) std::thread(InstallMetaLoaderThread, mc, true, lv).detach();
                 else if (g_dlLoader == 3) std::thread(InstallInstallerThread, mc, false, lv).detach();
@@ -4171,6 +4239,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_APP_NEEDJAVA: {
         int need = (int)wp;
+        if (g_dlBusy.load()) {
+            DWORD now = GetTickCount();
+            long long cb = g_dlBytes.load();
+            if (g_dlLastTick && now > g_dlLastTick) {
+                double dt = (now - g_dlLastTick) / 1000.0;
+                if (dt > 0.2) {
+                    g_dlSpeed = (cb - g_dlLastBytes) / dt;
+                    g_dlLastBytes = cb;
+                    g_dlLastTick = now;
+                }
+            } else {
+                g_dlLastTick = now;
+                g_dlLastBytes = cb;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+
         if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
         std::wstring msg = L"当前版本需要 Java " + std::to_wstring(need) +
                            L"，但本机没有检测到合适的 Java。\n\n是否打开 Adoptium 下载页面？";
@@ -4183,6 +4268,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_APP_ERROR:
+        if (g_dlBusy.load()) {
+            DWORD now = GetTickCount();
+            long long cb = g_dlBytes.load();
+            if (g_dlLastTick && now > g_dlLastTick) {
+                double dt = (now - g_dlLastTick) / 1000.0;
+                if (dt > 0.2) {
+                    g_dlSpeed = (cb - g_dlLastBytes) / dt;
+                    g_dlLastBytes = cb;
+                    g_dlLastTick = now;
+                }
+            } else {
+                g_dlLastTick = now;
+                g_dlLastBytes = cb;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+
         if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
         ShowErrorWindow();
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -4195,6 +4297,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_TIMER:
+        if (g_dlBusy.load()) {
+            DWORD now = GetTickCount();
+            long long cb = g_dlBytes.load();
+            if (g_dlLastTick && now > g_dlLastTick) {
+                double dt = (now - g_dlLastTick) / 1000.0;
+                if (dt > 0.2) {
+                    g_dlSpeed = (cb - g_dlLastBytes) / dt;
+                    g_dlLastBytes = cb;
+                    g_dlLastTick = now;
+                }
+            } else {
+                g_dlLastTick = now;
+                g_dlLastBytes = cb;
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+
         if (g_overlay) {
             if (g_stepCur.load() >= 4) {
                 SetWindowTextW(hBtnOverlayCancel, L"关闭");
