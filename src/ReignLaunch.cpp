@@ -46,7 +46,7 @@ using json = nlohmann::json;
 #define IDI_APP         100   // 应用图标
 
 // ============================ 页面 ============================
-enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, PAGE_INSTANCES = 4 };
+enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, PAGE_INSTANCES = 4, PAGE_DOWNLOAD = 5 };
 
 // ============================ 配置 ============================
 struct Account {
@@ -110,7 +110,7 @@ static HWND g_hwnd = nullptr;
 static HFONT g_fTitle = nullptr, g_fUi = nullptr, g_fSmall = nullptr;
 
 // ============================ 控件 ============================
-static HWND hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout, hBtnTabInst;
+static HWND hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout, hBtnTabInst, hBtnTabDl;
 static HWND hBtnLaunch, hBtnFill, hBtnRefresh, hBtnInstArrow, hBtnOverlayCancel;
 static std::string JavaVersionOf(const fs::path& javaw);
 static int RequiredJavaMajor(const std::string& id);
@@ -126,6 +126,11 @@ static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate;
+
+struct McVer { std::string id, type, url; };
+static std::vector<McVer> g_mcVers;
+static std::atomic<int>  g_mcVersState{ 0 };
+static void FetchManifestThread();
 
 // ============================ 颜色 ============================
 static const COLORREF C_BG       = RGB(24, 25, 28);
@@ -1443,6 +1448,7 @@ static std::string        g_loginErr;
 #define ID_TAB_SET      1003
 #define ID_TAB_ABOUT    1004
 #define ID_TAB_INST     1005
+#define ID_TAB_DL       1006
 #define ID_BTN_LAUNCH   1101
 #define ID_BTN_FILL     1102
 #define ID_BTN_REFRESH  1103
@@ -1567,8 +1573,8 @@ static void LayoutControls() {
     int w = g_ly.content.right, h = g_ly.content.bottom;
 
     // 顶部标签
-    HWND tabBtns[4] = { hBtnTabLaunch, hBtnTabInst, hBtnTabUser, hBtnTabSettings };
-    for (int i = 0; i < 4; ++i) {
+    HWND tabBtns[5] = { hBtnTabLaunch, hBtnTabDl, hBtnTabInst, hBtnTabUser, hBtnTabSettings };
+    for (int i = 0; i < 5; ++i) {
         RECT r = TabRect(i);
         MoveWindow(tabBtns[i], r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
     }
@@ -1648,12 +1654,15 @@ static void ShowPage(Page p) {
     g_page = p;
     bool L = (p == PAGE_LAUNCH), U = (p == PAGE_USER), S = (p == PAGE_SETTINGS);
     if (p != PAGE_SETTINGS) { g_showDirList = false; g_showJavaList = false; }
+    if (p == PAGE_DOWNLOAD && g_mcVersState.load() == 0)
+        std::thread(FetchManifestThread).detach();
 
     // 顶部标签必须始终可见，否则切不到别的页
     ShowWindow(hBtnTabLaunch, SW_SHOW);
     ShowWindow(hBtnTabUser, SW_SHOW);
     ShowWindow(hBtnTabSettings, SW_SHOW);
     ShowWindow(hBtnTabInst, SW_SHOW);
+    ShowWindow(hBtnTabDl, SW_SHOW);
 
 
 
@@ -2077,6 +2086,64 @@ static void DrawSettingsMenu(HDC dc) {
     }
 }
 
+// ============================ 原版下载 ============================
+
+
+static void FetchManifestThread() {
+    g_mcVersState = 1;
+    std::vector<unsigned char> data;
+    std::string err;
+    bool ok = HttpRequest("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+                          "GET", "", "", data, err);
+    if (ok && !data.empty()) {
+        std::string body(data.begin(), data.end());
+        json j = json::parse(body, nullptr, false);
+        if (j.is_object() && j.contains("versions") && j["versions"].is_array()) {
+            std::vector<McVer> list;
+            for (auto& v : j["versions"]) {
+                McVer m;
+                m.id   = v.value("id", std::string());
+                m.type = v.value("type", std::string());
+                m.url  = v.value("url", std::string());
+                if (!m.id.empty() && !m.url.empty()) list.push_back(m);
+            }
+            g_mcVers = list;
+            g_mcVersState = 2;
+        } else g_mcVersState = 3;
+    } else g_mcVersState = 3;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
+
+// 安装：下载版本 json → 自动补全客户端/依赖/资源
+static void InstallVersionThread(std::string id, std::string url) {
+    g_progState = 0;
+    g_progCur = 0;
+    g_progTotal = 0;
+    g_status = L"正在下载版本 JSON…";
+
+    fs::path dir = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id);
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    fs::path jf = dir / fs::u8path(id + ".json");
+
+    std::string err;
+    if (!DownloadFile(url, jf, err)) {
+        g_status = L"下载版本 JSON 失败：" + U8ToW(err);
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
+        return;
+    }
+
+    g_status = L"正在补全文件…";
+    DownloadStats st;
+    DownloadMissing(id, st);
+    g_progState = 0;
+
+    if (g_hwnd) {
+        g_status = L"安装完成：" + U8ToW(id) + L"（下载 " + std::to_wstring(st.downloaded) + L" 个文件）";
+        ScanVersions();
+        PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+    }
+}
 // ============================ 自动更新 ============================
 #define APP_TAG L"v1.1.0-beta3.5"
 
@@ -2342,7 +2409,7 @@ static void PaintMain(HDC dc, int w, int h) {
 
     // 当前页标题
     RECT pt = { g_ly.main.left + Scale(40), g_ly.content.top + Scale(12), g_ly.main.right, g_ly.content.top + Scale(44) };
-    const wchar_t* titles[] = { L"", L"用户", L"设置", L"关于", L"" };
+    const wchar_t* titles[] = { L"", L"用户", L"设置", L"关于", L"", L"" };
     if (g_page != PAGE_LAUNCH && g_page != PAGE_ABOUT) DrawTextIn(dc, titles[g_page], pt, C_DIM, g_fSmall);
 
     if (g_page == PAGE_LAUNCH) {
@@ -2492,6 +2559,42 @@ static void PaintMain(HDC dc, int w, int h) {
             RECT e = { x, top + Scale(50), g_ly.content.right - Scale(24), top + Scale(140) };
             DrawTextIn(dc, L"没有找到实例\n请到【设置】里指定 .minecraft 目录", e, C_DIM, g_fSmall,
                        DT_LEFT | DT_TOP | DT_WORDBREAK);
+        }
+    }
+    else if (g_page == PAGE_DOWNLOAD) {
+        int x   = g_ly.content.left + Scale(24);
+        int top = g_ly.content.top + Scale(16);
+
+        RECT lbl = { x, top, g_ly.content.right - Scale(24), top + Scale(26) };
+        std::wstring head = L"原版下载";
+        if (g_mcVersState.load() == 2) head += L"（" + std::to_wstring(g_mcVers.size()) + L" 个版本）";
+        DrawTextIn(dc, head, lbl, C_DIM, g_fSmall);
+
+        if (g_mcVersState.load() == 1 || g_mcVersState.load() == 0) {
+            RECT e = { x, top + Scale(50), g_ly.content.right - Scale(24), top + Scale(90) };
+            DrawTextIn(dc, L"正在获取版本清单…", e, C_DIM, g_fSmall);
+        } else if (g_mcVersState.load() == 3) {
+            RECT e = { x, top + Scale(50), g_ly.content.right - Scale(24), top + Scale(90) };
+            DrawTextIn(dc, L"获取版本清单失败，检查网络后重进本页", e, C_ERR, g_fSmall);
+        } else {
+            int itemH = Scale(48);
+            int y = top + Scale(34) - g_listScroll;
+            for (size_t i = 0; i < g_mcVers.size(); ++i) {
+                RECT item = { x, y, g_ly.content.right - Scale(24), y + itemH - Scale(6) };
+                if (item.bottom > top + Scale(34) && item.top < g_ly.content.bottom) {
+                    FillRoundRect(dc, item, 8, C_CARD);
+                    RECT tx = item; tx.left += Scale(16);
+                    DrawTextIn(dc, U8ToW(g_mcVers[i].id), tx, C_TEXT, g_fUi);
+
+                    std::wstring ty = (g_mcVers[i].type == "release") ? L"正式版"
+                                    : (g_mcVers[i].type == "snapshot") ? L"快照"
+                                    : (g_mcVers[i].type == "old_beta") ? L"旧版 Beta"
+                                                                       : L"旧版 Alpha";
+                    RECT tr = { item.right - Scale(200), item.top, item.right - Scale(16), item.bottom };
+                    DrawTextIn(dc, ty, tr, C_DIM, g_fSmall);
+                }
+                y += itemH;
+            }
         }
     }
     else if (g_page == PAGE_ABOUT) {
@@ -2755,6 +2858,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnTabSettings = MakeBtn(hwnd, L"设置", ID_TAB_SET);
         hBtnTabAbout    = MakeBtn(hwnd, L"关于", ID_TAB_ABOUT);
         hBtnTabInst     = MakeBtn(hwnd, L"实例", ID_TAB_INST);
+        hBtnTabDl       = MakeBtn(hwnd, L"下载", ID_TAB_DL);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
@@ -2844,12 +2948,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         int id = (int)d->CtlID;
         bool accent = (id == ID_BTN_LAUNCH || id == ID_BTN_LOGIN || id == ID_BTN_SAVE);
-        bool tab = (id == ID_TAB_LAUNCH || id == ID_TAB_USER || id == ID_TAB_SET || id == ID_TAB_ABOUT || id == ID_TAB_INST);
+        bool tab = (id == ID_TAB_LAUNCH || id == ID_TAB_USER || id == ID_TAB_SET || id == ID_TAB_ABOUT || id == ID_TAB_INST || id == ID_TAB_DL);
         bool activeTab = tab && ((id == ID_TAB_LAUNCH && g_page == PAGE_LAUNCH) ||
                                  (id == ID_TAB_USER && g_page == PAGE_USER) ||
                                  (id == ID_TAB_SET && g_page == PAGE_SETTINGS) ||
                                  (id == ID_TAB_ABOUT && g_page == PAGE_ABOUT) ||
-                                 (id == ID_TAB_INST && g_page == PAGE_INSTANCES));
+                                 (id == ID_TAB_INST && g_page == PAGE_INSTANCES) ||
+                                 (id == ID_TAB_DL && g_page == PAGE_DOWNLOAD));
 
         COLORREF bg;
         if (accent) bg = (g_launching && id == ID_BTN_LAUNCH) ? C_CARD : (sel ? RGB(29, 78, 216) : C_ACCENT);
@@ -2911,6 +3016,30 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
+        if (g_page == PAGE_DOWNLOAD) {
+            if (g_mcVersState.load() == 0) {
+                std::thread(FetchManifestThread).detach();
+            } else if (g_mcVersState.load() == 2) {
+                int itemH = Scale(48);
+                int top = g_ly.content.top + Scale(16) + Scale(34);
+                if (pt.y >= top) {
+                    int idx = (pt.y - top + g_listScroll) / itemH;
+                    if (idx >= 0 && idx < (int)g_mcVers.size()) {
+                        std::string id = g_mcVers[idx].id;
+                        std::string url = g_mcVers[idx].url;
+                        std::wstring cmsg = L"确定要下载并安装 " + U8ToW(id) +
+                            L" 吗？\n\n将下载版本 JSON、客户端、依赖库与资源文件，可能需要较长时间。";
+                        if (MessageBoxW(hwnd, cmsg.c_str(), L"下载原版", MB_YESNO | MB_ICONQUESTION) != IDYES)
+                            return 0;
+                        g_status = L"开始安装：" + U8ToW(id);
+                        InvalidateRect(hwnd, nullptr, TRUE);
+                        std::thread(InstallVersionThread, id, url).detach();
+                    }
+                }
+            }
+            return 0;
+        }
+
         if (g_page == PAGE_INSTANCES) {
             int itemH = Scale(56);
             int top = g_ly.content.top + Scale(16) + Scale(34);
@@ -2944,6 +3073,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
+        if (g_page == PAGE_INSTANCES || g_page == PAGE_DOWNLOAD) {
+            int delta0 = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+            bool dl = (g_page == PAGE_DOWNLOAD);
+            int itemH0 = dl ? Scale(48) : Scale(56);
+            int cnt = dl ? (int)g_mcVers.size() : (int)g_versions.size();
+            int listH0 = (int)(g_ly.content.bottom - g_ly.content.top) - Scale(70);
+            int maxS = std::max(0, cnt * itemH0 - listH0);
+            g_listScroll -= delta0 * itemH0;
+            g_listScroll = std::max(0, std::min(maxS, g_listScroll));
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (g_page != PAGE_LAUNCH) return 0;
 
         // 版本列表点击
@@ -2959,6 +3100,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_MOUSEWHEEL: {
+        if (g_page == PAGE_INSTANCES || g_page == PAGE_DOWNLOAD) {
+            int delta0 = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
+            bool dl = (g_page == PAGE_DOWNLOAD);
+            int itemH0 = dl ? Scale(48) : Scale(56);
+            int cnt = dl ? (int)g_mcVers.size() : (int)g_versions.size();
+            int listH0 = (int)(g_ly.content.bottom - g_ly.content.top) - Scale(70);
+            int maxS = std::max(0, cnt * itemH0 - listH0);
+            g_listScroll -= delta0 * itemH0;
+            g_listScroll = std::max(0, std::min(maxS, g_listScroll));
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (g_page != PAGE_LAUNCH) return 0;
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         ScreenToClient(hwnd, &pt);
@@ -2982,6 +3135,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_TAB_SET:    ShowPage(PAGE_SETTINGS); break;
         case ID_TAB_ABOUT:  ShowPage(PAGE_ABOUT);    break;
         case ID_TAB_INST:   ShowPage(PAGE_INSTANCES); break;
+        case ID_TAB_DL:     ShowPage(PAGE_DOWNLOAD); break;
 
         case ID_BTN_REFRESH:
             ScanVersions();
