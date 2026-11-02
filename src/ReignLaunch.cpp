@@ -4306,6 +4306,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_TIMER:
+        {
+            static bool s_lastBusy = false;
+            bool nb = g_dlBusy.load();
+            if (nb != s_lastBusy) { s_lastBusy = nb; SyncDownloadControls(); }
+        }
         if (g_dlBusy.load()) {
             DWORD now = GetTickCount();
             long long cb = g_dlBytes.load();
