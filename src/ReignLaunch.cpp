@@ -2299,7 +2299,10 @@ static void FetchLoaderVersThread(int kind, int gen) {
             if (!v.empty()) vers.push_back(v);
         }
     }
-    g_ldVersState = 2;   // 2=成功（空列表由绘制层显示"没有可下载的版本"）
+    if (gen != g_ldGen.load()) return;   // 期间切换过加载器，丢弃本次结果
+    g_ldVers  = vers;
+    g_ldFiles = files;
+    g_ldVersState = 2;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
 // ---------------- 详情页：加载器可用性 ----------------
