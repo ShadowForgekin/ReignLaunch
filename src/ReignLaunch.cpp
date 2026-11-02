@@ -127,7 +127,7 @@ static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
-static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall;
+static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl;
 
 struct McVer { std::string id, type, url, date; };
 static std::vector<McVer> g_mcVers;
@@ -143,6 +143,7 @@ static void FetchLoadersThread();
 static std::string g_dlDetailMc;
 static int g_dlLoader = 0;              // 0=原版 1=Fabric 2=Quilt 3=Forge 4=NeoForge
 static std::vector<std::string> g_ldVers;   // 当前加载器的可选版本
+static std::vector<std::string> g_ldFiles;  // 对应 mod 的下载地址（0/1/2/3/4 为空）
 static int g_ldSel = -1;
 static std::atomic<int> g_ldVersState{ 0 }; // 0未取 1取中 2成功 3失败
 static void FetchLoaderVersThread();
@@ -1507,6 +1508,8 @@ static std::string        g_loginErr;
 #define ID_DL_FILTER2    1382
 #define ID_DL_FILTER3    1383
 #define ID_DL_INSTALL    1384
+#define ID_DL_FAPI       1387
+#define ID_DL_QSL        1388
 #define ID_ED_SEARCH     1385
 #define ID_DL_BACK       1386
 #define ID_BTN_SAVE     1320
@@ -1688,13 +1691,15 @@ static void LayoutControls() {
             MoveWindow(hEdSearch, g_ly.content.right - Scale(24) - Scale(240), ty0, Scale(240), Scale(30), TRUE);
 
             int dby = g_ly.content.top + Scale(64);
-            int dbw = Scale(110), dbg = Scale(8);
+            int dbw = Scale(102), dbg = Scale(6);
             int dbx = g_ly.content.left + Scale(24);
             MoveWindow(hBtnDlVanilla, dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
             MoveWindow(hBtnDlFabric,  dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
             MoveWindow(hBtnDlQuilt,   dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
             MoveWindow(hBtnDlForge,   dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
-            MoveWindow(hBtnDlNeo,     dbx, dby, dbw, Scale(32), TRUE);
+            MoveWindow(hBtnDlNeo,     dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
+            MoveWindow(hBtnDlFapi,    dbx, dby, Scale(122), Scale(32), TRUE); dbx += Scale(128);
+            MoveWindow(hBtnDlQsl,     dbx, dby, Scale(70), Scale(32), TRUE);
             MoveWindow(hBtnDlInstall, g_ly.content.right - Scale(24) - Scale(130),
                        g_ly.content.bottom - Scale(58), Scale(130), Scale(38), TRUE);
             MoveWindow(hBtnDlBack, g_ly.content.left + Scale(24), g_ly.content.bottom - Scale(58), Scale(100), Scale(32), TRUE);
@@ -1711,6 +1716,8 @@ static void SyncDownloadControls() {
     int showDet = (onDl &&  g_dlDetail) ? SW_SHOW : SW_HIDE;
     ShowWindow(hBtnDlBack, showDet);
     ShowWindow(hBtnDlInstall, showDet);
+    ShowWindow(hBtnDlFapi, showDet);
+    ShowWindow(hBtnDlQsl,  showDet);
     ShowWindow(hBtnDlF0, showDl);
     ShowWindow(hBtnDlF1, showDl);
     ShowWindow(hBtnDlF2, showDl);
@@ -2231,7 +2238,11 @@ static void FetchLoaderVersThread() {
 
     std::string mc = g_dlDetailMc;
     std::string url;
-    if (kind == 1) url = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/" + mc;
+    if (kind == 5) {
+        url = "https://api.modrinth.com/v2/project/fabric-api/version?game_versions=[%22" + mc + "%22]&loaders=[%22fabric%22]";
+    } else if (kind == 6) {
+        url = "https://api.modrinth.com/v2/project/qsl/version?game_versions=[%22" + mc + "%22]&loaders=[%22quilt%22]";
+    } else if (kind == 1) url = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/" + mc;
     else if (kind == 2) url = "https://meta.quiltmc.org/v3/versions/loader/" + mc;
     else if (kind == 3) url = "https://bmclapi2.bangbang93.com/forge/minecraft/" + mc;
     else if (kind == 4) url = "https://bmclapi2.bangbang93.com/neoforge/list/" + mc;
@@ -2244,10 +2255,21 @@ static void FetchLoaderVersThread() {
         if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
         return;
     }
+    g_ldFiles.clear();
     json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
     if (j.is_array()) {
         for (auto& x : j) {
             std::string v;
+            if (kind == 5 || kind == 6) {
+                std::string v = x.value("version_number", x.value("name", std::string()));
+                std::string fu, fn;
+                if (x.contains("files") && x["files"].is_array() && !x["files"].empty()) {
+                    fu = x["files"][0].value("url", std::string());
+                    fn = x["files"][0].value("filename", std::string());
+                }
+                if (!v.empty()) { g_ldVers.push_back(v); g_ldFiles.push_back(fu + "\n" + fn); }
+                continue;
+            }
             if (kind == 1 || kind == 2) v = x["loader"].value("version", std::string());
             else v = x.value("version", std::string());
             if (!v.empty()) g_ldVers.push_back(v);
@@ -2940,7 +2962,9 @@ static void PaintMain(HDC dc, int w, int h) {
                 : (g_dlLoader == 1) ? L"Fabric：请在下方选择加载器版本"
                 : (g_dlLoader == 2) ? L"Quilt：请在下方选择加载器版本"
                 : (g_dlLoader == 3) ? L"Forge：请在下方选择加载器版本"
-                                    : L"NeoForge：请在下方选择加载器版本";
+                : (g_dlLoader == 4) ? L"NeoForge：请在下方选择加载器版本"
+                : (g_dlLoader == 5) ? L"Fabric API：请在下方选择模组版本（下载到 mods）"
+                                    : L"QSL（Quilt Standard Libraries）：请在下方选择模组版本";
             RECT hr = { g_ly.content.left + Scale(24), g_ly.content.top + Scale(104),
                         g_ly.content.right - Scale(24), g_ly.content.top + Scale(130) };
             DrawTextIn(dc, hint, hr, C_DIM, g_fSmall);
@@ -3321,6 +3345,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hEdSearch, EM_SETCUEBANNER, 0, (LPARAM)L"搜索版本，如 1.20.1");
         hBtnDlBack    = MakeBtn(hwnd, L"← 返回", ID_DL_BACK);
         hBtnDlInstall = MakeBtn(hwnd, L"安装", ID_DL_INSTALL);
+        hBtnDlFapi    = MakeBtn(hwnd, L"Fabric API", ID_DL_FAPI);
+        hBtnDlQsl     = MakeBtn(hwnd, L"QSL", ID_DL_QSL);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
@@ -3666,10 +3692,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case ID_DL_VANILLA: case ID_DL_FABRIC: case ID_DL_QUILT:
-        case ID_DL_FORGE:   case ID_DL_NEO: {
+        case ID_DL_FORGE:   case ID_DL_NEO:
+        case ID_DL_FAPI:    case ID_DL_QSL: {
             int id = (int)(wp & 0xFFFF);
             int kind = (id == ID_DL_VANILLA) ? 0 : (id == ID_DL_FABRIC) ? 1
-                     : (id == ID_DL_QUILT) ? 2 : (id == ID_DL_FORGE) ? 3 : 4;
+                     : (id == ID_DL_QUILT) ? 2 : (id == ID_DL_FORGE) ? 3
+                     : (id == ID_DL_NEO) ? 4 : (id == ID_DL_FAPI) ? 5 : 6;
+            if (kind >= 5) { g_ldFiles.clear(); }
             g_dlLoader = kind;
             g_ldSel = -1;
             g_ldVers.clear();
@@ -3694,6 +3723,35 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (MessageBoxW(hwnd, cmsg.c_str(), L"下载原版", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
                 g_status = L"开始安装：" + U8ToW(mc);
                 std::thread(InstallVersionThread, mc, url).detach();
+            } else if (g_dlLoader >= 5) {
+                if (g_ldSel < 0 || g_ldSel >= (int)g_ldFiles.size()) {
+                    MessageBoxW(hwnd, L"请先在列表里选择一个模组版本。", L"提示", MB_OK | MB_ICONINFORMATION);
+                    break;
+                }
+                {
+                    std::string info = g_ldFiles[g_ldSel];
+                    size_t nl = info.find((char)10);
+                    std::string surl = (nl == std::string::npos) ? info : info.substr(0, nl);
+                    std::string sfn  = (nl == std::string::npos) ? std::string("mod.jar") : info.substr(nl + 1);
+                    if (surl.empty()) {
+                        MessageBoxW(hwnd, L"该版本没有可下载的文件。", L"提示", MB_OK | MB_ICONINFORMATION);
+                        break;
+                    }
+                    fs::path mcDir2 = fs::u8path(g_cfg.gameDir);
+                    fs::path modDir = ShouldIsolate(mc, mcDir2)
+                                      ? (mcDir2 / L"versions" / fs::u8path(mc) / L"mods")
+                                      : (mcDir2 / L"mods");
+                    std::error_code ecm;
+                    fs::create_directories(modDir, ecm);
+                    fs::path dst = modDir / fs::u8path(sfn);
+                    std::string derr;
+                    if (DownloadFile(surl, dst, derr))
+                        g_status = L"已下载到 mods：" + U8ToW(sfn);
+                    else
+                        g_status = L"下载失败：" + U8ToW(derr);
+                }
+                InvalidateRect(hwnd, nullptr, TRUE);
+                break;
             } else {
                 if (g_ldSel < 0 || g_ldSel >= (int)g_ldVers.size()) {
                     MessageBoxW(hwnd, L"请先在列表里选择一个加载器版本。", L"提示", MB_OK | MB_ICONINFORMATION);
