@@ -2161,10 +2161,24 @@ static void StartUpdate() {
     fs::path nw = cur;
     nw += L".new";
 
-    std::string err;
-    if (!DownloadFile(g_newUrl, nw, err)) {
+    // 依次尝试：直连 -> gh-proxy 加速
+    std::vector<std::string> urls;
+    urls.push_back(g_newUrl);
+    urls.push_back("https://gh-proxy.com/" + g_newUrl);
+    urls.push_back("https://gh-proxy.com/https://gh-proxy.com/" + g_newUrl);
+
+    bool ok = false;
+    std::string lastErr;
+    for (size_t i = 0; i < urls.size() && !ok; ++i) {
+        std::string err;
+        Log("[更新] 尝试下载: " + urls[i]);
+        ok = DownloadFile(urls[i], nw, err);
+        if (!ok) lastErr = err;
+    }
+    if (!ok) {
         g_updating = false;
-        MessageBoxW(g_hwnd, (L"下载新版本失败：\n" + U8ToW(err)).c_str(), L"更新失败", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hwnd, (L"下载新版本失败：\n" + U8ToW(lastErr) +
+                             L"\n\n可尝试开启代理后重试。").c_str(), L"更新失败", MB_OK | MB_ICONERROR);
         return;
     }
 
