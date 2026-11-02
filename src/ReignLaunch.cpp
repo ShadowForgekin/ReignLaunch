@@ -68,7 +68,7 @@ struct Config {
     std::string extraJvm;            // 追加的 JVM 参数
     std::string extraGame;           // 追加的游戏参数
     int  dlSource = 0;               // 0=自动 1=仅官方 2=仅镜像
-    bool fullscreen = false;         // 全屏启动             // 下载线程数 1..128               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
+    int  winMode = 0;                // 0=窗口 1=最大化 2=全屏             // 下载线程数 1..128               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
     std::string javaPath;
     int         maxMemMB = 4096;
     std::string playerName = "Steve";
@@ -245,7 +245,7 @@ static void SaveConfig() {
     j["extraJvm"] = g_cfg.extraJvm;
     j["extraGame"] = g_cfg.extraGame;
     j["dlSource"] = g_cfg.dlSource;
-    j["fullscreen"] = g_cfg.fullscreen;
+    j["winMode"] = g_cfg.winMode;
     j["skinPath"] = g_cfg.skinPath;
     {
         json arr = json::array();
@@ -286,7 +286,10 @@ static void LoadConfig() {
     g_cfg.extraJvm = j.value("extraJvm", std::string());
     g_cfg.extraGame = j.value("extraGame", std::string());
     g_cfg.dlSource = j.value("dlSource", 0);
-    g_cfg.fullscreen = j.value("fullscreen", false);
+    g_cfg.winMode = j.value("winMode", 0);
+    if (!j.contains("winMode") && j.contains("fullscreen"))   // 兼容旧的布尔配置
+        g_cfg.winMode = j.value("fullscreen", false) ? 2 : 0;
+    if (g_cfg.winMode < 0 || g_cfg.winMode > 2) g_cfg.winMode = 0;
     g_cfg.skinPath = j.value("skinPath", std::string());
 
     g_cfg.activeAcc = j.value("activeAcc", -1);
@@ -969,7 +972,16 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
     cmd += L" -cp \"" + U8ToW(cp) + L"\"";
     cmd += L" " + U8ToW(mainClass);
     for (auto& a : splitArgs(g_cfg.extraGame)) cmd += L" " + U8ToW(QuoteIfNeeded(a));
-    if (g_cfg.fullscreen) cmd += L" --fullscreen";
+    if (g_cfg.winMode == 2) {
+        cmd += L" --fullscreen";
+    } else if (g_cfg.winMode == 1) {
+        // 最大化：按桌面工作区尺寸开窗（减去任务栏）
+        RECT wa{};
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0)) {
+            int w = wa.right - wa.left, hh = wa.bottom - wa.top;
+            cmd += L" --width " + std::to_wstring(w) + L" --height " + std::to_wstring(hh);
+        }
+    }
     for (auto& a : gameArgs) cmd += L" " + U8ToW(QuoteIfNeeded(a));
 
     plan.commandLine = cmd;
@@ -1541,6 +1553,13 @@ static const wchar_t* IsoLabel() {
     default: return L"不隔离实例";
     }
 }
+static const wchar_t* WinModeLabel(int m) {
+    switch (m) {
+    case 1:  return L"最大化";
+    case 2:  return L"全屏";
+    default: return L"窗口";
+    }
+}
 static void LayoutControls() {
     int w = g_ly.content.right, h = g_ly.content.bottom;
 
@@ -1615,7 +1634,7 @@ static void LayoutControls() {
         MoveWindow(hEdJvm,  x + Scale(110), y + rowH * 4 + Scale(6), Scale(560), Scale(30), TRUE);
         MoveWindow(hEdGame, x + Scale(110), y + rowH * 5 + Scale(6), Scale(560), Scale(30), TRUE);
         MoveWindow(hBtnSource, x + Scale(110), y + rowH * 6 + Scale(4), Scale(200), Scale(36), TRUE);
-        MoveWindow(hBtnFull,   x + Scale(322), y + rowH * 6 + Scale(4), Scale(150), Scale(36), TRUE);
+        MoveWindow(hBtnFull,   x + Scale(322), y + rowH * 6 + Scale(4), Scale(230), Scale(36), TRUE);
     }
 }
 
@@ -2002,7 +2021,7 @@ static void DrawAboutBlock(HDC dc) {
 
     struct AboutRow { const wchar_t* k; const wchar_t* v; };
     const AboutRow rows[] = {
-        { L"版本",   L"v1.0.0 Beta 3" },
+        { L"版本",   L"v1.1.0 Beta 3.5" },
         { L"制作人", L"加纳Brightchaserove（抖音）" },
         { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
         { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
@@ -2377,7 +2396,7 @@ static void PaintMain(HDC dc, int w, int h) {
             DrawTextIn(dc, L"JVM 参数", a, C_DIM, g_fUi);
             RECT b2 = { x, y + rowH * 5 + Scale(6), x + Scale(100), y + rowH * 5 + Scale(36) };
             DrawTextIn(dc, L"游戏参数", b2, C_DIM, g_fUi);
-            RECT c2 = { x + Scale(480), y + rowH * 6 + Scale(16), g_ly.main.right - Scale(40), y + rowH * 6 + Scale(36) };
+            RECT c2 = { x + Scale(560), y + rowH * 6 + Scale(16), g_ly.main.right - Scale(40), y + rowH * 6 + Scale(36) };
             DrawTextIn(dc, L"空格分隔，可留空", c2, C_DIM, g_fSmall);
         }
 
@@ -2635,7 +2654,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         hBtnSource = MakeBtn(hwnd, g_cfg.dlSource == 1 ? L"下载源：仅官方"
                                   : g_cfg.dlSource == 2 ? L"下载源：仅 BMCLAPI" : L"下载源：自动", ID_BTN_SOURCE);
-        hBtnFull   = MakeBtn(hwnd, g_cfg.fullscreen ? L"全屏启动：开" : L"全屏启动：关", ID_BTN_FULL);
+        hBtnFull   = MakeBtn(hwnd, (std::wstring(L"游戏窗口模式：") + WinModeLabel(g_cfg.winMode)).c_str(), ID_BTN_FULL);
         }
 
         hEdDir  = MakeEdit(hwnd, ID_ED_DIR, U8ToW(g_cfg.gameDir).c_str());
@@ -2876,10 +2895,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case ID_BTN_FULL: {
-        g_cfg.fullscreen = !g_cfg.fullscreen;
-        SetWindowTextW(hBtnFull, g_cfg.fullscreen ? L"全屏启动：开" : L"全屏启动：关");
+        g_cfg.winMode = (g_cfg.winMode + 1) % 3;
+        SetWindowTextW(hBtnFull, (std::wstring(L"游戏窗口模式：") + WinModeLabel(g_cfg.winMode)).c_str());
         SaveConfig();
-        g_status = g_cfg.fullscreen ? L"已开启全屏启动" : L"已关闭全屏启动";
+        g_status = (g_cfg.winMode == 0) ? L"窗口模式：854×480（不可调分辨率）"
+                 : (g_cfg.winMode == 1) ? L"最大化：按桌面工作区大小开窗"
+                                        : L"全屏模式";
         InvalidateRect(hwnd, nullptr, TRUE);
         break;
     }
