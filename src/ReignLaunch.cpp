@@ -64,7 +64,11 @@ struct Config {
     std::string gameDir;
     std::string skinPath;   // 当前皮肤 PNG
     int  isoMode = 0;
-    int  dlThreads = 4;             // 下载线程数 1..128               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
+    int  dlThreads = 4;
+    std::string extraJvm;            // 追加的 JVM 参数
+    std::string extraGame;           // 追加的游戏参数
+    int  dlSource = 0;               // 0=自动 1=仅官方 2=仅镜像
+    bool fullscreen = false;         // 全屏启动             // 下载线程数 1..128               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
     std::string javaPath;
     int         maxMemMB = 4096;
     std::string playerName = "Steve";
@@ -120,7 +124,7 @@ static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin, hBtnDelAcc;
 
 static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
-static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads;
+static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 
 // ============================ 颜色 ============================
 static const COLORREF C_BG       = RGB(24, 25, 28);
@@ -238,6 +242,10 @@ static void SaveConfig() {
     j["gameDir"]       = g_cfg.gameDir;
     j["isoMode"] = g_cfg.isoMode;
     j["dlThreads"] = g_cfg.dlThreads;
+    j["extraJvm"] = g_cfg.extraJvm;
+    j["extraGame"] = g_cfg.extraGame;
+    j["dlSource"] = g_cfg.dlSource;
+    j["fullscreen"] = g_cfg.fullscreen;
     j["skinPath"] = g_cfg.skinPath;
     {
         json arr = json::array();
@@ -275,6 +283,10 @@ static void LoadConfig() {
         g_cfg.gameDir        = j.value("gameDir", std::string());
     g_cfg.isoMode = j.value("isoMode", 0);
     g_cfg.dlThreads = j.value("dlThreads", 4);
+    g_cfg.extraJvm = j.value("extraJvm", std::string());
+    g_cfg.extraGame = j.value("extraGame", std::string());
+    g_cfg.dlSource = j.value("dlSource", 0);
+    g_cfg.fullscreen = j.value("fullscreen", false);
     g_cfg.skinPath = j.value("skinPath", std::string());
 
     g_cfg.activeAcc = j.value("activeAcc", -1);
@@ -615,8 +627,14 @@ static bool HttpRequest(const std::string& urlU8, const std::string& method,
 
 static bool DownloadFile(const std::string& url, const fs::path& dest, std::string& err) {
     std::vector<unsigned char> data;
-    if (!HttpRequest(url, "GET", "", "", data, err)) {
-        std::string mirror = ToMirror(url);
+    std::string mirror = ToMirror(url);
+    // dlSource: 0=自动(先官方，失败切镜像) 1=仅官方 2=仅镜像
+    if (g_cfg.dlSource == 2 && mirror != url) {
+        std::string e2;
+        if (!HttpRequest(mirror, "GET", "", "", data, e2)) { err = "镜像: " + e2; return false; }
+    }
+    else if (!HttpRequest(url, "GET", "", "", data, err)) {
+        if (g_cfg.dlSource == 1) return false;   // 仅官方：不切镜像
         if (mirror != url) {
             std::string e2;
             if (HttpRequest(mirror, "GET", "", "", data, e2)) err.clear();
@@ -890,6 +908,19 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
     };
 
     std::vector<std::string> jvmArgs, gameArgs;
+
+    // 用户自定义参数（按空格拆分，支持带引号）
+    auto splitArgs = [](const std::string& s) {
+        std::vector<std::string> out;
+        std::string cur; bool q = false;
+        for (char c : s) {
+            if (c == '"') { q = !q; continue; }
+            if (c == ' ' && !q) { if (!cur.empty()) { out.push_back(cur); cur.clear(); } }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) out.push_back(cur);
+        return out;
+    };
     if (vj.contains("arguments") && vj["arguments"].is_object()) {
         auto pushArg = [&](std::vector<std::string>& out, const std::string& raw) {
             std::string s = sub(raw);
@@ -933,9 +964,12 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
         cmd += L" -javaagent:\"" + U8ToW(g_cfg.authlibPath) + L"\"=" + U8ToW(g_cfg.authServer);
     }
 
+    for (auto& a : splitArgs(g_cfg.extraJvm)) cmd += L" " + U8ToW(QuoteIfNeeded(a));
     for (auto& a : jvmArgs) cmd += L" " + U8ToW(QuoteIfNeeded(a));
     cmd += L" -cp \"" + U8ToW(cp) + L"\"";
     cmd += L" " + U8ToW(mainClass);
+    for (auto& a : splitArgs(g_cfg.extraGame)) cmd += L" " + U8ToW(QuoteIfNeeded(a));
+    if (g_cfg.fullscreen) cmd += L" --fullscreen";
     for (auto& a : gameArgs) cmd += L" " + U8ToW(QuoteIfNeeded(a));
 
     plan.commandLine = cmd;
@@ -1419,6 +1453,10 @@ static std::string        g_loginErr;
 #define ID_BTN_SKIN      1340
 #define ID_BTN_DELACC    1341
 #define ID_ED_THREADS    1360
+#define ID_ED_JVM        1361
+#define ID_ED_GAME       1362
+#define ID_BTN_SOURCE    1363
+#define ID_BTN_FULL      1364
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1571,9 +1609,13 @@ static void LayoutControls() {
 
         MoveWindow(hEdMem,  x + Scale(110), y + rowH * 2, Scale(110), edH, TRUE);
 
-        MoveWindow(hBtnSave, x + Scale(110), y + rowH * 4 + Scale(10), Scale(140), Scale(40), TRUE);
-        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 4 + Scale(10), Scale(240), Scale(40), TRUE);
+        MoveWindow(hBtnSave, x + Scale(110), y + rowH * 7 + Scale(10), Scale(140), Scale(40), TRUE);
+        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 7 + Scale(10), Scale(240), Scale(40), TRUE);
         MoveWindow(hEdThreads, x + Scale(110), y + rowH * 3 + Scale(6), Scale(90), Scale(30), TRUE);
+        MoveWindow(hEdJvm,  x + Scale(110), y + rowH * 4 + Scale(6), Scale(560), Scale(30), TRUE);
+        MoveWindow(hEdGame, x + Scale(110), y + rowH * 5 + Scale(6), Scale(560), Scale(30), TRUE);
+        MoveWindow(hBtnSource, x + Scale(110), y + rowH * 6 + Scale(4), Scale(200), Scale(36), TRUE);
+        MoveWindow(hBtnFull,   x + Scale(322), y + rowH * 6 + Scale(4), Scale(150), Scale(36), TRUE);
     }
 }
 
@@ -1910,6 +1952,10 @@ static void SyncSettingsVisibility() {
     ShowWindow(hBtnSave, onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnIso,  onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hEdThreads, onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hEdJvm,  onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hEdGame, onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnSource, onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnFull,   onSettings ? SW_SHOW : SW_HIDE);
 }
 static void DrawCandList(HDC dc, bool isDir) {
     const std::vector<Cand>& list = isDir ? g_dirCands : g_javaCands;
@@ -2326,9 +2372,18 @@ static void PaintMain(HDC dc, int w, int h) {
             DrawTextIn(dc, L"1 - 128（默认 4）", th, C_DIM, g_fSmall);
         }
 
+        {
+            RECT a = { x, y + rowH * 4 + Scale(6), x + Scale(100), y + rowH * 4 + Scale(36) };
+            DrawTextIn(dc, L"JVM 参数", a, C_DIM, g_fUi);
+            RECT b2 = { x, y + rowH * 5 + Scale(6), x + Scale(100), y + rowH * 5 + Scale(36) };
+            DrawTextIn(dc, L"游戏参数", b2, C_DIM, g_fUi);
+            RECT c2 = { x + Scale(480), y + rowH * 6 + Scale(16), g_ly.main.right - Scale(40), y + rowH * 6 + Scale(36) };
+            DrawTextIn(dc, L"空格分隔，可留空", c2, C_DIM, g_fSmall);
+        }
+
 
         if (!g_status.empty()) {
-            RECT st = { x, y + rowH * 5 + Scale(50), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
+            RECT st = { x, y + rowH * 8 + Scale(6), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(4) };
             DrawTextIn(dc, g_status, st, C_OK, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
         }
         }
@@ -2569,6 +2624,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         0, 0, 10, 10, hwnd, (HMENU)ID_ED_THREADS, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(hEdThreads, WM_SETFONT, (WPARAM)g_fUi, TRUE);
 
+        if (hEdJvm) {} else {
+        hEdJvm = CreateWindowExW(0, L"EDIT", U8ToW(g_cfg.extraJvm).c_str(),
+                    WS_CHILD | WS_BORDER, 0, 0, 10, 10, hwnd, (HMENU)ID_ED_JVM, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(hEdJvm, WM_SETFONT, (WPARAM)g_fUi, TRUE);
+
+        hEdGame = CreateWindowExW(0, L"EDIT", U8ToW(g_cfg.extraGame).c_str(),
+                    WS_CHILD | WS_BORDER, 0, 0, 10, 10, hwnd, (HMENU)ID_ED_GAME, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(hEdGame, WM_SETFONT, (WPARAM)g_fUi, TRUE);
+
+        hBtnSource = MakeBtn(hwnd, g_cfg.dlSource == 1 ? L"下载源：仅官方"
+                                  : g_cfg.dlSource == 2 ? L"下载源：仅 BMCLAPI" : L"下载源：自动", ID_BTN_SOURCE);
+        hBtnFull   = MakeBtn(hwnd, g_cfg.fullscreen ? L"全屏启动：开" : L"全屏启动：关", ID_BTN_FULL);
+        }
+
         hEdDir  = MakeEdit(hwnd, ID_ED_DIR, U8ToW(g_cfg.gameDir).c_str());
         hEdJava = MakeEdit(hwnd, ID_ED_JAVA, U8ToW(g_cfg.javaPath).c_str());
         hEdMem  = MakeEdit(hwnd, ID_ED_MEM, std::to_wstring(g_cfg.maxMemMB).c_str(), ES_NUMBER);
@@ -2795,7 +2864,27 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
 
-        case ID_BTN_OVCANCEL:
+        case ID_BTN_SOURCE: {
+        g_cfg.dlSource = (g_cfg.dlSource + 1) % 3;
+        SetWindowTextW(hBtnSource,
+            g_cfg.dlSource == 1 ? L"下载源：仅官方"
+          : g_cfg.dlSource == 2 ? L"下载源：仅 BMCLAPI" : L"下载源：自动");
+        SaveConfig();
+        g_status = L"下载源已切换";
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+    }
+
+    case ID_BTN_FULL: {
+        g_cfg.fullscreen = !g_cfg.fullscreen;
+        SetWindowTextW(hBtnFull, g_cfg.fullscreen ? L"全屏启动：开" : L"全屏启动：关");
+        SaveConfig();
+        g_status = g_cfg.fullscreen ? L"已开启全屏启动" : L"已关闭全屏启动";
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+    }
+
+    case ID_BTN_OVCANCEL:
         g_cancelLaunch = true;
         // 立刻终止已经起来的游戏进程
         {
@@ -3000,6 +3089,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_cfg.dlThreads = n;
         SetWindowTextW(hEdThreads, std::to_wstring(n).c_str());
     }
+    g_cfg.extraJvm  = WToU8(CtlText(hEdJvm));
+    g_cfg.extraGame = WToU8(CtlText(hEdGame));
             {
         std::string emb = ExtractEmbeddedAuthlib();
         if (!emb.empty()) {
