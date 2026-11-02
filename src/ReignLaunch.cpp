@@ -2358,7 +2358,8 @@ static void RebuildDlView() {
         case 0: pass = isRelease; break;
         case 1: pass = (isSnap && !april); break;
         case 2: pass = isOld; break;
-        default: pass = april; break;
+        case 3: pass = april; break;
+        default: pass = true; break;      // 4 = 所有版本
         }
         if (!pass) continue;
 
@@ -3278,6 +3279,7 @@ static void ShowDropPopup(int mode) {
         g_dropItems.push_back({ "快照版", "快照版" });
         g_dropItems.push_back({ "远古版", "远古版" });
         g_dropItems.push_back({ "愚人节", "愚人节" });
+        g_dropItems.push_back({ "所有版本", "所有版本" });
     }
     else {
         g_dropItems.push_back({ "隔离所有实例", "隔离所有实例" });
@@ -4049,9 +4051,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int idx = (int)wp;
         int mode = (int)lp;
         if (mode == 7) {
-            if (idx >= 0 && idx < 4) {
+            if (idx >= 0 && idx < 5) {
                 g_dlFilter = idx;
-                const wchar_t* names[] = { L"正式版", L"快照版", L"远古版", L"愚人节" };
+                const wchar_t* names[] = { L"正式版", L"快照版", L"远古版", L"愚人节", L"所有版本" };
                 SetWindowTextW(hBtnDlFilterSel, (std::wstring(names[idx]) + L"  ▾").c_str());
                 g_dlSel = -1;
                 RebuildDlView();
