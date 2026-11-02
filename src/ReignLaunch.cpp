@@ -126,7 +126,7 @@ static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin, hBtnDelAcc;
 static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
-static HWND hBtnUpdate;
+static HWND hBtnUpdate, hBtnUserM0, hBtnUserM1, hBtnUserM2;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
 static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl, hBtnDlFilterSel, hBtnDlCancel;
 
@@ -149,6 +149,7 @@ static int g_ldSel = -1;
 static std::atomic<int> g_ldVersState{ 0 };
 static std::atomic<bool> g_dlBusy{ false };   // 正在下载/安装
 static std::atomic<bool> g_dlCancel{ false }; // 用户取消
+static int g_userMode = 0;   // 0=第三方 1=离线 2=微软
 static std::atomic<long long> g_dlBytes{ 0 };
 static std::wstring g_dlTarget;      // 例如 "26.3 Fabric"
 static long long g_dlLastBytes = 0;
@@ -1526,6 +1527,9 @@ static std::string        g_loginErr;
 #define ID_DL_QSL        1388
 #define ID_DL_FILTERSEL  1389
 #define ID_DL_CANCEL     1390
+#define ID_USER_M0       1400
+#define ID_USER_M1       1401
+#define ID_USER_M2       1402
 #define ID_ED_SEARCH     1385
 #define ID_DL_BACK       1386
 #define ID_BTN_SAVE     1320
@@ -1646,9 +1650,18 @@ static void LayoutControls() {
         int panelW = Scale(620);
         int x = g_ly.main.left + (g_ly.main.right - g_ly.main.left - panelW) / 2;
         if (x < g_ly.main.left + Scale(20)) x = g_ly.main.left + Scale(20);
-        int y = g_ly.content.top + Scale(60);
+        int y = g_ly.content.top + Scale(116);
         int rowH = Scale(58);
         int edW = Scale(380), edH = Scale(30);
+
+        {
+            int my = g_ly.content.top + Scale(18);
+            int mw = Scale(140), mg = Scale(10);
+            int mx = x;
+            MoveWindow(hBtnUserM0, mx, my, mw, Scale(36), TRUE); mx += mw + mg;
+            MoveWindow(hBtnUserM1, mx, my, mw, Scale(36), TRUE); mx += mw + mg;
+            MoveWindow(hBtnUserM2, mx, my, mw + Scale(70), Scale(36), TRUE);
+        }
 
         MoveWindow(hEdServer, x + Scale(110), y, edW, edH, TRUE);
         MoveWindow(hEdUser,   x + Scale(110), y + rowH, edW, edH, TRUE);
@@ -1727,6 +1740,20 @@ static void LayoutControls() {
 
 static void SyncSettingsVisibility();
 
+static void SyncUserMode() {
+    bool onUser = (g_page == PAGE_USER);
+    bool m0 = onUser && g_userMode == 0;
+    bool m1 = onUser && g_userMode == 1;
+
+    ShowWindow(hEdServer, m0); ShowWindow(hEdUser, m0); ShowWindow(hEdPass, m0);
+    ShowWindow(hBtnLogin, m0); ShowWindow(hBtnLogout, m0);
+    ShowWindow(hEdName, m1);   ShowWindow(hBtnOffline, m1);
+
+    ShowWindow(hBtnUserM0, onUser);
+    ShowWindow(hBtnUserM1, onUser);
+    ShowWindow(hBtnUserM2, onUser);
+}
+
 static void SyncDownloadControls() {
     bool onDl   = (g_page == PAGE_DOWNLOAD);
     int showDl  = (onDl && !g_dlDetail) ? SW_SHOW : SW_HIDE;
@@ -1769,6 +1796,7 @@ static void ShowPage(Page p) {
 
     ApplyOverlayVisibility();
 
+    SyncUserMode();
     ShowWindow(hEdServer, U); ShowWindow(hEdUser, U); ShowWindow(hEdPass, U);
     ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U); ShowWindow(hBtnSkin, U); ShowWindow(hBtnDelAcc, U);
 
@@ -1778,6 +1806,7 @@ static void ShowPage(Page p) {
 
     LayoutControls();
     SyncSettingsVisibility();
+    SyncUserMode();
     InvalidateRect(g_hwnd, nullptr, TRUE);
 }
 
@@ -2899,7 +2928,7 @@ static void PaintMain(HDC dc, int w, int h) {
     // 当前页标题
     RECT pt = { g_ly.main.left + Scale(40), g_ly.content.top + Scale(12), g_ly.main.right, g_ly.content.top + Scale(44) };
     const wchar_t* titles[] = { L"", L"用户", L"设置", L"关于", L"", L"" };
-    if (g_page != PAGE_LAUNCH && g_page != PAGE_ABOUT) DrawTextIn(dc, titles[g_page], pt, C_DIM, g_fSmall);
+    if (g_page != PAGE_LAUNCH && g_page != PAGE_ABOUT && g_page != PAGE_USER) DrawTextIn(dc, titles[g_page], pt, C_DIM, g_fSmall);
 
     if (g_page == PAGE_LAUNCH) {
         // 主区信息
@@ -2994,13 +3023,17 @@ static void PaintMain(HDC dc, int w, int h) {
         int panelW = Scale(620);
         int x = g_ly.main.left + (g_ly.main.right - g_ly.main.left - panelW) / 2;
         if (x < g_ly.main.left + Scale(20)) x = g_ly.main.left + Scale(20);
-        int y = g_ly.content.top + Scale(60);
+        int y = g_ly.content.top + Scale(116);
         int rowH = Scale(58);
 
-        DrawTextIn(dc, L"认证服务器", { x, y, x + Scale(100), y + Scale(30) }, C_DIM, g_fUi);
-        DrawTextIn(dc, L"用户名 / 邮箱", { x, y + rowH, x + Scale(100), y + rowH + Scale(30) }, C_DIM, g_fUi);
-        DrawTextIn(dc, L"密码", { x, y + rowH * 2, x + Scale(100), y + rowH * 2 + Scale(30) }, C_DIM, g_fUi);
-        DrawTextIn(dc, L"离线玩家名", { x, y + rowH * 4 + Scale(16), x + Scale(100), y + rowH * 4 + Scale(46) }, C_DIM, g_fUi);
+        if (g_userMode == 0) {
+            DrawTextIn(dc, L"认证服务器", { x, y, x + Scale(100), y + Scale(30) }, C_DIM, g_fUi);
+            DrawTextIn(dc, L"用户名 / 邮箱", { x, y + rowH, x + Scale(100), y + rowH + Scale(30) }, C_DIM, g_fUi);
+            DrawTextIn(dc, L"密码", { x, y + rowH * 2, x + Scale(100), y + rowH * 2 + Scale(30) }, C_DIM, g_fUi);
+        }
+        if (g_userMode == 1) {
+            DrawTextIn(dc, L"离线玩家名", { x, y + rowH * 4 + Scale(16), x + Scale(100), y + rowH * 4 + Scale(46) }, C_DIM, g_fUi);
+        }
 
         RECT cur = { x, y + rowH * 5 + Scale(12), g_ly.main.right - Scale(20), y + rowH * 5 + Scale(42) };
         std::wstring s = (g_cfg.authType == "thirdparty")
@@ -3014,10 +3047,11 @@ static void PaintMain(HDC dc, int w, int h) {
                        (g_loginState == 3) ? C_ERR : C_OK, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
         }
 
-        RECT hint = { x, g_ly.content.bottom - Scale(90), g_ly.main.right - Scale(20), g_ly.content.bottom - Scale(20) };
-        DrawTextIn(dc, L"支持 authlib-injector 协议的认证服务器（如 LittleSkin）。\n"
-                       L"authlib-injector 已内置在程序里，无需外部 jar。",
-                   hint, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        if (g_userMode == 2) {
+            RECT e2 = { x, y, g_ly.main.right - Scale(20), y + Scale(140) };
+            DrawTextIn(dc, L"微软正版登录正在开发中，暂不可用。\n\n目前请使用「第三方登录」（LittleSkin 等）或「离线登录」。",
+                       e2, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        }
     }
     else if (g_page == PAGE_INSTANCES) {
         int x   = g_ly.content.left + Scale(24);
@@ -3484,6 +3518,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnOffline = MakeBtn(hwnd, L"使用离线", ID_BTN_OFFLINE);
         hBtnSkin    = MakeBtn(hwnd, L"更换皮肤", ID_BTN_SKIN);
         hBtnDelAcc  = MakeBtn(hwnd, L"删除账户", ID_BTN_DELACC);
+        hBtnUserM0 = MakeBtn(hwnd, L"第三方登录", ID_USER_M0);
+        hBtnUserM1 = MakeBtn(hwnd, L"离线登录",   ID_USER_M1);
+        hBtnUserM2 = MakeBtn(hwnd, L"微软登录（开发中）", ID_USER_M2);
+
         hEdThreads = CreateWindowExW(0, L"EDIT", std::to_wstring(g_cfg.dlThreads).c_str(),
                         WS_CHILD | WS_BORDER | ES_NUMBER | ES_CENTER,
                         0, 0, 10, 10, hwnd, (HMENU)ID_ED_THREADS, GetModuleHandleW(nullptr), nullptr);
@@ -4045,6 +4083,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, TRUE);
         break;
     }
+
+    case ID_USER_M0: g_userMode = 0; SyncUserMode(); InvalidateRect(hwnd, nullptr, TRUE); break;
+    case ID_USER_M1: g_userMode = 1; SyncUserMode(); InvalidateRect(hwnd, nullptr, TRUE); break;
+    case ID_USER_M2: g_userMode = 2; SyncUserMode(); InvalidateRect(hwnd, nullptr, TRUE); break;
 
     case ID_BTN_LOGIN: {
             if (g_loginState == 1) return 0;
