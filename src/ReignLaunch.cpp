@@ -125,6 +125,7 @@ static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin, hBtnDelAcc;
 static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
 static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
+static HWND hBtnUpdate;
 
 // ============================ 颜色 ============================
 static const COLORREF C_BG       = RGB(24, 25, 28);
@@ -145,6 +146,7 @@ static HBRUSH g_brInput = nullptr;
 #define WM_APP_DONE  (WM_APP + 1)
 #define WM_APP_ERROR (WM_APP + 2)
 #define WM_APP_NEEDJAVA (WM_APP + 9)
+#define WM_APP_UPD       (WM_APP + 11)
 
 // ============================ 工具 ============================
 static std::wstring U8ToW(const std::string& s) {
@@ -1469,6 +1471,7 @@ static std::string        g_loginErr;
 #define ID_ED_GAME       1362
 #define ID_BTN_SOURCE    1363
 #define ID_BTN_FULL      1364
+#define ID_BTN_UPDATE    1365
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1635,6 +1638,7 @@ static void LayoutControls() {
         MoveWindow(hEdGame, x + Scale(110), y + rowH * 5 + Scale(6), Scale(560), Scale(30), TRUE);
         MoveWindow(hBtnSource, x + Scale(110), y + rowH * 6 + Scale(4), Scale(200), Scale(36), TRUE);
         MoveWindow(hBtnFull,   x + Scale(322), y + rowH * 6 + Scale(4), Scale(230), Scale(36), TRUE);
+        MoveWindow(hBtnUpdate, g_ly.main.left + Scale(40), g_ly.content.bottom - Scale(70), Scale(140), Scale(38), TRUE);
     }
 }
 
@@ -1975,6 +1979,7 @@ static void SyncSettingsVisibility() {
     ShowWindow(hEdGame, onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnSource, onSettings ? SW_SHOW : SW_HIDE);
     ShowWindow(hBtnFull,   onSettings ? SW_SHOW : SW_HIDE);
+    ShowWindow(hBtnUpdate, (g_page == PAGE_SETTINGS && g_settingsTab == 1) ? SW_SHOW : SW_HIDE);
 }
 static void DrawCandList(HDC dc, bool isDir) {
     const std::vector<Cand>& list = isDir ? g_dirCands : g_javaCands;
@@ -2072,6 +2077,118 @@ static void DrawSettingsMenu(HDC dc) {
     }
 }
 
+// ============================ 自动更新 ============================
+#define APP_TAG L"v1.1.0-beta3.5"
+
+static std::wstring    g_newTag;
+static std::string     g_newUrl;
+static std::atomic<int> g_updateState{ 0 };   // 0未查 1查中 2有新版 3已最新 4失败
+static std::atomic<bool> g_updating{ false };
+
+// a 是否比 b 新
+static bool TagNewer(const std::wstring& a, const std::wstring& b) {
+    auto parse = [](std::string s) {
+        if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s.erase(s.begin());
+        std::vector<int> nums;
+        double beta = 0;
+        size_t dash = s.find('-');
+        std::string mainPart = (dash == std::string::npos) ? s : s.substr(0, dash);
+        std::string sub = (dash == std::string::npos) ? "" : s.substr(dash + 1);
+        std::string cur;
+        for (char c : mainPart) {
+            if (c == '.') { if (!cur.empty()) { nums.push_back(atoi(cur.c_str())); cur.clear(); } }
+            else cur.push_back(c);
+        }
+        if (!cur.empty()) nums.push_back(atoi(cur.c_str()));
+        size_t bp = sub.find("beta");
+        if (bp != std::string::npos) beta = atof(sub.c_str() + bp + 4);
+        return std::make_pair(nums, beta);
+    };
+    auto A = parse(WToU8(a)), B = parse(WToU8(b));
+    size_t n = std::max(A.first.size(), B.first.size());
+    for (size_t i = 0; i < n; ++i) {
+        int x = i < A.first.size() ? A.first[i] : 0;
+        int y = i < B.first.size() ? B.first[i] : 0;
+        if (x != y) return x > y;
+    }
+    return A.second > B.second;
+}
+
+static void UpdateThread(bool interactive) {
+    g_updateState = 1;
+    std::vector<unsigned char> data;
+    std::string err;
+    bool ok = HttpRequest("https://api.github.com/repos/ShadowForgekin/ReignLaunch/releases",
+                          "GET", "", "", data, err);
+    if (ok && !data.empty()) {
+        std::string body(data.begin(), data.end());
+        json j = json::parse(body, nullptr, false);
+        if (j.is_array()) {
+            for (auto& r : j) {
+                if (!r.is_object() || r.value("draft", false)) continue;
+                std::string tag = r.value("tag_name", std::string());
+                std::string url;
+                if (r.contains("assets") && r["assets"].is_array()) {
+                    for (auto& a : r["assets"]) {
+                        if (a.value("name", std::string()) == "ReignLaunch.exe") {
+                            url = a.value("browser_download_url", std::string());
+                            break;
+                        }
+                    }
+                }
+                if (tag.empty() || url.empty()) continue;
+                g_newTag = U8ToW(tag);
+                g_newUrl = url;
+                g_updateState = TagNewer(g_newTag, APP_TAG) ? 2 : 3;
+                break;
+            }
+            if (g_updateState == 1) g_updateState = 3;
+        } else g_updateState = 4;
+    } else {
+        g_updateState = 4;
+    }
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPD, interactive ? 1 : 0, 0);
+}
+
+// 下载新版并写一个批处理：等本进程退出 -> 覆盖 exe -> 启动新版
+static void StartUpdate() {
+    if (g_updating.load()) return;
+    g_updating = true;
+
+    wchar_t exePath[MAX_PATH] = { 0 };
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    fs::path cur = exePath;
+    fs::path nw = cur;
+    nw += L".new";
+
+    std::string err;
+    if (!DownloadFile(g_newUrl, nw, err)) {
+        g_updating = false;
+        MessageBoxW(g_hwnd, (L"下载新版本失败：\n" + U8ToW(err)).c_str(), L"更新失败", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    fs::path bat = cur;
+    bat += L".update.bat";
+    {
+        std::ofstream f{ bat, std::ios::binary | std::ios::trunc };
+        std::string s;
+        s += "@echo off\r\n";
+        s += "timeout /t 2 /nobreak >nul\r\n";
+        s += ":wait\r\n";
+        s += "tasklist /fi \"imagename eq " + WToU8(cur.filename().wstring()) + "\" 2>nul | find /i \"" +
+             WToU8(cur.filename().wstring()) + "\" >nul\r\n";
+        s += "if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait)\r\n";
+        s += "move /y \"" + WToU8(nw.wstring()) + "\" \"" + WToU8(cur.wstring()) + "\" >nul\r\n";
+        s += "start \"\" \"" + WToU8(cur.wstring()) + "\"\r\n";
+        s += "del \"%~f0\"\r\n";
+        f << s;
+    }
+
+    ShellExecuteW(nullptr, L"open", bat.c_str(), nullptr, nullptr, SW_HIDE);
+    MessageBoxW(g_hwnd, L"新版本已下载，启动器会关闭并自动替换为最新版。", L"更新", MB_OK | MB_ICONINFORMATION);
+    DestroyWindow(g_hwnd);
+}
 // ============================ 启动浮层 ============================
 static void ApplyOverlayVisibility() {
     bool L = (g_page == PAGE_LAUNCH) && !g_overlay;
@@ -2655,6 +2772,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnSource = MakeBtn(hwnd, g_cfg.dlSource == 1 ? L"下载源：仅官方"
                                   : g_cfg.dlSource == 2 ? L"下载源：仅 BMCLAPI" : L"下载源：自动", ID_BTN_SOURCE);
         hBtnFull   = MakeBtn(hwnd, (std::wstring(L"游戏窗口模式：") + WinModeLabel(g_cfg.winMode)).c_str(), ID_BTN_FULL);
+        hBtnUpdate = MakeBtn(hwnd, L"检查更新", ID_BTN_UPDATE);
         }
 
         hEdDir  = MakeEdit(hwnd, ID_ED_DIR, U8ToW(g_cfg.gameDir).c_str());
@@ -2802,6 +2920,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     CaptureActiveAccount();
                     g_cfg.activeAcc = idx;
                     ApplyActiveAccount();
+    std::thread(UpdateThread, false).detach();
                     LoadSkinBitmap();
                     SaveConfig();
                     g_status = L"已切换到账户：" + U8ToW(g_cfg.accounts[idx].name);
@@ -2883,7 +3002,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
 
-        case ID_BTN_SOURCE: {
+        case ID_BTN_UPDATE:
+        g_status = L"正在检查更新…";
+        std::thread(UpdateThread, true).detach();
+        InvalidateRect(hwnd, nullptr, TRUE);
+        break;
+
+    case ID_BTN_SOURCE: {
         g_cfg.dlSource = (g_cfg.dlSource + 1) % 3;
         SetWindowTextW(hBtnSource,
             g_cfg.dlSource == 1 ? L"下载源：仅官方"
@@ -2966,6 +3091,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else {
             if (g_cfg.activeAcc >= (int)g_cfg.accounts.size()) g_cfg.activeAcc = (int)g_cfg.accounts.size() - 1;
             ApplyActiveAccount();
+    std::thread(UpdateThread, false).detach();
             LoadSkinBitmap();
         }
         SaveConfig();
@@ -3021,6 +3147,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             int idx = UpsertAccount("offline", nm);
             g_cfg.activeAcc = idx;
             ApplyActiveAccount();
+    std::thread(UpdateThread, false).detach();
             SaveConfig();
             g_loginState = 0;
             g_status = L"已切换到离线账户：" + U8ToW(nm);
@@ -3180,6 +3307,23 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
 
+    case WM_APP_UPD: {
+        bool interactive = (wp != 0);
+        int st = g_updateState.load();
+        if (st == 2) {
+            std::wstring msg = std::wstring(L"发现新版本 ") + g_newTag + L"\n当前版本 " APP_TAG L"\n\n是否现在更新？";
+            if (MessageBoxW(hwnd, msg.c_str(), L"检查更新", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                StartUpdate();
+            }
+        } else if (st == 3 && interactive) {
+            MessageBoxW(hwnd, (std::wstring(L"已是最新版本（") + APP_TAG + L"）").c_str(), L"检查更新", MB_OK | MB_ICONINFORMATION);
+        } else if (st == 4 && interactive) {
+            MessageBoxW(hwnd, L"检查更新失败，请检查网络后重试。", L"检查更新", MB_OK | MB_ICONWARNING);
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
     case WM_APP_NEEDJAVA: {
         int need = (int)wp;
         if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
@@ -3273,6 +3417,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int) {
     g_dataDir = WToU8(fs::path(g_cfgPath).parent_path().wstring());
     LoadConfig();
     ApplyActiveAccount();
+    std::thread(UpdateThread, false).detach();
 
 
     Gdiplus::GdiplusStartupInput gpsi;
