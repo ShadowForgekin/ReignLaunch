@@ -145,7 +145,8 @@ static int g_dlLoader = 0;              // 0=原版 1=Fabric 2=Quilt 3=Forge 4=N
 static std::vector<std::string> g_ldVers;   // 当前加载器的可选版本
 static std::vector<std::string> g_ldFiles;  // 对应 mod 的下载地址（0/1/2/3/4 为空）
 static int g_ldSel = -1;
-static std::atomic<int> g_ldVersState{ 0 }; // 0未取 1取中 2成功 3失败
+static std::atomic<int> g_ldVersState{ 0 };
+static std::atomic<bool> g_dlBusy{ false };   // 正在下载/安装 // 0未取 1取中 2成功 3失败
 static void FetchLoaderVersThread();
 static void RebuildDlView();
 static void FetchManifestThread();
@@ -2199,7 +2200,8 @@ static void FetchManifestThread() {
 
 // 安装：下载版本 json → 自动补全客户端/依赖/资源
 static void InstallVersionThread(std::string id, std::string url) {
-    g_progState = 0;
+    g_dlBusy = true;
+    g_progState = 1;
     g_progCur = 0;
     g_progTotal = 0;
     g_status = L"正在下载版本 JSON…";
@@ -2222,6 +2224,8 @@ static void InstallVersionThread(std::string id, std::string url) {
     g_progState = 0;
 
     if (g_hwnd) {
+    g_dlBusy = false;
+    g_progState = 0;
         g_status = L"安装完成：" + U8ToW(id) + L"（下载 " + std::to_wstring(st.downloaded) + L" 个文件）";
         ScanVersions();
         PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
@@ -2425,6 +2429,8 @@ static void InstallMetaLoaderThread(std::string mc, bool quilt, std::string want
     g_progState = 0;
     if (g_hwnd) {
         ScanVersions();
+    g_dlBusy = false;
+    g_progState = 0;
         g_status = L"安装完成：" + U8ToW(vid) + L"（下载 " + std::to_wstring(st.downloaded) + L" 个文件）";
         PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
     }
@@ -2507,6 +2513,8 @@ static void InstallInstallerThread(std::string mc, bool neo, std::string wantVer
 
     if (g_hwnd) {
         ScanVersions();
+    g_dlBusy = false;
+    g_progState = 0;
         g_status = (code == 0) ? (L"安装完成：" + U8ToW(ver))
                                : (L"安装器退出码 " + std::to_wstring(code) + L"，请查看日志");
         PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
@@ -2670,6 +2678,40 @@ static void FillLine(HDC dc, int left, int right, int y, COLORREF col) {
 }
 
 // 沉浸式启动画面：背景图/深灰渐变 + 底部 200px 渐变压暗 + 左下角状态 + 贴底进度条
+// 下载进度条（下载页底部）
+static void DrawDlProgress(HDC dc) {
+    if (g_progState.load() != 1 && !g_dlBusy.load()) return;
+    RECT c = g_ly.content;
+    int total = g_progTotal.load(), cur = g_progCur.load();
+    double ratio = 0;
+    if (total > 0) ratio = (double)cur / total;
+    else if (g_dlBusy.load()) ratio = 0.15;
+    if (ratio > 1) ratio = 1;
+
+    int barH = Scale(6);
+    RECT bg = { c.left, c.bottom - barH, c.right, c.bottom };
+    HBRUSH b1 = CreateSolidBrush(RGB(40, 42, 48));
+    FillRect(dc, &bg, b1);
+    DeleteObject(b1);
+    if (ratio > 0) {
+        RECT fg = bg;
+        fg.right = bg.left + (int)((bg.right - bg.left) * ratio);
+        if (fg.right < fg.left + 1) fg.right = fg.left + 1;
+        HBRUSH b2 = CreateSolidBrush(C_ACCENT2);
+        FillRect(dc, &fg, b2);
+        DeleteObject(b2);
+    }
+
+    std::wstring s;
+    if (total > 0)
+        s = L"正在下载 " + std::to_wstring(cur) + L" / " + std::to_wstring(total) +
+            L"   " + std::to_wstring((int)(ratio * 100)) + L"%";
+    else
+        s = L"正在准备下载…";
+    RECT tr = { c.left + Scale(24), c.bottom - Scale(34), c.right - Scale(24), c.bottom - Scale(10) };
+    DrawTextIn(dc, s, tr, C_TEXT, g_fSmall);
+}
+
 static void DrawOverlay(HDC dc) {
     RECT c = g_ly.content;
     int h = c.bottom - c.top;
@@ -3010,6 +3052,7 @@ static void PaintMain(HDC dc, int w, int h) {
                     yy += itemH;
                 }
             }
+            DrawDlProgress(dc);
             return;
         }
 
@@ -3065,6 +3108,7 @@ static void PaintMain(HDC dc, int w, int h) {
                 y += itemH;
             }
         }
+        DrawDlProgress(dc);
     }
     else if (g_page == PAGE_ABOUT) {
         DrawAboutBlock(dc);
