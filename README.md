@@ -4,7 +4,7 @@
 
 **v1.2.0 Beta 4** · 制作人：加纳Brightchaserove（抖音）
 
-![启动页](screenshots/ui_launch.jpg?v=2)
+![启动页](screenshots/ui_launch.jpg?v=20261102b)
 
 ---
 
@@ -40,7 +40,7 @@
 
 | 下载列表 | 版本详情 |
 |---|---|
-| ![下载](screenshots/ui_download.jpg?v=2) | ![详情](screenshots/ui_download_detail.jpg?v=2) |
+| ![下载](screenshots/ui_download.jpg?v=20261102b) | ![详情](screenshots/ui_download_detail.jpg?v=20261102b) |
 
 **下载任务面板**
 
@@ -52,7 +52,7 @@
 - 实时速度（KB/s 或 MB/s）
 - 右下角「取消下载」
 
-![下载中](screenshots/ui_download_task.jpg?v=2)
+![下载中](screenshots/ui_download_task.jpg?v=20261102b)
 
 **下载加速**：每个线程复用一条 WinHTTP 会话（避免每文件重新 TLS 握手），
 默认 **16 线程**并发，设置页可调 1–128。
@@ -74,7 +74,7 @@
     （装了 CustomSkinLoader 模组游戏内可见）
 - **离线 UUID**：`MD5("OfflinePlayer:名字")` + version 3 / variant 位，与官方一致
 
-![用户页](screenshots/ui_user.jpg?v=2)
+![用户页](screenshots/ui_user.jpg?v=20261102b)
 
 ### Java 自动匹配
 
@@ -96,7 +96,7 @@
 （属于游戏 PID + 窗口可见 + 标题非空，最多 180 秒），完成后 1.5 秒自动收起。
 中途点「取消」会立即终止 java 进程。
 
-![启动画面](screenshots/ui_launching.jpg?v=2)
+![启动画面](screenshots/ui_launching.jpg?v=20261102b)
 
 ### 版本隔离
 
