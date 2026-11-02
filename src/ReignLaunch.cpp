@@ -127,7 +127,7 @@ static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
-static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack;
+static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall;
 
 struct McVer { std::string id, type, url, date; };
 static std::vector<McVer> g_mcVers;
@@ -141,6 +141,11 @@ static std::atomic<int> g_ldState[4] = { {0}, {0}, {0}, {0} };
 static std::wstring g_ldVer[4];
 static void FetchLoadersThread();
 static std::string g_dlDetailMc;
+static int g_dlLoader = 0;              // 0=原版 1=Fabric 2=Quilt 3=Forge 4=NeoForge
+static std::vector<std::string> g_ldVers;   // 当前加载器的可选版本
+static int g_ldSel = -1;
+static std::atomic<int> g_ldVersState{ 0 }; // 0未取 1取中 2成功 3失败
+static void FetchLoaderVersThread();
 static void RebuildDlView();
 static void FetchManifestThread();
 static bool IsAprilFools(const McVer& v);
@@ -1682,14 +1687,17 @@ static void LayoutControls() {
             MoveWindow(hBtnDlF3, tx0, ty0, tw, Scale(32), TRUE);
             MoveWindow(hEdSearch, g_ly.content.right - Scale(24) - Scale(240), ty0, Scale(240), Scale(30), TRUE);
 
-            int dbx = g_ly.content.right - Scale(24) - Scale(150);
-            int dby0 = g_ly.content.top + Scale(64);
-            MoveWindow(hBtnDlVanilla, dbx, dby0 + Scale(56) * 0, Scale(150), Scale(38), TRUE);
-            MoveWindow(hBtnDlFabric,  dbx, dby0 + Scale(56) * 1, Scale(150), Scale(38), TRUE);
-            MoveWindow(hBtnDlQuilt,   dbx, dby0 + Scale(56) * 2, Scale(150), Scale(38), TRUE);
-            MoveWindow(hBtnDlForge,   dbx, dby0 + Scale(56) * 3, Scale(150), Scale(38), TRUE);
-            MoveWindow(hBtnDlNeo,     dbx, dby0 + Scale(56) * 4, Scale(150), Scale(38), TRUE);
-            MoveWindow(hBtnDlBack, g_ly.content.left + Scale(24), g_ly.content.top + Scale(16), Scale(100), Scale(32), TRUE);
+            int dby = g_ly.content.top + Scale(64);
+            int dbw = Scale(110), dbg = Scale(8);
+            int dbx = g_ly.content.left + Scale(24);
+            MoveWindow(hBtnDlVanilla, dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
+            MoveWindow(hBtnDlFabric,  dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
+            MoveWindow(hBtnDlQuilt,   dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
+            MoveWindow(hBtnDlForge,   dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
+            MoveWindow(hBtnDlNeo,     dbx, dby, dbw, Scale(32), TRUE);
+            MoveWindow(hBtnDlInstall, g_ly.content.right - Scale(24) - Scale(130),
+                       g_ly.content.bottom - Scale(58), Scale(130), Scale(38), TRUE);
+            MoveWindow(hBtnDlBack, g_ly.content.left + Scale(24), g_ly.content.bottom - Scale(58), Scale(100), Scale(32), TRUE);
 
         }
     }
@@ -1702,6 +1710,7 @@ static void SyncDownloadControls() {
     int showDl  = (onDl && !g_dlDetail) ? SW_SHOW : SW_HIDE;
     int showDet = (onDl &&  g_dlDetail) ? SW_SHOW : SW_HIDE;
     ShowWindow(hBtnDlBack, showDet);
+    ShowWindow(hBtnDlInstall, showDet);
     ShowWindow(hBtnDlF0, showDl);
     ShowWindow(hBtnDlF1, showDl);
     ShowWindow(hBtnDlF2, showDl);
@@ -2219,6 +2228,40 @@ static void InstallVersionThread(std::string id, std::string url) {
         PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
     }
 }
+// ---------------- 详情页：加载器版本列表 ----------------
+static void FetchLoaderVersThread() {
+    int kind = g_dlLoader;
+    g_ldVersState = 1;
+    g_ldVers.clear();
+    g_ldSel = -1;
+
+    std::string mc = g_dlDetailMc;
+    std::string url;
+    if (kind == 1) url = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/" + mc;
+    else if (kind == 2) url = "https://meta.quiltmc.org/v3/versions/loader/" + mc;
+    else if (kind == 3) url = "https://bmclapi2.bangbang93.com/forge/minecraft/" + mc;
+    else if (kind == 4) url = "https://bmclapi2.bangbang93.com/neoforge/list/" + mc;
+    else { g_ldVersState = 2; if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); return; }
+
+    std::vector<unsigned char> d;
+    std::string e;
+    if (!HttpRequest(url, "GET", "", "", d, e)) {
+        g_ldVersState = 3;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+    if (j.is_array()) {
+        for (auto& x : j) {
+            std::string v;
+            if (kind == 1 || kind == 2) v = x["loader"].value("version", std::string());
+            else v = x.value("version", std::string());
+            if (!v.empty()) g_ldVers.push_back(v);
+        }
+    }
+    g_ldVersState = 2;   // 2=成功（空列表由绘制层显示"没有可下载的版本"）
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
 // ---------------- 详情页：加载器可用性 ----------------
 static void FetchLoadersThread() {
     std::string mc = g_dlDetailMc;
@@ -2325,7 +2368,7 @@ static std::string HttpGetString(const std::string& url, std::string& err) {
 }
 
 // Fabric / Quilt：拿 loader 列表 -> profile json -> 落到 versions/<id>
-static void InstallMetaLoaderThread(std::string mc, bool quilt) {
+static void InstallMetaLoaderThread(std::string mc, bool quilt, std::string wantVer = "") {
     g_status = L"正在获取 " + std::wstring(quilt ? L"Quilt" : L"Fabric") + L" 加载器列表…";
 
     std::string url = quilt
@@ -2339,7 +2382,8 @@ static void InstallMetaLoaderThread(std::string mc, bool quilt) {
     json j = json::parse(body, nullptr, false);
     if (!j.is_array() || j.empty()) { g_status = L"该版本没有可用的加载器"; if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); return; }
 
-    std::string lv = j[0]["loader"].value("version", std::string());
+    std::string lv = wantVer;
+    if (lv.empty()) lv = j[0]["loader"].value("version", std::string());
     if (lv.empty()) { g_status = L"解析加载器版本失败"; if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); return; }
 
     g_status = L"正在获取 profile（" + U8ToW(lv) + L"）…";
@@ -2372,7 +2416,7 @@ static void InstallMetaLoaderThread(std::string mc, bool quilt) {
 }
 
 // Forge / NeoForge：下载 installer 并执行 --installClient
-static void InstallInstallerThread(std::string mc, bool neo) {
+static void InstallInstallerThread(std::string mc, bool neo, std::string wantVer = "") {
     std::string listUrl = neo
         ? "https://bmclapi2.bangbang93.com/neoforge/list/" + mc
         : "https://bmclapi2.bangbang93.com/forge/minecraft/" + mc;
@@ -2874,42 +2918,80 @@ static void PaintMain(HDC dc, int w, int h) {
     }
     else if (g_page == PAGE_DOWNLOAD) {
         if (g_dlDetail) {
-            if (g_dlSel >= 0 && g_dlSel < (int)g_dlView.size()) {
-                const McVer& v = g_mcVers[g_dlView[g_dlSel]];
-                int x = g_ly.content.left + Scale(140);
-                int y = g_ly.content.top + Scale(12);
-
-                RECT t1 = { x, y, g_ly.content.right - Scale(200), y + Scale(34) };
-                DrawTextIn(dc, U8ToW(v.id), t1, C_TEXT, g_fTitle);
-
-                std::wstring sub = U8ToW(v.date);
-                if (!sub.empty()) sub += L"   ";
-                sub += (v.type == "release") ? L"正式版" : (v.type == "snapshot") ? L"快照" :
-                       (v.type == "old_beta") ? L"远古 Beta" : L"远古 Alpha";
-                RECT t2 = { x, y + Scale(32), g_ly.content.right - Scale(200), y + Scale(56) };
-                DrawTextIn(dc, sub, t2, C_DIM, g_fSmall);
-
-                const wchar_t* names[5] = { L"原版", L"Fabric", L"Quilt", L"Forge", L"NeoForge" };
-                int baseY = g_ly.content.top + Scale(64);
-                for (int i = 0; i < 5; ++i) {
-                    int ry = baseY + Scale(56) * i;
-                    RECT nm = { g_ly.content.left + Scale(24), ry, g_ly.content.left + Scale(200), ry + Scale(38) };
-                    DrawTextIn(dc, names[i], nm, C_TEXT, g_fUi);
-
-                    RECT ir = { g_ly.content.left + Scale(200), ry, g_ly.content.right - Scale(200), ry + Scale(38) };
-                    if (i == 0) {
-                        DrawTextIn(dc, L"游戏本体（客户端 + 依赖 + 资源）", ir, C_DIM, g_fSmall);
-                    } else {
-                        int st = g_ldState[i - 1].load();
-                        std::wstring info = (st == 0) ? L"查询中…"
-                                          : (st == 1) ? (L"最新 " + g_ldVer[i - 1])
-                                          : L"没有可下载的版本";
-                        DrawTextIn(dc, info, ir, (st == 2) ? C_ERR : C_DIM, g_fSmall);
-                    }
-                }
-            } else {
-                RECT e = { g_ly.content.left + Scale(24), g_ly.content.top + Scale(60), g_ly.content.right - Scale(24), g_ly.content.top + Scale(100) };
+            if (g_dlSel < 0 || g_dlSel >= (int)g_dlView.size()) {
+                RECT e = { g_ly.content.left + Scale(24), g_ly.content.top + Scale(60),
+                           g_ly.content.right - Scale(24), g_ly.content.top + Scale(100) };
                 DrawTextIn(dc, L"未选中版本，点「返回」重新选择", e, C_DIM, g_fSmall);
+                return;
+            }
+
+            const McVer& v = g_mcVers[g_dlView[g_dlSel]];
+
+            // 标题
+            int hx = g_ly.content.left + Scale(140);
+            int hy = g_ly.content.top + Scale(10);
+            RECT t1 = { hx, hy, g_ly.content.right - Scale(24), hy + Scale(32) };
+            DrawTextIn(dc, U8ToW(v.id), t1, C_TEXT, g_fTitle);
+
+            std::wstring sub = U8ToW(v.date);
+            if (!sub.empty()) sub += L"   ";
+            sub += (v.type == "release") ? L"正式版" : (v.type == "snapshot") ? L"快照" :
+                   (v.type == "old_beta") ? L"远古 Beta" : L"远古 Alpha";
+            RECT t2 = { hx, hy + Scale(30), g_ly.content.right - Scale(24), hy + Scale(52) };
+            DrawTextIn(dc, sub, t2, C_DIM, g_fSmall);
+
+            // 加载器选择行（按钮是控件，这里只画提示）
+            const wchar_t* hint = (g_dlLoader == 0)
+                ? L"原版：不安装任何加载器"
+                : (g_dlLoader == 1) ? L"Fabric：请在下方选择加载器版本"
+                : (g_dlLoader == 2) ? L"Quilt：请在下方选择加载器版本"
+                : (g_dlLoader == 3) ? L"Forge：请在下方选择加载器版本"
+                                    : L"NeoForge：请在下方选择加载器版本";
+            RECT hr = { g_ly.content.left + Scale(24), g_ly.content.top + Scale(104),
+                        g_ly.content.right - Scale(24), g_ly.content.top + Scale(130) };
+            DrawTextIn(dc, hint, hr, C_DIM, g_fSmall);
+
+            // 版本列表
+            int listTop  = g_ly.content.top + Scale(136);
+            int listBot  = g_ly.content.bottom - Scale(70);
+
+            if (g_dlLoader == 0) {
+                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
+                           g_ly.content.right - Scale(24), listTop + Scale(46) };
+                DrawTextIn(dc, L"选中「原版」时不安装加载器，直接点右下角安装即可。", e, C_DIM, g_fSmall);
+            } else if (g_ldVersState.load() == 0 || g_ldVersState.load() == 1) {
+                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
+                           g_ly.content.right - Scale(24), listTop + Scale(46) };
+                DrawTextIn(dc, L"正在获取加载器版本…", e, C_DIM, g_fSmall);
+            } else if (g_ldVersState.load() == 3) {
+                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
+                           g_ly.content.right - Scale(24), listTop + Scale(46) };
+                DrawTextIn(dc, L"获取失败，检查网络后重试", e, C_ERR, g_fSmall);
+            } else if (g_ldVers.empty()) {
+                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
+                           g_ly.content.right - Scale(24), listTop + Scale(46) };
+                DrawTextIn(dc, L"没有可下载的版本", e, C_ERR, g_fSmall);
+            } else {
+                int itemH = Scale(44);
+                int yy = listTop - g_listScroll;
+                for (size_t i = 0; i < g_ldVers.size(); ++i) {
+                    RECT item = { g_ly.content.left + Scale(24), yy,
+                                  g_ly.content.right - Scale(24), yy + itemH - Scale(6) };
+                    if (item.bottom > listTop && item.top < listBot) {
+                        if (item.bottom > listBot) item.bottom = listBot;
+                        bool sel = ((int)i == g_ldSel);
+                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
+                        RECT tx = item; tx.left += Scale(16);
+                        DrawTextIn(dc, U8ToW(g_ldVers[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
+                        if (sel) {
+                            RECT bar = { item.left, item.top + Scale(6), item.left + Scale(3), item.bottom - Scale(6) };
+                            HBRUSH b = CreateSolidBrush(C_ACCENT2);
+                            FillRect(dc, &bar, b);
+                            DeleteObject(b);
+                        }
+                    }
+                    yy += itemH;
+                }
             }
             return;
         }
@@ -3229,7 +3311,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnTabAbout    = MakeBtn(hwnd, L"关于", ID_TAB_ABOUT);
         hBtnTabInst     = MakeBtn(hwnd, L"实例", ID_TAB_INST);
         hBtnTabDl       = MakeBtn(hwnd, L"下载", ID_TAB_DL);
-        hBtnDlVanilla = MakeBtn(hwnd, L"下载并安装", ID_DL_VANILLA);
+        hBtnDlVanilla = MakeBtn(hwnd, L"原版", ID_DL_VANILLA);
         hBtnDlFabric  = MakeBtn(hwnd, L"Fabric",   ID_DL_FABRIC);
         hBtnDlQuilt   = MakeBtn(hwnd, L"Quilt",    ID_DL_QUILT);
         hBtnDlForge   = MakeBtn(hwnd, L"Forge",    ID_DL_FORGE);
@@ -3244,6 +3326,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageW(hEdSearch, WM_SETFONT, (WPARAM)g_fUi, TRUE);
         SendMessageW(hEdSearch, EM_SETCUEBANNER, 0, (LPARAM)L"搜索版本，如 1.20.1");
         hBtnDlBack    = MakeBtn(hwnd, L"← 返回", ID_DL_BACK);
+        hBtnDlInstall = MakeBtn(hwnd, L"安装", ID_DL_INSTALL);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
@@ -3402,6 +3485,21 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (g_page == PAGE_DOWNLOAD) {
+            if (g_dlDetail) {
+                if (g_dlLoader > 0 && !g_ldVers.empty()) {
+                    int itemH0 = Scale(44);
+                    int top0 = g_ly.content.top + Scale(136);
+                    if (pt.y >= top0) {
+                        int idx0 = (pt.y - top0 + g_listScroll) / itemH0;
+                        if (idx0 >= 0 && idx0 < (int)g_ldVers.size()) {
+                            g_ldSel = idx0;
+                            g_status = L"已选择加载器版本：" + U8ToW(g_ldVers[idx0]);
+                            InvalidateRect(hwnd, nullptr, TRUE);
+                        }
+                    }
+                }
+                return 0;
+            }
             if (g_mcVersState.load() == 0) {
                 std::thread(FetchManifestThread).detach();
             } else if (g_mcVersState.load() == 2) {
@@ -3572,51 +3670,53 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case ID_DL_VANILLA: case ID_DL_FABRIC: case ID_DL_QUILT:
-    case ID_DL_FORGE:   case ID_DL_NEO: {
-        if (g_dlSel < 0 || g_dlSel >= (int)g_dlView.size()) {
-            MessageBoxW(hwnd, L"请先在列表里选一个游戏版本。", L"下载", MB_OK | MB_ICONINFORMATION);
+        case ID_DL_FORGE:   case ID_DL_NEO: {
+            int id = (int)(wp & 0xFFFF);
+            int kind = (id == ID_DL_VANILLA) ? 0 : (id == ID_DL_FABRIC) ? 1
+                     : (id == ID_DL_QUILT) ? 2 : (id == ID_DL_FORGE) ? 3 : 4;
+            g_dlLoader = kind;
+            g_ldSel = -1;
+            g_ldVers.clear();
+            g_ldVersState = 0;
+            g_listScroll = 0;
+            if (kind > 0) std::thread(FetchLoaderVersThread).detach();
+            InvalidateRect(hwnd, nullptr, TRUE);
             break;
         }
-        {
-            int idchk = (int)(wp & 0xFFFF);
-            int ldi = (idchk == ID_DL_FABRIC) ? 0 : (idchk == ID_DL_QUILT) ? 1
-                    : (idchk == ID_DL_FORGE) ? 2 : (idchk == ID_DL_NEO) ? 3 : -1;
-            if (ldi >= 0 && g_ldState[ldi].load() != 1) {
-                MessageBoxW(hwnd, L"该版本没有可下载的加载器版本。", L"提示", MB_OK | MB_ICONINFORMATION);
+
+        case ID_DL_INSTALL: {
+            if (g_dlSel < 0 || g_dlSel >= (int)g_dlView.size()) {
+                MessageBoxW(hwnd, L"请先返回列表选择一个游戏版本。", L"下载", MB_OK | MB_ICONINFORMATION);
                 break;
             }
-        }
-        int realIdx = g_dlView[g_dlSel];
-        std::string mc = g_mcVers[realIdx].id;
-        std::string url = g_mcVers[realIdx].url;
-        int id = (int)(wp & 0xFFFF);
-        if (id == ID_DL_VANILLA) (void)url;
+            int realIdx = g_dlView[g_dlSel];
+            std::string mc  = g_mcVers[realIdx].id;
+            std::string url = g_mcVers[realIdx].url;
 
-        if (id == ID_DL_VANILLA) {
-            std::wstring cmsg = L"确定安装原版 " + U8ToW(mc) + L" 吗？";
-            if (MessageBoxW(hwnd, cmsg.c_str(), L"下载原版", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
-            g_status = L"开始安装：" + U8ToW(mc);
-            std::thread(InstallVersionThread, mc, url).detach();
-        } else if (id == ID_DL_FABRIC) {
-            std::wstring cmsg = L"为 " + U8ToW(mc) + L" 安装 Fabric？\n会自动选最新加载器。";
-            if (MessageBoxW(hwnd, cmsg.c_str(), L"安装 Fabric", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
-            std::thread(InstallMetaLoaderThread, mc, false).detach();
-        } else if (id == ID_DL_QUILT) {
-            std::wstring cmsg = L"为 " + U8ToW(mc) + L" 安装 Quilt？\n会自动选最新加载器。";
-            if (MessageBoxW(hwnd, cmsg.c_str(), L"安装 Quilt", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
-            std::thread(InstallMetaLoaderThread, mc, true).detach();
-        } else if (id == ID_DL_FORGE) {
-            std::wstring cmsg = L"为 " + U8ToW(mc) + L" 安装 Forge？\n会下载并运行官方安装器，可能需要几分钟。";
-            if (MessageBoxW(hwnd, cmsg.c_str(), L"安装 Forge", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
-            std::thread(InstallInstallerThread, mc, false).detach();
-        } else {
-            std::wstring cmsg = L"为 " + U8ToW(mc) + L" 安装 NeoForge？\n会下载并运行官方安装器，可能需要几分钟。";
-            if (MessageBoxW(hwnd, cmsg.c_str(), L"安装 NeoForge", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
-            std::thread(InstallInstallerThread, mc, true).detach();
+            if (g_dlLoader == 0) {
+                std::wstring cmsg = L"安装原版 " + U8ToW(mc) + L"（不安装加载器）？";
+                if (MessageBoxW(hwnd, cmsg.c_str(), L"下载原版", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
+                g_status = L"开始安装：" + U8ToW(mc);
+                std::thread(InstallVersionThread, mc, url).detach();
+            } else {
+                if (g_ldSel < 0 || g_ldSel >= (int)g_ldVers.size()) {
+                    MessageBoxW(hwnd, L"请先在列表里选择一个加载器版本。", L"提示", MB_OK | MB_ICONINFORMATION);
+                    break;
+                }
+                std::string lv = g_ldVers[g_ldSel];
+                std::wstring cmsg = L"为 " + U8ToW(mc) + L" 安装 " +
+                                    (g_dlLoader == 1 ? L"Fabric " : g_dlLoader == 2 ? L"Quilt " :
+                                     g_dlLoader == 3 ? L"Forge " : L"NeoForge ") +
+                                    U8ToW(lv) + L"？";
+                if (MessageBoxW(hwnd, cmsg.c_str(), L"安装加载器", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
+                if (g_dlLoader == 1)      std::thread(InstallMetaLoaderThread, mc, false, lv).detach();
+                else if (g_dlLoader == 2) std::thread(InstallMetaLoaderThread, mc, true, lv).detach();
+                else if (g_dlLoader == 3) std::thread(InstallInstallerThread, mc, false, lv).detach();
+                else                      std::thread(InstallInstallerThread, mc, true, lv).detach();
+            }
+            InvalidateRect(hwnd, nullptr, TRUE);
+            break;
         }
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    }
 
     case ID_BTN_UPDATE:
         g_status = L"正在检查更新…";
