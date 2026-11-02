@@ -154,7 +154,8 @@ static std::wstring g_dlTarget;      // 例如 "26.3 Fabric"
 static long long g_dlLastBytes = 0;
 static DWORD     g_dlLastTick = 0;
 static double    g_dlSpeed = 0; // 0未取 1取中 2成功 3失败
-static void FetchLoaderVersThread();
+static std::atomic<int> g_ldGen{ 0 };
+static void FetchLoaderVersThread(int kind, int gen);
 static void RebuildDlView();
 static void FetchManifestThread();
 static bool IsAprilFools(const McVer& v);
@@ -2254,10 +2255,9 @@ static void InstallVersionThread(std::string id, std::string url) {
     }
 }
 // ---------------- 详情页：加载器版本列表 ----------------
-static void FetchLoaderVersThread() {
-    int kind = g_dlLoader;
+static void FetchLoaderVersThread(int kind, int gen) {
+    if (gen != g_ldGen.load()) return;
     g_ldVersState = 1;
-    g_ldVers.clear();
     g_ldSel = -1;
 
     std::string mc = g_dlDetailMc;
@@ -2279,7 +2279,7 @@ static void FetchLoaderVersThread() {
         if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
         return;
     }
-    g_ldFiles.clear();
+    std::vector<std::string> vers, files;
     json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
     if (j.is_array()) {
         for (auto& x : j) {
@@ -2291,12 +2291,12 @@ static void FetchLoaderVersThread() {
                     fu = x["files"][0].value("url", std::string());
                     fn = x["files"][0].value("filename", std::string());
                 }
-                if (!v.empty()) { g_ldVers.push_back(v); g_ldFiles.push_back(fu + "\n" + fn); }
+                if (!v.empty()) { vers.push_back(v); files.push_back(fu + "\n" + fn); }
                 continue;
             }
             if (kind == 1 || kind == 2) v = x["loader"].value("version", std::string());
             else v = x.value("version", std::string());
-            if (!v.empty()) g_ldVers.push_back(v);
+            if (!v.empty()) vers.push_back(v);
         }
     }
     g_ldVersState = 2;   // 2=成功（空列表由绘制层显示"没有可下载的版本"）
@@ -3836,7 +3836,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_ldVers.clear();
             g_ldVersState = 0;
             g_listScroll = 0;
-            if (kind > 0) std::thread(FetchLoaderVersThread).detach();
+                        if (kind > 0) {
+                int gen = ++g_ldGen;
+                std::thread(FetchLoaderVersThread, kind, gen).detach();
+            } else {
+                ++g_ldGen;
+            }
             InvalidateRect(hwnd, nullptr, TRUE);
             break;
         }
