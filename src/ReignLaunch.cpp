@@ -64,7 +64,7 @@ struct Config {
     std::string gameDir;
     std::string skinPath;   // 当前皮肤 PNG
     int  isoMode = 0;
-    int  dlThreads = 4;
+    int  dlThreads = 16;
     std::string extraJvm;            // 追加的 JVM 参数
     std::string extraGame;           // 追加的游戏参数
     int  dlSource = 0;               // 0=自动 1=仅官方 2=仅镜像
@@ -150,6 +150,7 @@ static std::atomic<int> g_ldVersState{ 0 };
 static std::atomic<bool> g_dlBusy{ false };   // 正在下载/安装
 static std::atomic<bool> g_dlCancel{ false }; // 用户取消
 static std::atomic<long long> g_dlBytes{ 0 };
+static std::wstring g_dlTarget;      // 例如 "26.3 Fabric"
 static long long g_dlLastBytes = 0;
 static DWORD     g_dlLastTick = 0;
 static double    g_dlSpeed = 0; // 0未取 1取中 2成功 3失败
@@ -314,7 +315,7 @@ static void LoadConfig() {
         json j; f >> j;
         g_cfg.gameDir        = j.value("gameDir", std::string());
     g_cfg.isoMode = j.value("isoMode", 0);
-    g_cfg.dlThreads = j.value("dlThreads", 4);
+    g_cfg.dlThreads = j.value("dlThreads", 16);
     g_cfg.extraJvm = j.value("extraJvm", std::string());
     g_cfg.extraGame = j.value("extraGame", std::string());
     g_cfg.dlSource = j.value("dlSource", 0);
@@ -613,13 +614,17 @@ static bool HttpRequest(const std::string& urlU8, const std::string& method,
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &uc)) { err = "URL 解析失败"; return false; }
 
     bool https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
-    HINTERNET ses = WinHttpOpen(L"ReignLaunch/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!ses) { err = "WinHttpOpen 失败"; return false; }
+    static thread_local HINTERNET tlsSes = nullptr;
+    if (!tlsSes) {
+        tlsSes = WinHttpOpen(L"ReignLaunch/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (tlsSes) WinHttpSetTimeouts(tlsSes, 15000, 15000, 30000, 60000);
+    }
+    HINTERNET ses = tlsSes;
     WinHttpSetTimeouts(ses, 15000, 15000, 30000, 60000);
 
     HINTERNET con = WinHttpConnect(ses, host, uc.nPort ? uc.nPort : (https ? 443 : 80), 0);
-    if (!con) { WinHttpCloseHandle(ses); err = "连接失败"; return false; }
+    if (!con) { err = "连接失败"; return false; }
 
     std::wstring wmethod = U8ToW(method);
     HINTERNET req = WinHttpOpenRequest(con, wmethod.c_str(), path, nullptr, WINHTTP_NO_REFERER,
@@ -656,7 +661,6 @@ static bool HttpRequest(const std::string& urlU8, const std::string& method,
 
     WinHttpCloseHandle(req);
     WinHttpCloseHandle(con);
-    WinHttpCloseHandle(ses);
     return ok;
 }
 
@@ -2718,7 +2722,8 @@ static void DrawDlTaskPanel(HDC dc) {
 
     int x = card.left + Scale(24);
     RECT ttl = { x, card.top + Scale(18), card.right - Scale(24), card.top + Scale(46) };
-    DrawTextIn(dc, g_status.empty() ? L"正在下载…" : g_status, ttl, C_TEXT, g_fUi);
+    std::wstring title = L"正在下载中：" + (g_dlTarget.empty() ? std::wstring(L"…") : g_dlTarget);
+    DrawTextIn(dc, title, ttl, C_TEXT, g_fUi);
 
     int total = g_progTotal.load(), cur = g_progCur.load();
     double ratio = (total > 0) ? ((double)cur / total) : 0.0;
@@ -3848,6 +3853,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_dlCancel = false;
             g_dlBytes = 0;
             g_dlBusy = true;
+            {
+                const wchar_t* kn = (g_dlLoader == 1) ? L"Fabric"
+                                 : (g_dlLoader == 2) ? L"Quilt"
+                                 : (g_dlLoader == 3) ? L"Forge"
+                                 : (g_dlLoader == 4) ? L"NeoForge"
+                                 : (g_dlLoader == 5) ? L"Fabric API"
+                                 : (g_dlLoader == 6) ? L"QSL" : L"原版";
+                g_dlTarget = U8ToW(mc) + L" " + kn;
+            }
             g_progState = 1;
             g_progCur = 0;
             g_progTotal = 0;
@@ -4140,7 +4154,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_cfg.maxMemMB = mem;
     {
         std::string ts = WToU8(CtlText(hEdThreads));
-        int n = ts.empty() ? 4 : atoi(ts.c_str());
+        int n = ts.empty() ? 16 : atoi(ts.c_str());
         if (n < 1) n = 1;
         if (n > 128) n = 128;
         g_cfg.dlThreads = n;
