@@ -127,12 +127,17 @@ static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
+static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch;
 
-struct McVer { std::string id, type, url; };
+struct McVer { std::string id, type, url, date; };
 static std::vector<McVer> g_mcVers;
 static std::atomic<int>  g_mcVersState{ 0 };
+static int g_dlFilter = 0;                 // 0正式 1快照 2远古 3愚人节
+static std::vector<int> g_dlView;
+static int g_dlSel = -1;          // 过滤后的下标
+static void RebuildDlView();
 static void FetchManifestThread();
-
+static bool IsAprilFools(const McVer& v);
 // ============================ 颜色 ============================
 static const COLORREF C_BG       = RGB(24, 25, 28);
 static const COLORREF C_INPUTBG  = RGB(36, 38, 42);
@@ -1278,7 +1283,8 @@ static void LaunchThread(std::string versionId) {
             g_progTotal = miss;
             g_progCur = 0;
             g_progState = 1;
-            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+            RebuildDlView();
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
         }
         if (miss < 0) {
             Log("[错误] 版本 JSON 无法解析，无法检查文件完整性");
@@ -1357,7 +1363,8 @@ static void LaunchThread(std::string versionId) {
         std::thread waiter([gamePid]() {
             if (WaitForGameWindow(gamePid, 180000)) {
                 g_stepCur = 4;
-                if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+                RebuildDlView();
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
                 Log("[成功] 游戏窗口已出现");
             } else {
                 Log("[提示] 等待 180 秒仍未检测到游戏窗口（可能已崩溃，请看日志）");
@@ -1484,6 +1491,12 @@ static std::string        g_loginErr;
 #define ID_DL_QUILT      1372
 #define ID_DL_FORGE      1373
 #define ID_DL_NEO        1374
+#define ID_DL_FILTER0    1380
+#define ID_DL_FILTER1    1381
+#define ID_DL_FILTER2    1382
+#define ID_DL_FILTER3    1383
+#define ID_DL_INSTALL    1384
+#define ID_ED_SEARCH     1385
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1653,6 +1666,15 @@ static void LayoutControls() {
         MoveWindow(hBtnUpdate, g_ly.main.left + Scale(40), g_ly.content.bottom - Scale(70), Scale(140), Scale(38), TRUE);
 
         {
+            int tx0 = g_ly.content.left + Scale(24);
+            int ty0 = g_ly.content.top + Scale(16);
+            int tw = Scale(96), tg = Scale(8);
+            MoveWindow(hBtnDlF0, tx0, ty0, tw, Scale(32), TRUE); tx0 += tw + tg;
+            MoveWindow(hBtnDlF1, tx0, ty0, tw, Scale(32), TRUE); tx0 += tw + tg;
+            MoveWindow(hBtnDlF2, tx0, ty0, tw, Scale(32), TRUE); tx0 += tw + tg;
+            MoveWindow(hBtnDlF3, tx0, ty0, tw, Scale(32), TRUE);
+            MoveWindow(hEdSearch, g_ly.content.right - Scale(24) - Scale(240), ty0, Scale(240), Scale(30), TRUE);
+
             int by = g_ly.content.bottom - Scale(56);
             int bw = Scale(112), gap = Scale(8);
             int bx = g_ly.content.left + Scale(24);
@@ -1682,6 +1704,11 @@ static void ShowPage(Page p) {
     ShowWindow(hBtnTabDl, SW_SHOW);
     {
         int showDl = (g_page == PAGE_DOWNLOAD) ? SW_SHOW : SW_HIDE;
+        ShowWindow(hBtnDlF0, showDl);
+        ShowWindow(hBtnDlF1, showDl);
+        ShowWindow(hBtnDlF2, showDl);
+        ShowWindow(hBtnDlF3, showDl);
+        ShowWindow(hEdSearch, showDl);
         ShowWindow(hBtnDlVanilla, showDl);
         ShowWindow(hBtnDlFabric,  showDl);
         ShowWindow(hBtnDlQuilt,   showDl);
@@ -2130,12 +2157,15 @@ static void FetchManifestThread() {
                 m.id   = v.value("id", std::string());
                 m.type = v.value("type", std::string());
                 m.url  = v.value("url", std::string());
+                std::string rt = v.value("releaseTime", std::string());
+                if (rt.size() >= 10) m.date = rt.substr(0, 10);
                 if (!m.id.empty() && !m.url.empty()) list.push_back(m);
             }
             g_mcVers = list;
             g_mcVersState = 2;
         } else g_mcVersState = 3;
     } else g_mcVersState = 3;
+    RebuildDlView();
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
 
@@ -2169,8 +2199,54 @@ static void InstallVersionThread(std::string id, std::string url) {
         PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
     }
 }
+// ---------------- 下载页过滤 ----------------
+static bool IsAprilFools(const McVer& v) {
+    if (v.type == "release") return false;   // 正式版不算愚人节
+    if (v.date.size() >= 10 && v.date.substr(5, 2) == "04" && v.date.substr(8, 2) == "01") return true;
+    static const char* ids[] = { "15w14a", "1.rv-pre1", "2.0", "3D Shareware v1.34",
+                                 "20w14infinite", "22w13oneblockatatime", "23w13a_or_b" };
+    for (auto id : ids) if (v.id == id) return true;
+    return false;
+}
+
+static void RebuildDlView() {
+    g_dlView.clear();
+    std::wstring kw;
+    {
+        wchar_t buf[256] = { 0 };
+        if (hEdSearch) GetWindowTextW(hEdSearch, buf, 256);
+        kw = buf;
+        for (auto& c : kw) c = (wchar_t)towlower(c);
+    }
+
+    for (size_t i = 0; i < g_mcVers.size(); ++i) {
+        const McVer& v = g_mcVers[i];
+        bool april = IsAprilFools(v);
+        bool isRelease = (v.type == "release");
+        bool isSnap    = (v.type == "snapshot");
+        bool isOld     = (v.type == "old_beta" || v.type == "old_alpha");
+
+        bool pass = false;
+        switch (g_dlFilter) {
+        case 0: pass = isRelease; break;
+        case 1: pass = (isSnap && !april); break;
+        case 2: pass = isOld; break;
+        default: pass = april; break;
+        }
+        if (!pass) continue;
+
+        if (!kw.empty()) {
+            std::wstring idw = U8ToW(v.id);
+            for (auto& c : idw) c = (wchar_t)towlower(c);
+            if (idw.find(kw) == std::wstring::npos) continue;
+        }
+        g_dlView.push_back((int)i);
+    }
+    g_listScroll = 0;
+    if (g_dlSel >= (int)g_dlView.size()) g_dlSel = -1;
+}
 // ---------------- 模组加载器安装 ----------------
-static int g_dlSel = -1;      // 下载页选中的版本下标
+
 
 static std::string HttpGetString(const std::string& url, std::string& err) {
     std::vector<unsigned char> data;
@@ -2270,7 +2346,8 @@ static void InstallInstallerThread(std::string mc, bool neo) {
     std::string e2;
     if (!DownloadFile(dlUrl, jar, e2)) {
         g_status = L"安装器下载失败：" + U8ToW(e2);
-        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        RebuildDlView();
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
         return;
     }
 
@@ -2288,7 +2365,8 @@ static void InstallInstallerThread(std::string mc, bool neo) {
     if (!CreateProcessW(nullptr, cmdBuf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
                         nullptr, U8ToW(g_cfg.gameDir).c_str(), &si, &pi)) {
         g_status = L"安装器启动失败（错误码 " + std::to_wstring(GetLastError()) + L"）";
-        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        RebuildDlView();
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
         return;
     }
     WaitForSingleObject(pi.hProcess, 600000);
@@ -2725,45 +2803,54 @@ static void PaintMain(HDC dc, int w, int h) {
         }
     }
     else if (g_page == PAGE_DOWNLOAD) {
-        int x   = g_ly.content.left + Scale(24);
-        int top = g_ly.content.top + Scale(16);
+        int x    = g_ly.content.left + Scale(24);
+        int top  = g_ly.content.top + Scale(16);
+        int listTop = top + Scale(46);
+        int listBottom = g_ly.content.bottom - Scale(72);
 
-        RECT lbl = { x, top, g_ly.content.right - Scale(24), top + Scale(26) };
-        std::wstring head = L"原版下载";
-        if (g_mcVersState.load() == 2) head += L"（" + std::to_wstring(g_mcVers.size()) + L" 个版本）";
-        DrawTextIn(dc, head, lbl, C_DIM, g_fSmall);
-
-        if (g_mcVersState.load() == 1 || g_mcVersState.load() == 0) {
-            RECT e = { x, top + Scale(50), g_ly.content.right - Scale(24), top + Scale(90) };
+        if (g_mcVersState.load() == 0 || g_mcVersState.load() == 1) {
+            RECT e = { x, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
             DrawTextIn(dc, L"正在获取版本清单…", e, C_DIM, g_fSmall);
         } else if (g_mcVersState.load() == 3) {
-            RECT e = { x, top + Scale(50), g_ly.content.right - Scale(24), top + Scale(90) };
+            RECT e = { x, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
             DrawTextIn(dc, L"获取版本清单失败，检查网络后重进本页", e, C_ERR, g_fSmall);
+        } else if (g_dlView.empty()) {
+            RECT e = { x, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
+            DrawTextIn(dc, L"没有符合条件的版本", e, C_DIM, g_fSmall);
         } else {
-            int itemH = Scale(48);
-            int y = top + Scale(34) - g_listScroll;
-            for (size_t i = 0; i < g_mcVers.size(); ++i) {
-                RECT item = { x, y, g_ly.content.right - Scale(24), y + itemH - Scale(6) };
-                int listBottom = g_ly.content.bottom - Scale(72);
-                if (item.bottom > listBottom) item.bottom = listBottom;
-                if (item.bottom > top + Scale(34) && item.top < listBottom) {
+            int itemH = Scale(52);
+            int y = listTop - g_listScroll;
+            for (size_t i = 0; i < g_dlView.size(); ++i) {
+                const McVer& v = g_mcVers[g_dlView[i]];
+                RECT item = { x, y, g_ly.content.right - Scale(24), y + itemH - Scale(8) };
+                if (item.bottom > listTop && item.top < listBottom) {
+                    if (item.bottom > listBottom) item.bottom = listBottom;
                     bool sel = ((int)i == g_dlSel);
                     FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
+
                     RECT tx = item; tx.left += Scale(16);
-                    DrawTextIn(dc, U8ToW(g_mcVers[i].id), tx, sel ? C_TEXT : C_DIM, g_fUi);
+                    DrawTextIn(dc, U8ToW(v.id), tx, sel ? C_TEXT : C_DIM, g_fUi);
+
+                    if (!v.date.empty()) {
+                        RECT td = { item.right - Scale(300), item.top, item.right - Scale(180), item.bottom };
+                        DrawTextIn(dc, U8ToW(v.date), td, C_DIM, g_fSmall);
+                    }
+
+                    bool april = IsAprilFools(v);
+                    std::wstring ty = april ? L"愚人节"
+                                    : (v.type == "release") ? L"正式版"
+                                    : (v.type == "snapshot") ? L"快照"
+                                    : (v.type == "old_beta") ? L"远古 Beta"
+                                                             : L"远古 Alpha";
+                    RECT tr2 = { item.right - Scale(160), item.top, item.right - Scale(16), item.bottom };
+                    DrawTextIn(dc, ty, tr2, april ? C_ERR : C_DIM, g_fSmall);
+
                     if (sel) {
                         RECT bar = { item.left, item.top + Scale(8), item.left + Scale(3), item.bottom - Scale(8) };
                         HBRUSH b = CreateSolidBrush(C_ACCENT2);
                         FillRect(dc, &bar, b);
                         DeleteObject(b);
                     }
-
-                    std::wstring ty = (g_mcVers[i].type == "release") ? L"正式版"
-                                    : (g_mcVers[i].type == "snapshot") ? L"快照"
-                                    : (g_mcVers[i].type == "old_beta") ? L"旧版 Beta"
-                                                                       : L"旧版 Alpha";
-                    RECT tr = { item.right - Scale(200), item.top, item.right - Scale(16), item.bottom };
-                    DrawTextIn(dc, ty, tr, C_DIM, g_fSmall);
                 }
                 y += itemH;
             }
@@ -3031,11 +3118,20 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnTabAbout    = MakeBtn(hwnd, L"关于", ID_TAB_ABOUT);
         hBtnTabInst     = MakeBtn(hwnd, L"实例", ID_TAB_INST);
         hBtnTabDl       = MakeBtn(hwnd, L"下载", ID_TAB_DL);
-        hBtnDlVanilla = MakeBtn(hwnd, L"安装原版", ID_DL_VANILLA);
+        hBtnDlVanilla = MakeBtn(hwnd, L"下载并安装", ID_DL_VANILLA);
         hBtnDlFabric  = MakeBtn(hwnd, L"Fabric",   ID_DL_FABRIC);
         hBtnDlQuilt   = MakeBtn(hwnd, L"Quilt",    ID_DL_QUILT);
         hBtnDlForge   = MakeBtn(hwnd, L"Forge",    ID_DL_FORGE);
         hBtnDlNeo     = MakeBtn(hwnd, L"NeoForge", ID_DL_NEO);
+        hBtnDlF0      = MakeBtn(hwnd, L"正式版",   ID_DL_FILTER0);
+        hBtnDlF1      = MakeBtn(hwnd, L"快照版",   ID_DL_FILTER1);
+        hBtnDlF2      = MakeBtn(hwnd, L"远古版",   ID_DL_FILTER2);
+        hBtnDlF3      = MakeBtn(hwnd, L"愚人节",   ID_DL_FILTER3);
+        hEdSearch = CreateWindowExW(0, L"EDIT", L"",
+                        WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+                        0, 0, 10, 10, hwnd, (HMENU)ID_ED_SEARCH, GetModuleHandleW(nullptr), nullptr);
+        SendMessageW(hEdSearch, WM_SETFONT, (WPARAM)g_fUi, TRUE);
+        SendMessageW(hEdSearch, EM_SETCUEBANNER, 0, (LPARAM)L"搜索版本，如 1.20.1");
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
@@ -3197,13 +3293,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_mcVersState.load() == 0) {
                 std::thread(FetchManifestThread).detach();
             } else if (g_mcVersState.load() == 2) {
-                int itemH = Scale(48);
-                int top = g_ly.content.top + Scale(16) + Scale(34);
+                int itemH = Scale(52);
+                int top = g_ly.content.top + Scale(16) + Scale(46);
                 if (pt.y >= top) {
-                    int idx = (pt.y - top + g_listScroll) / itemH;
-                    if (idx >= 0 && idx < (int)g_mcVers.size()) {
-                        std::string id = g_mcVers[idx].id;
-                        std::string url = g_mcVers[idx].url;
+                                    int idx = (pt.y - top + g_listScroll) / itemH;
+                    if (idx >= 0 && idx < (int)g_dlView.size()) {
+                        std::string id = g_mcVers[g_dlView[idx]].id;
+                        std::string url = g_mcVers[g_dlView[idx]].url;
                         g_dlSel = idx;
                         g_status = L"已选择：" + U8ToW(id) + L"  → 点下方的按钮安装";
                         InvalidateRect(hwnd, nullptr, TRUE);
@@ -3338,19 +3434,29 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                    L"，新下载 " + std::to_wstring(st.downloaded) +
                                    L"，失败 " + std::to_wstring(st.failed);
                     }
-                    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+                    RebuildDlView();
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
                 }).detach();
             }
             break;
 
+        case ID_DL_FILTER0: case ID_DL_FILTER1: case ID_DL_FILTER2: case ID_DL_FILTER3: {
+            g_dlFilter = (int)(wp & 0xFFFF) - ID_DL_FILTER0;
+            g_dlSel = -1;
+            RebuildDlView();
+            InvalidateRect(hwnd, nullptr, TRUE);
+            break;
+        }
+
         case ID_DL_VANILLA: case ID_DL_FABRIC: case ID_DL_QUILT:
     case ID_DL_FORGE:   case ID_DL_NEO: {
-        if (g_dlSel < 0 || g_dlSel >= (int)g_mcVers.size()) {
+        if (g_dlSel < 0 || g_dlSel >= (int)g_dlView.size()) {
             MessageBoxW(hwnd, L"请先在列表里选一个游戏版本。", L"下载", MB_OK | MB_ICONINFORMATION);
             break;
         }
-        std::string mc = g_mcVers[g_dlSel].id;
-        std::string url = g_mcVers[g_dlSel].url;
+        int realIdx = g_dlView[g_dlSel];
+        std::string mc = g_mcVers[realIdx].id;
+        std::string url = g_mcVers[realIdx].url;
         int id = (int)(wp & 0xFFFF);
         if (id == ID_DL_VANILLA) (void)url;
 
@@ -3598,6 +3704,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case ID_BTN_ISO:
         ShowDropPopup(3);
         break;
+
+        case ID_ED_SEARCH:
+            if (HIWORD(wp) == EN_CHANGE) {
+                RebuildDlView();
+                InvalidateRect(hwnd, nullptr, TRUE);
+            }
+            break;
 
     case ID_BTN_SAVE: {
             g_cfg.gameDir = WToU8(CtlText(hEdDir));
