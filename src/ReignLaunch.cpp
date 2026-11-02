@@ -127,7 +127,7 @@ static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
-static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl;
+static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl, hBtnDlFilterSel;
 
 struct McVer { std::string id, type, url, date; };
 static std::vector<McVer> g_mcVers;
@@ -1510,6 +1510,7 @@ static std::string        g_loginErr;
 #define ID_DL_INSTALL    1384
 #define ID_DL_FAPI       1387
 #define ID_DL_QSL        1388
+#define ID_DL_FILTERSEL  1389
 #define ID_ED_SEARCH     1385
 #define ID_DL_BACK       1386
 #define ID_BTN_SAVE     1320
@@ -1683,11 +1684,7 @@ static void LayoutControls() {
         {
             int tx0 = g_ly.content.left + Scale(24);
             int ty0 = g_ly.content.top + Scale(16);
-            int tw = Scale(96), tg = Scale(8);
-            MoveWindow(hBtnDlF0, tx0, ty0, tw, Scale(32), TRUE); tx0 += tw + tg;
-            MoveWindow(hBtnDlF1, tx0, ty0, tw, Scale(32), TRUE); tx0 += tw + tg;
-            MoveWindow(hBtnDlF2, tx0, ty0, tw, Scale(32), TRUE); tx0 += tw + tg;
-            MoveWindow(hBtnDlF3, tx0, ty0, tw, Scale(32), TRUE);
+            MoveWindow(hBtnDlFilterSel, tx0, ty0, Scale(150), Scale(32), TRUE);
             MoveWindow(hEdSearch, g_ly.content.right - Scale(24) - Scale(240), ty0, Scale(240), Scale(30), TRUE);
 
             int dby = g_ly.content.top + Scale(64);
@@ -1718,10 +1715,11 @@ static void SyncDownloadControls() {
     ShowWindow(hBtnDlInstall, showDet);
     ShowWindow(hBtnDlFapi, showDet);
     ShowWindow(hBtnDlQsl,  showDet);
-    ShowWindow(hBtnDlF0, showDl);
-    ShowWindow(hBtnDlF1, showDl);
-    ShowWindow(hBtnDlF2, showDl);
-    ShowWindow(hBtnDlF3, showDl);
+    ShowWindow(hBtnDlFilterSel, showDl);
+    ShowWindow(hBtnDlF0, SW_HIDE);
+    ShowWindow(hBtnDlF1, SW_HIDE);
+    ShowWindow(hBtnDlF2, SW_HIDE);
+    ShowWindow(hBtnDlF3, SW_HIDE);
     ShowWindow(hEdSearch, showDl);
     ShowWindow(hBtnDlVanilla, showDet);
     ShowWindow(hBtnDlFabric,  showDet);
@@ -3275,6 +3273,12 @@ static void ShowDropPopup(int mode) {
     if (mode == 0)      g_dropItems = g_dirCands;
     else if (mode == 1) g_dropItems = g_javaCands;
     else if (mode == 2) { for (auto& v : g_versions) g_dropItems.push_back({ v, v }); }
+    else if (mode == 7) {
+        g_dropItems.push_back({ "正式版", "正式版" });
+        g_dropItems.push_back({ "快照版", "快照版" });
+        g_dropItems.push_back({ "远古版", "远古版" });
+        g_dropItems.push_back({ "愚人节", "愚人节" });
+    }
     else {
         g_dropItems.push_back({ "隔离所有实例", "隔离所有实例" });
         g_dropItems.push_back({ "隔离模组实例", "隔离模组实例" });
@@ -3286,10 +3290,11 @@ static void ShowDropPopup(int mode) {
     if (mode == 0)      GetWindowRect(hEdDir, &er);
     else if (mode == 1) GetWindowRect(hEdJava, &er);
     else if (mode == 2) GetWindowRect(hBtnInstArrow, &er);
-    else                GetWindowRect(hBtnIso, &er);
+    else if (mode == 3) GetWindowRect(hBtnIso, &er);
+    else                GetWindowRect(hBtnDlFilterSel, &er);
 
     int itemH = Scale(28);
-    int w = Scale(mode == 2 ? 300 : (mode == 3 ? 300 : 420));
+    int w = Scale(mode == 2 ? 300 : (mode == 7 ? 180 : (mode == 3 ? 300 : 420)));
     int h = itemH * (int)g_dropItems.size() + Scale(8);
 
     static bool reg = false;
@@ -3347,6 +3352,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnDlInstall = MakeBtn(hwnd, L"安装", ID_DL_INSTALL);
         hBtnDlFapi    = MakeBtn(hwnd, L"Fabric API", ID_DL_FAPI);
         hBtnDlQsl     = MakeBtn(hwnd, L"QSL", ID_DL_QSL);
+        hBtnDlFilterSel = MakeBtn(hwnd, L"正式版  ▾", ID_DL_FILTERSEL);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
@@ -3683,7 +3689,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
 
-        case ID_DL_FILTER0: case ID_DL_FILTER1: case ID_DL_FILTER2: case ID_DL_FILTER3: {
+        case ID_DL_FILTERSEL:
+        ShowDropPopup(7);
+        break;
+
+    case ID_DL_FILTER0: case ID_DL_FILTER1: case ID_DL_FILTER2: case ID_DL_FILTER3: {
             g_dlFilter = (int)(wp & 0xFFFF) - ID_DL_FILTER0;
             g_dlSel = -1;
             RebuildDlView();
@@ -4038,6 +4048,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DROP_PICK: {
         int idx = (int)wp;
         int mode = (int)lp;
+        if (mode == 7) {
+            if (idx >= 0 && idx < 4) {
+                g_dlFilter = idx;
+                const wchar_t* names[] = { L"正式版", L"快照版", L"远古版", L"愚人节" };
+                SetWindowTextW(hBtnDlFilterSel, (std::wstring(names[idx]) + L"  ▾").c_str());
+                g_dlSel = -1;
+                RebuildDlView();
+            }
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return 0;
+        }
+
         if (mode == 3) {
             if (idx >= 0 && idx < 3) {
                 g_cfg.isoMode = idx;
