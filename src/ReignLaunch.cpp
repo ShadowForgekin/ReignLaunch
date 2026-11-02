@@ -117,6 +117,7 @@ static int RequiredJavaMajor(const std::string& id);
 static std::string PickJavaFor(int need);
 static RECT OverlayCardRect();
 static RECT OverlayCancelRect();
+static RECT DlTaskCardRect();
 static void ApplyOverlayVisibility();
 
 static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
@@ -1712,8 +1713,9 @@ static void LayoutControls() {
                        g_ly.content.bottom - Scale(58), Scale(130), Scale(38), TRUE);
             MoveWindow(hBtnDlBack, g_ly.content.left + Scale(24), g_ly.content.bottom - Scale(58), Scale(100), Scale(32), TRUE);
             {
-                int cy2 = (g_ly.content.top + g_ly.content.bottom) / 2 + Scale(55);
-                MoveWindow(hBtnDlCancel, g_ly.content.right - Scale(24) - Scale(130), cy2, Scale(130), Scale(32), TRUE);
+                RECT card2 = DlTaskCardRect();
+                MoveWindow(hBtnDlCancel, card2.right - Scale(24) - Scale(120),
+                           card2.bottom - Scale(20) - Scale(32), Scale(120), Scale(32), TRUE);
             }
     }
 }
@@ -2129,7 +2131,7 @@ static void DrawAboutBlock(HDC dc) {
 
     struct AboutRow { const wchar_t* k; const wchar_t* v; };
     const AboutRow rows[] = {
-        { L"版本",   L"v1.1.0 Beta 3.5" },
+        { L"版本",   L"v1.2.0 Beta 4" },
         { L"制作人", L"加纳Brightchaserove（抖音）" },
         { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
         { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
@@ -2218,6 +2220,9 @@ static void InstallVersionThread(std::string id, std::string url) {
     g_progCur = 0;
     g_progTotal = 0;
     g_status = L"正在下载版本 JSON…";
+
+    g_progTotal = 1;
+    g_progCur = 0;
 
     fs::path dir = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id);
     std::error_code ec;
@@ -2534,7 +2539,7 @@ static void InstallInstallerThread(std::string mc, bool neo, std::string wantVer
     }
 }
 // ============================ 自动更新 ============================
-#define APP_TAG L"v1.1.0-beta3.5"
+#define APP_TAG L"v1.2.0-beta4"
 
 static std::wstring    g_newTag;
 static std::string     g_newUrl;
@@ -2692,14 +2697,18 @@ static void FillLine(HDC dc, int left, int right, int y, COLORREF col) {
 
 // 沉浸式启动画面：背景图/深灰渐变 + 底部 200px 渐变压暗 + 左下角状态 + 贴底进度条
 // 下载任务面板（下载页中央卡片）
+static RECT DlTaskCardRect() {
+    RECT c = g_ly.content;
+    int w = Scale(560), h = Scale(190);
+    int cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2;
+    return { cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2 };
+}
+
 static void DrawDlTaskPanel(HDC dc) {
     if (!g_dlBusy.load()) return;
 
     RECT c = g_ly.content;
-    int w = Scale(560), h = Scale(190);
-    int cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2;
-    RECT card = { cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2 };
-
+    RECT card = DlTaskCardRect();
     // 遮罩
     HBRUSH dim = CreateSolidBrush(RGB(18, 19, 22));
     FillRect(dc, &c, dim);
@@ -3802,7 +3811,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         case ID_DL_CANCEL:
         g_dlCancel = true;
-        g_status = L"正在取消下载…";
+        g_dlBusy = false;
+        g_progState = 0;
+        g_status = L"下载已取消";
         InvalidateRect(hwnd, nullptr, TRUE);
         break;
 
