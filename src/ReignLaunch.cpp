@@ -3045,111 +3045,99 @@ static void PaintMain(HDC dc, int w, int h) {
         }
     }
     else if (g_page == PAGE_DOWNLOAD) {
+        int cx = g_ly.content.left + Scale(24);
+        int cyTop = g_ly.content.top + Scale(16);
+
         if (g_dlDetail) {
-            if (g_dlSel < 0 || g_dlSel >= (int)g_dlView.size()) {
-                RECT e = { g_ly.content.left + Scale(24), g_ly.content.top + Scale(60),
-                           g_ly.content.right - Scale(24), g_ly.content.top + Scale(100) };
-                DrawTextIn(dc, L"未选中版本，点「返回」重新选择", e, C_DIM, g_fSmall);
-                return;
-            }
+            // ---------------- 详情页 ----------------
+            if (g_dlSel >= 0 && g_dlSel < (int)g_dlView.size()) {
+                const McVer& v = g_mcVers[g_dlView[g_dlSel]];
 
-            const McVer& v = g_mcVers[g_dlView[g_dlSel]];
+                int hx = g_ly.content.left + Scale(140);
+                RECT t1 = { hx, g_ly.content.top + Scale(8), g_ly.content.right - Scale(24), g_ly.content.top + Scale(40) };
+                DrawTextIn(dc, U8ToW(v.id), t1, C_TEXT, g_fTitle);
 
-            // 标题
-            int hx = g_ly.content.left + Scale(140);
-            int hy = g_ly.content.top + Scale(10);
-            RECT t1 = { hx, hy, g_ly.content.right - Scale(24), hy + Scale(32) };
-            DrawTextIn(dc, U8ToW(v.id), t1, C_TEXT, g_fTitle);
+                std::wstring sub = U8ToW(v.date);
+                if (!sub.empty()) sub += L"   ";
+                sub += (v.type == "release") ? L"正式版" : (v.type == "snapshot") ? L"快照" :
+                       (v.type == "old_beta") ? L"远古 Beta" : L"远古 Alpha";
+                RECT t2 = { hx, g_ly.content.top + Scale(38), g_ly.content.right - Scale(24), g_ly.content.top + Scale(58) };
+                DrawTextIn(dc, sub, t2, C_DIM, g_fSmall);
 
-            std::wstring sub = U8ToW(v.date);
-            if (!sub.empty()) sub += L"   ";
-            sub += (v.type == "release") ? L"正式版" : (v.type == "snapshot") ? L"快照" :
-                   (v.type == "old_beta") ? L"远古 Beta" : L"远古 Alpha";
-            RECT t2 = { hx, hy + Scale(30), g_ly.content.right - Scale(24), hy + Scale(52) };
-            DrawTextIn(dc, sub, t2, C_DIM, g_fSmall);
+                const wchar_t* hint = (g_dlLoader == 0) ? L"原版：不安装任何加载器，直接点右下角「安装」"
+                    : (g_dlLoader == 1) ? L"Fabric：请在下方选择加载器版本"
+                    : (g_dlLoader == 2) ? L"Quilt：请在下方选择加载器版本"
+                    : (g_dlLoader == 3) ? L"Forge：请在下方选择加载器版本"
+                    : (g_dlLoader == 4) ? L"NeoForge：请在下方选择加载器版本"
+                    : (g_dlLoader == 5) ? L"Fabric API：选择版本后下载到 mods 目录"
+                                        : L"QSL：选择版本后下载到 mods 目录";
+                RECT hr = { cx, g_ly.content.top + Scale(100), g_ly.content.right - Scale(24), g_ly.content.top + Scale(124) };
+                DrawTextIn(dc, hint, hr, C_DIM, g_fSmall);
 
-            // 加载器选择行（按钮是控件，这里只画提示）
-            const wchar_t* hint = (g_dlLoader == 0)
-                ? L"原版：不安装任何加载器"
-                : (g_dlLoader == 1) ? L"Fabric：请在下方选择加载器版本"
-                : (g_dlLoader == 2) ? L"Quilt：请在下方选择加载器版本"
-                : (g_dlLoader == 3) ? L"Forge：请在下方选择加载器版本"
-                : (g_dlLoader == 4) ? L"NeoForge：请在下方选择加载器版本"
-                : (g_dlLoader == 5) ? L"Fabric API：请在下方选择模组版本（下载到 mods）"
-                                    : L"QSL（Quilt Standard Libraries）：请在下方选择模组版本";
-            RECT hr = { g_ly.content.left + Scale(24), g_ly.content.top + Scale(104),
-                        g_ly.content.right - Scale(24), g_ly.content.top + Scale(130) };
-            DrawTextIn(dc, hint, hr, C_DIM, g_fSmall);
+                int listTop = g_ly.content.top + Scale(132);
+                int listBot = g_ly.content.bottom - Scale(72);
 
-            // 版本列表
-            int listTop  = g_ly.content.top + Scale(136);
-            int listBot  = g_ly.content.bottom - Scale(70);
-
-            if (g_dlLoader == 0) {
-                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
-                           g_ly.content.right - Scale(24), listTop + Scale(46) };
-                DrawTextIn(dc, L"选中「原版」时不安装加载器，直接点右下角安装即可。", e, C_DIM, g_fSmall);
-            } else if (g_ldVersState.load() == 0 || g_ldVersState.load() == 1) {
-                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
-                           g_ly.content.right - Scale(24), listTop + Scale(46) };
-                DrawTextIn(dc, L"正在获取加载器版本…", e, C_DIM, g_fSmall);
-            } else if (g_ldVersState.load() == 3) {
-                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
-                           g_ly.content.right - Scale(24), listTop + Scale(46) };
-                DrawTextIn(dc, L"获取失败，检查网络后重试", e, C_ERR, g_fSmall);
-            } else if (g_ldVers.empty()) {
-                RECT e = { g_ly.content.left + Scale(24), listTop + Scale(10),
-                           g_ly.content.right - Scale(24), listTop + Scale(46) };
-                DrawTextIn(dc, L"没有可下载的版本", e, C_ERR, g_fSmall);
-            } else {
-                int itemH = Scale(44);
-                int yy = listTop - g_listScroll;
-                for (size_t i = 0; i < g_ldVers.size(); ++i) {
-                    RECT item = { g_ly.content.left + Scale(24), yy,
-                                  g_ly.content.right - Scale(24), yy + itemH - Scale(6) };
-                    if (item.bottom > listTop && item.top < listBot) {
-                        if (item.bottom > listBot) item.bottom = listBot;
-                        bool sel = ((int)i == g_ldSel);
-                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                        RECT tx = item; tx.left += Scale(16);
-                        DrawTextIn(dc, U8ToW(g_ldVers[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
-                        if (sel) {
-                            RECT bar = { item.left, item.top + Scale(6), item.left + Scale(3), item.bottom - Scale(6) };
-                            HBRUSH b = CreateSolidBrush(C_ACCENT2);
-                            FillRect(dc, &bar, b);
-                            DeleteObject(b);
+                if (g_dlLoader == 0) {
+                    RECT e = { cx, listTop + Scale(8), g_ly.content.right - Scale(24), listTop + Scale(40) };
+                    DrawTextIn(dc, L"（原版无需选择加载器版本）", e, C_DIM, g_fSmall);
+                } else if (g_ldVersState.load() == 0 || g_ldVersState.load() == 1) {
+                    RECT e = { cx, listTop + Scale(8), g_ly.content.right - Scale(24), listTop + Scale(40) };
+                    DrawTextIn(dc, L"正在获取版本列表…", e, C_DIM, g_fSmall);
+                } else if (g_ldVers.empty()) {
+                    RECT e = { cx, listTop + Scale(8), g_ly.content.right - Scale(24), listTop + Scale(40) };
+                    DrawTextIn(dc, L"没有可下载的版本", e, C_ERR, g_fSmall);
+                } else {
+                    int itemH = Scale(44);
+                    int yy = listTop - g_listScroll;
+                    for (size_t i = 0; i < g_ldVers.size(); ++i) {
+                        RECT item = { cx, yy, g_ly.content.right - Scale(24), yy + itemH - Scale(6) };
+                        if (item.bottom > listTop && item.top < listBot) {
+                            if (item.bottom > listBot) item.bottom = listBot;
+                            bool sel = ((int)i == g_ldSel);
+                            FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
+                            RECT tx = item; tx.left += Scale(16);
+                            DrawTextIn(dc, U8ToW(g_ldVers[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
+                            if (sel) {
+                                RECT bar = { item.left, item.top + Scale(6), item.left + Scale(3), item.bottom - Scale(6) };
+                                HBRUSH b = CreateSolidBrush(C_ACCENT2);
+                                FillRect(dc, &bar, b);
+                                DeleteObject(b);
+                            }
                         }
+                        yy += itemH;
                     }
-                    yy += itemH;
                 }
+            } else {
+                RECT e = { cx, g_ly.content.top + Scale(60), g_ly.content.right - Scale(24), g_ly.content.top + Scale(100) };
+                DrawTextIn(dc, L"未选中版本，点「返回」重新选择", e, C_DIM, g_fSmall);
             }
+
             DrawDlProgress(dc);
             DrawDlTaskPanel(dc);
             return;
         }
 
-        int x    = g_ly.content.left + Scale(24);
-        int top  = g_ly.content.top + Scale(16);
-        int listTop = top + Scale(46);
-        int listBottom = g_ly.content.bottom - Scale(72);
+        // ---------------- 列表页 ----------------
+        int listTop = g_ly.content.top + Scale(58);
+        int listBot = g_ly.content.bottom - Scale(16);
 
         if (g_mcVersState.load() == 0 || g_mcVersState.load() == 1) {
-            RECT e = { x, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
+            RECT e = { cx, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
             DrawTextIn(dc, L"正在获取版本清单…", e, C_DIM, g_fSmall);
         } else if (g_mcVersState.load() == 3) {
-            RECT e = { x, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
+            RECT e = { cx, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
             DrawTextIn(dc, L"获取版本清单失败，检查网络后重进本页", e, C_ERR, g_fSmall);
         } else if (g_dlView.empty()) {
-            RECT e = { x, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
+            RECT e = { cx, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
             DrawTextIn(dc, L"没有符合条件的版本", e, C_DIM, g_fSmall);
         } else {
             int itemH = Scale(52);
-            int y = listTop - g_listScroll;
+            int yy = listTop - g_listScroll;
             for (size_t i = 0; i < g_dlView.size(); ++i) {
                 const McVer& v = g_mcVers[g_dlView[i]];
-                RECT item = { x, y, g_ly.content.right - Scale(24), y + itemH - Scale(8) };
-                if (item.bottom > listTop && item.top < listBottom) {
-                    if (item.bottom > listBottom) item.bottom = listBottom;
+                RECT item = { cx, yy, g_ly.content.right - Scale(24), yy + itemH - Scale(8) };
+                if (item.bottom > listTop && item.top < listBot) {
+                    if (item.bottom > listBot) item.bottom = listBot;
                     bool sel = ((int)i == g_dlSel);
                     FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
 
@@ -3177,11 +3165,12 @@ static void PaintMain(HDC dc, int w, int h) {
                         DeleteObject(b);
                     }
                 }
-                y += itemH;
+                yy += itemH;
             }
         }
+
         DrawDlProgress(dc);
-            DrawDlTaskPanel(dc);
+        DrawDlTaskPanel(dc);
     }
     else if (g_page == PAGE_ABOUT) {
         DrawAboutBlock(dc);
@@ -3856,6 +3845,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::string mc  = g_mcVers[realIdx].id;
             std::string url = g_mcVers[realIdx].url;
 
+            g_dlCancel = false;
+            g_dlBytes = 0;
+            g_dlBusy = true;
+            g_progState = 1;
+            g_progCur = 0;
+            g_progTotal = 0;
+            SyncDownloadControls();
+
             if (g_dlLoader == 0) {
                 g_status = L"开始安装：" + U8ToW(mc);
             g_dlCancel = false;
@@ -4302,6 +4299,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_APP_DONE:
+        SyncDownloadControls();
         if (g_overlay && g_stepCur.load() >= 4 && g_overlayDoneTick == 0)
             g_overlayDoneTick = GetTickCount();
         InvalidateRect(hwnd, nullptr, FALSE);
