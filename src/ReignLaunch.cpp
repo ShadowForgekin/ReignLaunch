@@ -1722,12 +1722,6 @@ static void SyncDownloadControls() {
     ShowWindow(hBtnDlForge,   showDet);
     ShowWindow(hBtnDlNeo,     showDet);
 
-    if (showDet == SW_SHOW) {
-        EnableWindow(hBtnDlFabric, g_ldState[0].load() == 1);
-        EnableWindow(hBtnDlQuilt,  g_ldState[1].load() == 1);
-        EnableWindow(hBtnDlForge,  g_ldState[2].load() == 1);
-        EnableWindow(hBtnDlNeo,    g_ldState[3].load() == 1);
-    }
 }
 
 static void ShowPage(Page p) {
@@ -3515,7 +3509,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         g_dlDetailMc = id;
                         for (int k = 0; k < 4; ++k) { g_ldState[k] = 0; g_ldVer[k].clear(); }
                         std::thread(FetchLoadersThread).detach();
+                        LayoutControls();
                         SyncDownloadControls();
+                        SetFocus(hwnd);
                         g_status = L"已选择：" + U8ToW(id) + L"  → 点下方的按钮安装";
                         InvalidateRect(hwnd, nullptr, TRUE);
                     }
