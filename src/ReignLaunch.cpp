@@ -127,7 +127,7 @@ static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
-static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch;
+static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack;
 
 struct McVer { std::string id, type, url, date; };
 static std::vector<McVer> g_mcVers;
@@ -135,6 +135,12 @@ static std::atomic<int>  g_mcVersState{ 0 };
 static int g_dlFilter = 0;                 // 0正式 1快照 2远古 3愚人节
 static std::vector<int> g_dlView;
 static int g_dlSel = -1;          // 过滤后的下标
+static bool g_dlDetail = false;   // 是否在详情页
+// 加载器可用性：0=查询中 1=有 2=没有
+static std::atomic<int> g_ldState[4] = { {0}, {0}, {0}, {0} };
+static std::wstring g_ldVer[4];
+static void FetchLoadersThread();
+static std::string g_dlDetailMc;
 static void RebuildDlView();
 static void FetchManifestThread();
 static bool IsAprilFools(const McVer& v);
@@ -1497,6 +1503,7 @@ static std::string        g_loginErr;
 #define ID_DL_FILTER3    1383
 #define ID_DL_INSTALL    1384
 #define ID_ED_SEARCH     1385
+#define ID_DL_BACK       1386
 #define ID_BTN_SAVE     1320
 #define ID_BTN_ISO      1321
 
@@ -1675,19 +1682,44 @@ static void LayoutControls() {
             MoveWindow(hBtnDlF3, tx0, ty0, tw, Scale(32), TRUE);
             MoveWindow(hEdSearch, g_ly.content.right - Scale(24) - Scale(240), ty0, Scale(240), Scale(30), TRUE);
 
-            int by = g_ly.content.bottom - Scale(56);
-            int bw = Scale(112), gap = Scale(8);
-            int bx = g_ly.content.left + Scale(24);
-            MoveWindow(hBtnDlVanilla, bx, by, bw, Scale(38), TRUE); bx += bw + gap;
-            MoveWindow(hBtnDlFabric,  bx, by, bw, Scale(38), TRUE); bx += bw + gap;
-            MoveWindow(hBtnDlQuilt,   bx, by, bw, Scale(38), TRUE); bx += bw + gap;
-            MoveWindow(hBtnDlForge,   bx, by, bw, Scale(38), TRUE); bx += bw + gap;
-            MoveWindow(hBtnDlNeo,     bx, by, bw, Scale(38), TRUE);
+            int dbx = g_ly.content.right - Scale(24) - Scale(150);
+            int dby0 = g_ly.content.top + Scale(64);
+            MoveWindow(hBtnDlVanilla, dbx, dby0 + Scale(56) * 0, Scale(150), Scale(38), TRUE);
+            MoveWindow(hBtnDlFabric,  dbx, dby0 + Scale(56) * 1, Scale(150), Scale(38), TRUE);
+            MoveWindow(hBtnDlQuilt,   dbx, dby0 + Scale(56) * 2, Scale(150), Scale(38), TRUE);
+            MoveWindow(hBtnDlForge,   dbx, dby0 + Scale(56) * 3, Scale(150), Scale(38), TRUE);
+            MoveWindow(hBtnDlNeo,     dbx, dby0 + Scale(56) * 4, Scale(150), Scale(38), TRUE);
+            MoveWindow(hBtnDlBack, g_ly.content.left + Scale(24), g_ly.content.top + Scale(16), Scale(100), Scale(32), TRUE);
+
         }
     }
 }
 
 static void SyncSettingsVisibility();
+
+static void SyncDownloadControls() {
+    bool onDl   = (g_page == PAGE_DOWNLOAD);
+    int showDl  = (onDl && !g_dlDetail) ? SW_SHOW : SW_HIDE;
+    int showDet = (onDl &&  g_dlDetail) ? SW_SHOW : SW_HIDE;
+    ShowWindow(hBtnDlBack, showDet);
+    ShowWindow(hBtnDlF0, showDl);
+    ShowWindow(hBtnDlF1, showDl);
+    ShowWindow(hBtnDlF2, showDl);
+    ShowWindow(hBtnDlF3, showDl);
+    ShowWindow(hEdSearch, showDl);
+    ShowWindow(hBtnDlVanilla, showDet);
+    ShowWindow(hBtnDlFabric,  showDet);
+    ShowWindow(hBtnDlQuilt,   showDet);
+    ShowWindow(hBtnDlForge,   showDet);
+    ShowWindow(hBtnDlNeo,     showDet);
+
+    if (showDet == SW_SHOW) {
+        EnableWindow(hBtnDlFabric, g_ldState[0].load() == 1);
+        EnableWindow(hBtnDlQuilt,  g_ldState[1].load() == 1);
+        EnableWindow(hBtnDlForge,  g_ldState[2].load() == 1);
+        EnableWindow(hBtnDlNeo,    g_ldState[3].load() == 1);
+    }
+}
 
 static void ShowPage(Page p) {
     g_page = p;
@@ -1702,19 +1734,7 @@ static void ShowPage(Page p) {
     ShowWindow(hBtnTabSettings, SW_SHOW);
     ShowWindow(hBtnTabInst, SW_SHOW);
     ShowWindow(hBtnTabDl, SW_SHOW);
-    {
-        int showDl = (g_page == PAGE_DOWNLOAD) ? SW_SHOW : SW_HIDE;
-        ShowWindow(hBtnDlF0, showDl);
-        ShowWindow(hBtnDlF1, showDl);
-        ShowWindow(hBtnDlF2, showDl);
-        ShowWindow(hBtnDlF3, showDl);
-        ShowWindow(hEdSearch, showDl);
-        ShowWindow(hBtnDlVanilla, showDl);
-        ShowWindow(hBtnDlFabric,  showDl);
-        ShowWindow(hBtnDlQuilt,   showDl);
-        ShowWindow(hBtnDlForge,   showDl);
-        ShowWindow(hBtnDlNeo,     showDl);
-    }
+        SyncDownloadControls();
 
 
 
@@ -2198,6 +2218,56 @@ static void InstallVersionThread(std::string id, std::string url) {
         ScanVersions();
         PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
     }
+}
+// ---------------- 详情页：加载器可用性 ----------------
+static void FetchLoadersThread() {
+    std::string mc = g_dlDetailMc;
+    for (int i = 0; i < 4; ++i) { g_ldState[i] = 0; g_ldVer[i].clear(); }
+
+    auto getJson = [](const std::string& url) {
+        std::vector<unsigned char> d;
+        std::string e;
+        if (!HttpRequest(url, "GET", "", "", d, e)) return json();
+        return json::parse(std::string(d.begin(), d.end()), nullptr, false);
+    };
+
+    // 0=Fabric 1=Quilt 2=Forge 3=NeoForge
+    {
+        json j = getJson("https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/" + mc);
+        if (j.is_array() && !j.empty()) {
+            std::string v = j[0]["loader"].value("version", std::string());
+            if (!v.empty()) { g_ldVer[0] = U8ToW(v); g_ldState[0] = 1; } else g_ldState[0] = 2;
+        } else g_ldState[0] = 2;
+    }
+    {
+        json j = getJson("https://meta.quiltmc.org/v3/versions/loader/" + mc);
+        if (j.is_array() && !j.empty()) {
+            std::string v = j[0]["loader"].value("version", std::string());
+            if (!v.empty()) { g_ldVer[1] = U8ToW(v); g_ldState[1] = 1; } else g_ldState[1] = 2;
+        } else g_ldState[1] = 2;
+    }
+    {
+        json j = getJson("https://bmclapi2.bangbang93.com/forge/minecraft/" + mc);
+        if (j.is_array() && !j.empty()) {
+            std::string v;
+            for (auto& x : j) {
+                std::string vv = x.value("version", std::string());
+                if (vv.empty()) continue;
+                v = vv;
+                if (x.value("branch", std::string()) == "recommended") break;
+            }
+            if (!v.empty()) { g_ldVer[2] = U8ToW(v); g_ldState[2] = 1; } else g_ldState[2] = 2;
+        } else g_ldState[2] = 2;
+    }
+    {
+        json j = getJson("https://bmclapi2.bangbang93.com/neoforge/list/" + mc);
+        if (j.is_array() && !j.empty()) {
+            std::string v = j[0].value("version", std::string());
+            if (!v.empty()) { g_ldVer[3] = U8ToW(v); g_ldState[3] = 1; } else g_ldState[3] = 2;
+        } else g_ldState[3] = 2;
+    }
+
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
 // ---------------- 下载页过滤 ----------------
 static bool IsAprilFools(const McVer& v) {
@@ -2803,6 +2873,47 @@ static void PaintMain(HDC dc, int w, int h) {
         }
     }
     else if (g_page == PAGE_DOWNLOAD) {
+        if (g_dlDetail) {
+            if (g_dlSel >= 0 && g_dlSel < (int)g_dlView.size()) {
+                const McVer& v = g_mcVers[g_dlView[g_dlSel]];
+                int x = g_ly.content.left + Scale(140);
+                int y = g_ly.content.top + Scale(12);
+
+                RECT t1 = { x, y, g_ly.content.right - Scale(200), y + Scale(34) };
+                DrawTextIn(dc, U8ToW(v.id), t1, C_TEXT, g_fTitle);
+
+                std::wstring sub = U8ToW(v.date);
+                if (!sub.empty()) sub += L"   ";
+                sub += (v.type == "release") ? L"正式版" : (v.type == "snapshot") ? L"快照" :
+                       (v.type == "old_beta") ? L"远古 Beta" : L"远古 Alpha";
+                RECT t2 = { x, y + Scale(32), g_ly.content.right - Scale(200), y + Scale(56) };
+                DrawTextIn(dc, sub, t2, C_DIM, g_fSmall);
+
+                const wchar_t* names[5] = { L"原版", L"Fabric", L"Quilt", L"Forge", L"NeoForge" };
+                int baseY = g_ly.content.top + Scale(64);
+                for (int i = 0; i < 5; ++i) {
+                    int ry = baseY + Scale(56) * i;
+                    RECT nm = { g_ly.content.left + Scale(24), ry, g_ly.content.left + Scale(200), ry + Scale(38) };
+                    DrawTextIn(dc, names[i], nm, C_TEXT, g_fUi);
+
+                    RECT ir = { g_ly.content.left + Scale(200), ry, g_ly.content.right - Scale(200), ry + Scale(38) };
+                    if (i == 0) {
+                        DrawTextIn(dc, L"游戏本体（客户端 + 依赖 + 资源）", ir, C_DIM, g_fSmall);
+                    } else {
+                        int st = g_ldState[i - 1].load();
+                        std::wstring info = (st == 0) ? L"查询中…"
+                                          : (st == 1) ? (L"最新 " + g_ldVer[i - 1])
+                                          : L"没有可下载的版本";
+                        DrawTextIn(dc, info, ir, (st == 2) ? C_ERR : C_DIM, g_fSmall);
+                    }
+                }
+            } else {
+                RECT e = { g_ly.content.left + Scale(24), g_ly.content.top + Scale(60), g_ly.content.right - Scale(24), g_ly.content.top + Scale(100) };
+                DrawTextIn(dc, L"未选中版本，点「返回」重新选择", e, C_DIM, g_fSmall);
+            }
+            return;
+        }
+
         int x    = g_ly.content.left + Scale(24);
         int top  = g_ly.content.top + Scale(16);
         int listTop = top + Scale(46);
@@ -3132,6 +3243,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         0, 0, 10, 10, hwnd, (HMENU)ID_ED_SEARCH, GetModuleHandleW(nullptr), nullptr);
         SendMessageW(hEdSearch, WM_SETFONT, (WPARAM)g_fUi, TRUE);
         SendMessageW(hEdSearch, EM_SETCUEBANNER, 0, (LPARAM)L"搜索版本，如 1.20.1");
+        hBtnDlBack    = MakeBtn(hwnd, L"← 返回", ID_DL_BACK);
 
         hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
         hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
@@ -3301,6 +3413,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         std::string id = g_mcVers[g_dlView[idx]].id;
                         std::string url = g_mcVers[g_dlView[idx]].url;
                         g_dlSel = idx;
+                        g_dlDetail = true;
+                        g_dlDetailMc = id;
+                        for (int k = 0; k < 4; ++k) { g_ldState[k] = 0; g_ldVer[k].clear(); }
+                        std::thread(FetchLoadersThread).detach();
+                        SyncDownloadControls();
                         g_status = L"已选择：" + U8ToW(id) + L"  → 点下方的按钮安装";
                         InvalidateRect(hwnd, nullptr, TRUE);
                     }
@@ -3440,6 +3557,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
 
+        case ID_DL_BACK: {
+            g_dlDetail = false;
+            InvalidateRect(hwnd, nullptr, TRUE);
+            break;
+        }
+
         case ID_DL_FILTER0: case ID_DL_FILTER1: case ID_DL_FILTER2: case ID_DL_FILTER3: {
             g_dlFilter = (int)(wp & 0xFFFF) - ID_DL_FILTER0;
             g_dlSel = -1;
@@ -3453,6 +3576,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_dlSel < 0 || g_dlSel >= (int)g_dlView.size()) {
             MessageBoxW(hwnd, L"请先在列表里选一个游戏版本。", L"下载", MB_OK | MB_ICONINFORMATION);
             break;
+        }
+        {
+            int idchk = (int)(wp & 0xFFFF);
+            int ldi = (idchk == ID_DL_FABRIC) ? 0 : (idchk == ID_DL_QUILT) ? 1
+                    : (idchk == ID_DL_FORGE) ? 2 : (idchk == ID_DL_NEO) ? 3 : -1;
+            if (ldi >= 0 && g_ldState[ldi].load() != 1) {
+                MessageBoxW(hwnd, L"该版本没有可下载的加载器版本。", L"提示", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
         }
         int realIdx = g_dlView[g_dlSel];
         std::string mc = g_mcVers[realIdx].id;
