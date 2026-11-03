@@ -2965,7 +2965,9 @@ static void FetchModSearchThread(std::string q) {
     std::string mc = CurrentMcVersion();
     std::string loader = CurrentLoaderTag();
 
-    std::string url = "https://api.modrinth.com/v2/search?limit=20&query=" + q;
+    std::string url = "https://api.modrinth.com/v2/search?limit=20";
+    if (q.empty()) url += "&index=downloads";
+    else          url += "&query=" + q;
     if (!mc.empty()) {
         url += "&facets=%5B%5B%22versions%3A" + mc + "%22%5D%2C%5B%22categories%3A" + loader + "%22%5D%5D";
     }
@@ -3461,8 +3463,8 @@ static void PaintMain(HDC dc, int w, int h) {
             } else if (g_modHits.empty()) {
                 RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
                 DrawTextIn(dc, g_modState.load() == 0
-                               ? L"输入关键词搜索模组（按当前实例的版本和加载器过滤）"
-                               : L"没有找到匹配的模组", e, C_DIM, g_fSmall);
+                               ? L"正在加载模组列表…"
+                               : L"没有找到匹配的模组，换个关键词试试", e, C_DIM, g_fSmall);
             } else {
                 int ih = Scale(56);
                 int yy = mTop - g_listScroll;
@@ -4543,7 +4545,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case ID_DL_SEC_GAME:
         g_dlSection = 0; g_dlDetail = false; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_DL_SEC_MOD:
-        g_dlSection = 1; g_modSel = -1; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
+        g_dlSection = 1; g_modSel = -1;
+        if (g_modState.load() == 0) std::thread(FetchModSearchThread, std::string()).detach();
+        SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_INST_TAB_LIST:
         g_instTab = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_INST_TAB_MOD:
