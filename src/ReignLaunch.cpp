@@ -128,6 +128,7 @@ static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
 static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
 static HWND hBtnUpdate, hBtnUserM0, hBtnUserM1, hBtnUserM2;
 static HWND hBtnModTabDl, hBtnModTabIn, hEdModSearch, hBtnModSource, hBtnModInstall, hBtnModToggle, hBtnModDelete;
+static HWND hBtnDlSecGame, hBtnDlSecMod, hBtnInstTabList, hBtnInstTabMod;
 static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
 static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl, hBtnDlFilterSel, hBtnDlCancel;
 
@@ -161,6 +162,8 @@ static int  g_modSel = -1;
 static int  g_modFileSel = -1;
 static int  g_modTab = 0;                        // 0=下载 1=已安装
 static int  g_modSource = 0;                     // 0=Modrinth 1=CurseForge
+static int  g_dlSection = 0;                     // 下载页：0=原版游戏 1=Mod下载
+static int  g_instTab = 0;                       // 实例页：0=版本列表 1=模组管理
 static void FetchModSearchThread(std::string q);
 static void RefreshInstalledMods();
 static std::string CurrentLoaderTag();
@@ -1552,6 +1555,10 @@ static std::string        g_loginErr;
 #define ID_MOD_INSTALL   1414
 #define ID_MOD_TOGGLE    1415
 #define ID_MOD_DELETE    1416
+#define ID_DL_SEC_GAME   1420
+#define ID_DL_SEC_MOD    1421
+#define ID_INST_TAB_LIST 1422
+#define ID_INST_TAB_MOD  1423
 #define ID_ED_SEARCH     1385
 #define ID_DL_BACK       1386
 #define ID_BTN_SAVE     1320
@@ -1649,8 +1656,8 @@ static void LayoutControls() {
     int w = g_ly.content.right, h = g_ly.content.bottom;
 
     // 顶部标签
-    HWND tabBtns[6] = { hBtnTabLaunch, hBtnTabDl, hBtnTabMods, hBtnTabInst, hBtnTabUser, hBtnTabSettings };
-    for (int i = 0; i < 6; ++i) {
+    HWND tabBtns[5] = { hBtnTabLaunch, hBtnTabDl, hBtnTabInst, hBtnTabUser, hBtnTabSettings };
+    for (int i = 0; i < 5; ++i) {
         RECT r = TabRect(i);
         MoveWindow(tabBtns[i], r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
     }
@@ -1724,6 +1731,13 @@ static void LayoutControls() {
 
         MoveWindow(hBtnSave, x + Scale(110), y + rowH * 7 + Scale(10), Scale(140), Scale(40), TRUE);
         MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 7 + Scale(10), Scale(240), Scale(40), TRUE);
+        {
+            int itx = g_ly.content.left + Scale(24);
+            int ity = g_ly.content.top + Scale(16);
+            MoveWindow(hBtnInstTabList, itx, ity, Scale(110), Scale(32), TRUE); itx += Scale(118);
+            MoveWindow(hBtnInstTabMod,  itx, ity, Scale(110), Scale(32), TRUE);
+        }
+
         MoveWindow(hEdThreads, x + Scale(110), y + rowH * 3 + Scale(6), Scale(90), Scale(30), TRUE);
         MoveWindow(hEdJvm,  x + Scale(110), y + rowH * 4 + Scale(6), Scale(560), Scale(30), TRUE);
         MoveWindow(hEdGame, x + Scale(110), y + rowH * 5 + Scale(6), Scale(560), Scale(30), TRUE);
@@ -1736,8 +1750,14 @@ static void LayoutControls() {
         {
             int tx0 = g_ly.content.left + Scale(24);
             int ty0 = g_ly.content.top + Scale(16);
+            MoveWindow(hBtnDlSecGame, tx0, ty0, Scale(110), Scale(32), TRUE); tx0 += Scale(118);
+            MoveWindow(hBtnDlSecMod,  tx0, ty0, Scale(110), Scale(32), TRUE); tx0 += Scale(126);
             MoveWindow(hBtnDlFilterSel, tx0, ty0, Scale(150), Scale(32), TRUE);
             MoveWindow(hEdSearch, g_ly.content.right - Scale(24) - Scale(240), ty0, Scale(240), Scale(30), TRUE);
+            MoveWindow(hBtnModSource,  tx0, ty0, Scale(160), Scale(32), TRUE);
+            MoveWindow(hEdModSearch,   tx0 + Scale(168), ty0, Scale(280), Scale(30), TRUE);
+            MoveWindow(hBtnModInstall, g_ly.content.right - Scale(24) - Scale(130),
+                       g_ly.content.bottom - Scale(58), Scale(130), Scale(38), TRUE);
 
             int dby = g_ly.content.top + Scale(64);
             int dbw = Scale(102), dbg = Scale(6);
@@ -1802,21 +1822,30 @@ static void SyncDownloadControls() {
     ShowWindow(hBtnDlCancel, (g_dlBusy.load() && (g_page == PAGE_DOWNLOAD)) ? SW_SHOW : SW_HIDE);
 
     {
-        bool onMods = (g_page == PAGE_MODS);
-        int s1 = onMods ? SW_SHOW : SW_HIDE;
-        ShowWindow(hBtnModTabDl, s1);
-        ShowWindow(hBtnModTabIn, s1);
-        ShowWindow(hBtnModSource, (onMods && g_modTab == 0) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hEdModSearch,  (onMods && g_modTab == 0) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModInstall, (onMods && g_modTab == 0) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModToggle,  (onMods && g_modTab == 1) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModDelete,  (onMods && g_modTab == 1) ? SW_SHOW : SW_HIDE);
+        bool onDl2  = onDl && !g_dlDetail;
+        bool game   = onDl2 && g_dlSection == 0;
+        bool modDl  = onDl2 && g_dlSection == 1;
+        ShowWindow(hBtnDlSecGame, onDl2 ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnDlSecMod,  onDl2 ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnDlFilterSel, game ? SW_SHOW : SW_HIDE);
+        ShowWindow(hEdSearch,       game ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnModSource,   modDl ? SW_SHOW : SW_HIDE);
+        ShowWindow(hEdModSearch,    modDl ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnModInstall,  modDl ? SW_SHOW : SW_HIDE);
+
+        bool onInst = (g_page == PAGE_INSTANCES);
+        ShowWindow(hBtnInstTabList, onInst ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnInstTabMod,  onInst ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnModToggle, (onInst && g_instTab == 1) ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnModDelete, (onInst && g_instTab == 1) ? SW_SHOW : SW_HIDE);
+
+        ShowWindow(hBtnModTabDl, SW_HIDE);
+        ShowWindow(hBtnModTabIn, SW_HIDE);
     }
     ShowWindow(hBtnDlF0, SW_HIDE);
     ShowWindow(hBtnDlF1, SW_HIDE);
     ShowWindow(hBtnDlF2, SW_HIDE);
     ShowWindow(hBtnDlF3, SW_HIDE);
-    ShowWindow(hEdSearch, showDl);
     ShowWindow(hBtnDlVanilla, showDet);
     ShowWindow(hBtnDlFabric,  showDet);
     ShowWindow(hBtnDlQuilt,   showDet);
@@ -1838,7 +1867,7 @@ static void ShowPage(Page p) {
     ShowWindow(hBtnTabSettings, SW_SHOW);
     ShowWindow(hBtnTabInst, SW_SHOW);
     ShowWindow(hBtnTabDl, SW_SHOW);
-    ShowWindow(hBtnTabMods, SW_SHOW);
+    ShowWindow(hBtnTabMods, SW_HIDE);
         SyncDownloadControls();
 
 
@@ -3284,7 +3313,36 @@ static void PaintMain(HDC dc, int w, int h) {
     }
     else if (g_page == PAGE_INSTANCES) {
         int x   = g_ly.content.left + Scale(24);
-        int top = g_ly.content.top + Scale(16);
+        int top = g_ly.content.top + Scale(72);
+
+        if (g_instTab == 1) {
+            int mBot = g_ly.content.bottom - Scale(24);
+            if (g_modFiles.empty()) {
+                RECT e = { x, top + Scale(10), g_ly.content.right - Scale(24), top + Scale(40) };
+                DrawTextIn(dc, L"当前实例没有安装模组", e, C_DIM, g_fSmall);
+            } else {
+                int ih = Scale(44);
+                int yy = top - g_listScroll;
+                for (size_t i = 0; i < g_modFiles.size(); ++i) {
+                    RECT item = { x, yy, g_ly.content.right - Scale(24), yy + ih - Scale(6) };
+                    if (item.bottom > top && item.top < mBot) {
+                        if (item.bottom > mBot) item.bottom = mBot;
+                        bool sel = ((int)i == g_modFileSel);
+                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
+                        std::string n = g_modFiles[i];
+                        bool dis = (n.size() > 13 && n.substr(n.size() - 13) == ".jar.disabled");
+                        RECT tx = item; tx.left += Scale(16);
+                        DrawTextIn(dc, U8ToW(n), tx, dis ? C_DIM : (sel ? C_TEXT : C_DIM), g_fUi);
+                        if (dis) {
+                            RECT tr = { item.right - Scale(120), item.top, item.right - Scale(16), item.bottom };
+                            DrawTextIn(dc, L"已禁用", tr, C_ERR, g_fSmall);
+                        }
+                    }
+                    yy += ih;
+                }
+            }
+            return;
+        }
 
         RECT lbl = { x, top, g_ly.content.right - Scale(160), top + Scale(26) };
         DrawTextIn(dc, L"实例 (" + std::to_wstring(g_versions.size()) + L")", lbl, C_DIM, g_fSmall);
@@ -3383,6 +3441,45 @@ static void PaintMain(HDC dc, int w, int h) {
                 DrawTextIn(dc, L"未选中版本，点「返回」重新选择", e, C_DIM, g_fSmall);
             }
 
+            DrawDlProgress(dc);
+            DrawDlTaskPanel(dc);
+            return;
+        }
+
+        // ---------------- Mod 下载 ----------------
+        if (g_dlSection == 1) {
+            int mx0 = g_ly.content.left + Scale(24);
+            int mTop = g_ly.content.top + Scale(72);
+            int mBot = g_ly.content.bottom - Scale(24);
+
+            if (g_modState.load() == 1) {
+                RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
+                DrawTextIn(dc, L"搜索中…", e, C_DIM, g_fSmall);
+            } else if (g_modState.load() == 3) {
+                RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
+                DrawTextIn(dc, L"搜索失败，检查网络后重试", e, C_ERR, g_fSmall);
+            } else if (g_modHits.empty()) {
+                RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
+                DrawTextIn(dc, g_modState.load() == 0
+                               ? L"输入关键词搜索模组（按当前实例的版本和加载器过滤）"
+                               : L"没有找到匹配的模组", e, C_DIM, g_fSmall);
+            } else {
+                int ih = Scale(56);
+                int yy = mTop - g_listScroll;
+                for (size_t i = 0; i < g_modHits.size(); ++i) {
+                    RECT item = { mx0, yy, g_ly.content.right - Scale(24), yy + ih - Scale(8) };
+                    if (item.bottom > mTop && item.top < mBot) {
+                        if (item.bottom > mBot) item.bottom = mBot;
+                        bool sel = ((int)i == g_modSel);
+                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
+                        RECT t1 = { item.left + Scale(16), item.top + Scale(8), item.right - Scale(16), item.top + Scale(32) };
+                        DrawTextIn(dc, U8ToW(g_modHits[i].title), t1, sel ? C_TEXT : C_DIM, g_fUi);
+                        RECT t2 = { item.left + Scale(16), item.top + Scale(32), item.right - Scale(16), item.bottom - Scale(4) };
+                        DrawTextIn(dc, U8ToW(g_modHits[i].desc), t2, C_DIM, g_fSmall);
+                    }
+                    yy += ih;
+                }
+            }
             DrawDlProgress(dc);
             DrawDlTaskPanel(dc);
             return;
@@ -3810,6 +3907,11 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         hBtnOffline = MakeBtn(hwnd, L"使用离线", ID_BTN_OFFLINE);
         hBtnSkin    = MakeBtn(hwnd, L"更换皮肤", ID_BTN_SKIN);
         hBtnDelAcc  = MakeBtn(hwnd, L"删除账户", ID_BTN_DELACC);
+        hBtnDlSecGame = MakeBtn(hwnd, L"原版游戏", ID_DL_SEC_GAME);
+        hBtnDlSecMod  = MakeBtn(hwnd, L"Mod下载",  ID_DL_SEC_MOD);
+        hBtnInstTabList = MakeBtn(hwnd, L"版本列表", ID_INST_TAB_LIST);
+        hBtnInstTabMod  = MakeBtn(hwnd, L"模组管理", ID_INST_TAB_MOD);
+
         hBtnModTabDl  = MakeBtn(hwnd, L"模组下载", ID_MOD_TABDL);
         hBtnModTabIn  = MakeBtn(hwnd, L"已安装",   ID_MOD_TABIN);
         hBtnModSource = MakeBtn(hwnd, L"源：Modrinth", ID_MOD_SOURCE);
@@ -4007,6 +4109,32 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         g_status = L"已选择：" + U8ToW(id) + L"  → 点下方的按钮安装";
                         InvalidateRect(hwnd, nullptr, TRUE);
                     }
+                }
+            }
+            return 0;
+        }
+
+        if (g_page == PAGE_DOWNLOAD && g_dlSection == 1) {
+            int mTop = g_ly.content.top + Scale(72);
+            if (pt.y >= mTop) {
+                int ih = Scale(56);
+                int idx = (pt.y - mTop + g_listScroll) / ih;
+                if (idx >= 0 && idx < (int)g_modHits.size()) {
+                    g_modSel = idx;
+                    InvalidateRect(hwnd, nullptr, TRUE);
+                }
+            }
+            return 0;
+        }
+
+        if (g_page == PAGE_INSTANCES && g_instTab == 1) {
+            int mTop = g_ly.content.top + Scale(72);
+            if (pt.y >= mTop) {
+                int ih = Scale(44);
+                int idx = (pt.y - mTop + g_listScroll) / ih;
+                if (idx >= 0 && idx < (int)g_modFiles.size()) {
+                    g_modFileSel = idx;
+                    InvalidateRect(hwnd, nullptr, TRUE);
                 }
             }
             return 0;
@@ -4411,6 +4539,16 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, TRUE);
         break;
     }
+
+    case ID_DL_SEC_GAME:
+        g_dlSection = 0; g_dlDetail = false; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
+    case ID_DL_SEC_MOD:
+        g_dlSection = 1; g_modSel = -1; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
+    case ID_INST_TAB_LIST:
+        g_instTab = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
+    case ID_INST_TAB_MOD:
+        g_instTab = 1; g_modFileSel = -1; RefreshInstalledMods();
+        SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
 
     case ID_MOD_TABDL:
         g_modTab = 0; g_modFileSel = -1; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
