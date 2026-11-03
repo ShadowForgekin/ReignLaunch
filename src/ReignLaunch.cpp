@@ -201,6 +201,7 @@ static HBRUSH g_brInput = nullptr;
 #define WM_APP_ERROR (WM_APP + 2)
 #define WM_APP_NEEDJAVA (WM_APP + 9)
 #define WM_APP_UPD       (WM_APP + 11)
+#define WM_APP_SYNCUI    (WM_APP + 12)
 
 // ============================ 工具 ============================
 static std::wstring U8ToW(const std::string& s) {
@@ -4075,7 +4076,12 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        SyncDownloadControls();          // 重绘前同步控件可见性，避免状态错位
+        {   // 只在 UI 状态变化时异步同步一次，避免消息风暴
+            static int s_sig = -1;
+            int sig = g_page * 100000 + g_dlSection * 1000 + (g_dlDetail ? 1 : 0) * 100
+                    + (g_modDetail ? 2 : 0) * 10 + (g_instTab ? 3 : 0) + (g_userMode * 7);
+            if (sig != s_sig) { s_sig = sig; PostMessageW(hwnd, WM_APP_SYNCUI, 0, 0); }
+        }
         RECT rc; GetClientRect(hwnd, &rc);
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
@@ -5034,6 +5040,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
         ShowErrorWindow();
         InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_APP_SYNCUI:
+        SyncDownloadControls();
         return 0;
 
     case WM_APP_DONE:
