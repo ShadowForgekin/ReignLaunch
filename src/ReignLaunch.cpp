@@ -2971,21 +2971,24 @@ static void FetchModSearchThread(std::string q) {
     std::string mc = CurrentMcVersion();
     std::string loader = CurrentLoaderTag();
 
-    std::string url = "https://api.modrinth.com/v2/search?limit=20";
-    if (q.empty()) url += "&index=downloads";
-    else          url += "&query=" + q;
-    if (!mc.empty()) {
-        url += "&facets=%5B%5B%22versions%3A" + mc + "%22%5D%2C%5B%22categories%3A" + loader + "%22%5D%5D";
-    }
+    std::string base = "https://api.modrinth.com/v2/search?limit=20";
+    if (q.empty()) base += "&index=downloads";
+    else          base += "&query=" + q;
 
-    std::vector<unsigned char> d; std::string e;
-    if (!HttpRequest(url, "GET", "", "", d, e)) {
-        g_modState = 3;
-        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-        return;
-    }
-    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
-    if (j.is_object() && j.contains("hits") && j["hits"].is_array()) {
+    // 依次放宽条件：版本+加载器 -> 仅加载器 -> 不过滤
+    std::vector<std::string> urls;
+    if (!mc.empty())
+        urls.push_back(base + "&facets=%5B%5B%22versions%3A" + mc + "%22%5D%2C%5B%22categories%3A" + loader + "%22%5D%5D");
+    urls.push_back(base + "&facets=%5B%5B%22categories%3A" + loader + "%22%5D%5D");
+    urls.push_back(base);
+
+    bool anyOk = false;
+    for (auto& url : urls) {
+        std::vector<unsigned char> d; std::string e;
+        if (!HttpRequest(url, "GET", "", "", d, e)) continue;
+        json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+        if (!(j.is_object() && j.contains("hits") && j["hits"].is_array())) continue;
+        anyOk = true;
         for (auto& h : j["hits"]) {
             ModHit m;
             m.slug      = h.value("slug", std::string());
@@ -2994,11 +2997,9 @@ static void FetchModSearchThread(std::string q) {
             m.downloads = h.value("downloads", 0LL);
             if (!m.slug.empty()) g_modHits.push_back(m);
         }
-        g_modState = 2;
-    } else {
-        g_modState = 3;
-        g_status = L"模组搜索返回异常：" + U8ToW(std::string((char*)d.data(), std::min<size_t>(80, d.size())));
+        if (!g_modHits.empty()) break;   // 有结果就停
     }
+    g_modState = anyOk ? 2 : 3;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
 
@@ -4074,6 +4075,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
+        SyncDownloadControls();          // 重绘前同步控件可见性，避免状态错位
         RECT rc; GetClientRect(hwnd, &rc);
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
