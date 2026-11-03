@@ -2929,14 +2929,39 @@ static std::string CurrentLoaderTag() {
 static std::string CurrentMcVersion() {
     if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size()) return "";
     std::string id = g_versions[g_selVersion];
-    fs::path jp = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id) / fs::u8path(id + ".json");
-    std::ifstream f{ jp };
-    if (f) {
-        std::stringstream ss; ss << f.rdbuf();
-        std::string s = ss.str();
-        std::regex re("\"inheritsFrom\"\\s*:\\s*\"([^\"]+)\"");
-        std::smatch m;
-        if (std::regex_search(s, m, re)) return m[1].str();
+
+    // 1) 版本 JSON 里的 inheritsFrom 最准
+    {
+        fs::path jp = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id) / fs::u8path(id + ".json");
+        std::ifstream f{ jp };
+        if (f) {
+            std::stringstream ss; ss << f.rdbuf();
+            std::string s = ss.str();
+            std::regex re("\"inheritsFrom\"\\s*:\\s*\"([^\"]+)\"");
+            std::smatch m;
+            if (std::regex_search(s, m, re)) return m[1].str();
+        }
+    }
+
+    // 2) 用官方版本清单做最长前缀匹配（"26.3-Fabric" -> "26.3"）
+    if (!g_mcVers.empty()) {
+        std::string best;
+        for (auto& v : g_mcVers) {
+            const std::string& cand = v.id;
+            if (cand.size() > id.size()) continue;
+            if (id.compare(0, cand.size(), cand) != 0) continue;
+            if (cand.size() > best.size()) best = cand;
+        }
+        if (!best.empty()) return best;
+    }
+
+    // 3) 兜底：砍掉 -fabric / -forge / -neoforge / -quilt 及其后内容
+    std::string low = id;
+    for (auto& c : low) c = (char)tolower((unsigned char)c);
+    const char* seps[] = { "-fabric", "-forge", "-neoforge", "-quilt", " fabric", " forge" };
+    for (auto* s : seps) {
+        size_t pos = low.find(s);
+        if (pos != std::string::npos && pos > 0) return id.substr(0, pos);
     }
     return id;
 }
@@ -3011,17 +3036,22 @@ static void FetchModVersThread(std::string slug) {
 
     std::string mc = CurrentMcVersion();
     std::string loader = CurrentLoaderTag();
-    std::string url = "https://api.modrinth.com/v2/project/" + slug + "/version";
-    if (!mc.empty()) url += "?game_versions=%5B%22" + mc + "%22%5D&loaders=%5B%22" + loader + "%22%5D";
+    std::string base = "https://api.modrinth.com/v2/project/" + slug + "/version";
 
-    std::vector<unsigned char> d; std::string e;
-    if (!HttpRequest(url, "GET", "", "", d, e)) {
-        g_modVerState = 3;
-        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-        return;
-    }
-    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
-    if (j.is_array()) {
+    // 依次放宽：版本+加载器 -> 仅加载器 -> 全部
+    std::vector<std::string> urls;
+    if (!mc.empty())
+        urls.push_back(base + "?game_versions=%5B%22" + mc + "%22%5D&loaders=%5B%22" + loader + "%22%5D");
+    urls.push_back(base + "?loaders=%5B%22" + loader + "%22%5D");
+    urls.push_back(base);
+
+    bool anyOk = false;
+    for (auto& url : urls) {
+        std::vector<unsigned char> d; std::string e;
+        if (!HttpRequest(url, "GET", "", "", d, e)) continue;
+        json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+        if (!j.is_array()) continue;
+        anyOk = true;
         for (auto& v : j) {
             std::string name = v.value("version_number", v.value("name", std::string()));
             std::string fu, fnn;
@@ -3031,8 +3061,9 @@ static void FetchModVersThread(std::string slug) {
             }
             if (!fu.empty()) { g_modVerNames.push_back(name); g_modVerFiles.push_back(fu + "\n" + fnn); }
         }
-        g_modVerState = 2;
-    } else g_modVerState = 3;
+        if (!g_modVerNames.empty()) break;   // 有结果就停
+    }
+    g_modVerState = anyOk ? 2 : 3;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
 
