@@ -3349,7 +3349,7 @@ static void PaintMain(HDC dc, int w, int h) {
         RECT lbl = { x, top, g_ly.content.right - Scale(160), top + Scale(26) };
         DrawTextIn(dc, L"实例 (" + std::to_wstring(g_versions.size()) + L")", lbl, C_DIM, g_fSmall);
 
-        int itemH = Scale(56);
+        int itemH = Scale(48);
         int y = top + Scale(34) - g_listScroll;
         for (size_t i = 0; i < g_versions.size(); ++i) {
             RECT item = { x, y, g_ly.content.right - Scale(24), y + itemH - Scale(8) };
@@ -4058,6 +4058,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
         if (g_dropWnd) { DestroyWindow(g_dropWnd); }
+        SetFocus(hwnd);   // 焦点收回主窗口，滚轮消息才送到这里
 
         if (g_page == PAGE_SETTINGS) {
             RECT sb = g_ly.sidebar;
@@ -4165,8 +4166,8 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (g_page == PAGE_INSTANCES) {
-            int itemH = Scale(56);
-            int top = g_ly.content.top + Scale(16) + Scale(34);
+            int itemH = Scale(48);
+            int top = g_ly.content.top + Scale(72) + Scale(34);
             if (pt.y >= top) {
                 int idx = (pt.y - top + g_listScroll) / itemH;
                 if (idx >= 0 && idx < (int)g_versions.size()) {
@@ -4197,41 +4198,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
         }
 
-        if (g_page == PAGE_INSTANCES || g_page == PAGE_DOWNLOAD) {
-            int delta0 = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
-            int top0 = 0, bot0 = 0, itemH0 = Scale(52), cnt = 0;
-
-            if (g_page == PAGE_INSTANCES) {
-                if (g_instTab == 1) {
-                    top0 = g_ly.content.top + Scale(72);
-                    bot0 = g_ly.content.bottom - Scale(24);
-                    itemH0 = Scale(44); cnt = (int)g_modFiles.size();
-                } else {
-                    top0 = g_ly.content.top + Scale(106);
-                    bot0 = g_ly.content.bottom - Scale(16);
-                    itemH0 = Scale(56); cnt = (int)g_versions.size();
-                }
-            } else if (g_dlDetail) {
-                top0 = g_ly.content.top + Scale(132);
-                bot0 = g_ly.content.bottom - Scale(72);
-                itemH0 = Scale(44); cnt = (int)g_ldVers.size();
-            } else if (g_dlSection == 1) {
-                top0 = g_ly.content.top + Scale(72);
-                bot0 = g_ly.content.bottom - Scale(24);
-                itemH0 = Scale(56); cnt = (int)g_modHits.size();
-            } else {
-                top0 = g_ly.content.top + Scale(58);
-                bot0 = g_ly.content.bottom - Scale(16);
-                itemH0 = Scale(52); cnt = (int)g_dlView.size();
-            }
-
-            int listH0 = bot0 - top0;
-            int maxS = std::max(0, cnt * itemH0 - listH0);
-            g_listScroll -= delta0 * itemH0;
-            g_listScroll = std::max(0, std::min(maxS, g_listScroll));
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
         if (g_page != PAGE_LAUNCH) return 0;
 
         // 版本列表点击
@@ -4259,7 +4225,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } else {
                     top0 = g_ly.content.top + Scale(106);
                     bot0 = g_ly.content.bottom - Scale(16);
-                    itemH0 = Scale(56); cnt = (int)g_versions.size();
+                    itemH0 = Scale(48); cnt = (int)g_versions.size();
                 }
             } else if (g_dlDetail) {
                 top0 = g_ly.content.top + Scale(132);
