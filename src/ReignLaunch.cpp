@@ -157,7 +157,11 @@ static int g_userMode = 0;   // 0=第三方 1=离线 2=微软
 struct ModHit { std::string slug, title, desc; long long downloads = 0; };
 static std::vector<ModHit> g_modHits;
 static std::vector<std::string> g_modFiles;      // 已安装的模组文件名（mods 目录）
-static std::atomic<int> g_modState{ 0 };         // 0未搜 1搜索中 2成功 3失败
+static bool g_modDetail = false;
+static std::string g_modDetailSlug, g_modDetailTitle, g_modDetailDesc;
+static std::vector<std::string> g_modVerNames, g_modVerFiles;
+static std::atomic<int> g_modVerState{ 0 };
+static int g_modVerSel = -1;static std::atomic<int> g_modState{ 0 };         // 0未搜 1搜索中 2成功 3失败
 static int  g_modSel = -1;
 static int  g_modFileSel = -1;
 static int  g_modTab = 0;                        // 0=下载 1=已安装
@@ -1823,15 +1827,17 @@ static void SyncDownloadControls() {
 
     {
         bool onDl2  = onDl && !g_dlDetail;
+        bool modDet = onDl2 && g_dlSection == 1 && g_modDetail;
         bool game   = onDl2 && g_dlSection == 0;
-        bool modDl  = onDl2 && g_dlSection == 1;
-        ShowWindow(hBtnDlSecGame, onDl2 ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnDlSecMod,  onDl2 ? SW_SHOW : SW_HIDE);
+        bool modDl  = onDl2 && g_dlSection == 1 && !g_modDetail;
+        ShowWindow(hBtnDlSecGame, (onDl2 && !g_modDetail) ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnDlSecMod,  (onDl2 && !g_modDetail) ? SW_SHOW : SW_HIDE);
         ShowWindow(hBtnDlFilterSel, game ? SW_SHOW : SW_HIDE);
         ShowWindow(hEdSearch,       game ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnDlBack, (showDet || modDet) ? SW_SHOW : SW_HIDE);
         ShowWindow(hBtnModSource,   modDl ? SW_SHOW : SW_HIDE);
         ShowWindow(hEdModSearch,    modDl ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModInstall,  modDl ? SW_SHOW : SW_HIDE);
+        ShowWindow(hBtnModInstall,  (modDl || modDet) ? SW_SHOW : SW_HIDE);
 
         bool onInst = (g_page == PAGE_INSTANCES);
         ShowWindow(hBtnInstTabList, onInst ? SW_SHOW : SW_HIDE);
@@ -2996,6 +3002,59 @@ static void FetchModSearchThread(std::string q) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
 
+// 拉某个模组的可用版本（按当前实例过滤）
+static void FetchModVersThread(std::string slug) {
+    g_modVerState = 1;
+    g_modVerNames.clear(); g_modVerFiles.clear(); g_modVerSel = -1;
+
+    std::string mc = CurrentMcVersion();
+    std::string loader = CurrentLoaderTag();
+    std::string url = "https://api.modrinth.com/v2/project/" + slug + "/version";
+    if (!mc.empty()) url += "?game_versions=%5B%22" + mc + "%22%5D&loaders=%5B%22" + loader + "%22%5D";
+
+    std::vector<unsigned char> d; std::string e;
+    if (!HttpRequest(url, "GET", "", "", d, e)) {
+        g_modVerState = 3;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+    if (j.is_array()) {
+        for (auto& v : j) {
+            std::string name = v.value("version_number", v.value("name", std::string()));
+            std::string fu, fnn;
+            if (v.contains("files") && v["files"].is_array() && !v["files"].empty()) {
+                fu  = v["files"][0].value("url", std::string());
+                fnn = v["files"][0].value("filename", std::string());
+            }
+            if (!fu.empty()) { g_modVerNames.push_back(name); g_modVerFiles.push_back(fu + "\n" + fnn); }
+        }
+        g_modVerState = 2;
+    } else g_modVerState = 3;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
+
+// 下载详情页里选中的那个模组版本
+static void InstallModVersionThread(std::string url, std::string fname) {
+    g_dlBusy = true; g_dlCancel = false; g_dlBytes = 0;
+    g_dlTarget = U8ToW(g_modDetailTitle);
+    g_progState = 1; g_progTotal = 1; g_progCur = 0;
+    g_status = L"正在下载模组…";
+
+    std::error_code ec;
+    fs::path dir = InstanceModsDir();
+    fs::create_directories(dir, ec);
+    std::string err;
+    if (DownloadFile(url, dir / fs::u8path(fname), err)) {
+        g_progCur = 1;
+        g_status = L"已安装模组：" + U8ToW(fname);
+        RefreshInstalledMods();
+    } else {
+        g_status = L"下载失败：" + U8ToW(err);
+    }
+    g_dlBusy = false; g_progState = 0;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
 // 下载某个模组（最新适配版本）到 mods
 static void InstallModThread(std::string slug) {
     g_dlBusy = true; g_dlCancel = false; g_dlBytes = 0;
@@ -3453,6 +3512,43 @@ static void PaintMain(HDC dc, int w, int h) {
             int mx0 = g_ly.content.left + Scale(24);
             int mTop = g_ly.content.top + Scale(72);
             int mBot = g_ly.content.bottom - Scale(24);
+            if (g_modDetail) {
+                int hx = g_ly.content.left + Scale(140);
+                RECT d1 = { hx, g_ly.content.top + Scale(8), g_ly.content.right - Scale(24), g_ly.content.top + Scale(40) };
+                DrawTextIn(dc, U8ToW(g_modDetailTitle), d1, C_TEXT, g_fTitle);
+                RECT d2 = { hx, g_ly.content.top + Scale(38), g_ly.content.right - Scale(24), g_ly.content.top + Scale(62) };
+                DrawTextIn(dc, U8ToW(g_modDetailDesc), d2, C_DIM, g_fSmall);
+
+                int vTop = g_ly.content.top + Scale(84);
+                if (g_modVerState.load() == 0 || g_modVerState.load() == 1) {
+                    RECT e = { mx0, vTop + Scale(8), g_ly.content.right - Scale(24), vTop + Scale(38) };
+                    DrawTextIn(dc, L"正在获取版本列表…", e, C_DIM, g_fSmall);
+                } else if (g_modVerState.load() == 3) {
+                    RECT e = { mx0, vTop + Scale(8), g_ly.content.right - Scale(24), vTop + Scale(38) };
+                    DrawTextIn(dc, L"获取版本失败，检查网络后重试", e, C_ERR, g_fSmall);
+                } else if (g_modVerNames.empty()) {
+                    RECT e = { mx0, vTop + Scale(8), g_ly.content.right - Scale(24), vTop + Scale(38) };
+                    DrawTextIn(dc, L"没有适配当前实例的版本文件", e, C_ERR, g_fSmall);
+                } else {
+                    int ih = Scale(44);
+                    int yy = vTop - g_listScroll;
+                    for (size_t i = 0; i < g_modVerNames.size(); ++i) {
+                        RECT item = { mx0, yy, g_ly.content.right - Scale(24), yy + ih - Scale(6) };
+                        if (item.bottom > vTop && item.top < mBot) {
+                            if (item.bottom > mBot) item.bottom = mBot;
+                            bool sel = ((int)i == g_modVerSel);
+                            FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
+                            RECT tx = item; tx.left += Scale(16);
+                            DrawTextIn(dc, U8ToW(g_modVerNames[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
+                        }
+                        yy += ih;
+                    }
+                }
+                DrawDlProgress(dc);
+                DrawDlTaskPanel(dc);
+                return;
+            }
+
 
             if (g_modState.load() == 1) {
                 RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
@@ -4076,6 +4172,38 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         if (g_page == PAGE_DOWNLOAD) {
+            if (g_dlSection == 1) {
+                if (g_modDetail) {
+                    int vTop = g_ly.content.top + Scale(84);
+                    if (pt.y >= vTop) {
+                        int ih2 = Scale(44);
+                        int idx2 = (pt.y - vTop + g_listScroll) / ih2;
+                        if (idx2 >= 0 && idx2 < (int)g_modVerNames.size()) {
+                            g_modVerSel = idx2;
+                            InvalidateRect(hwnd, nullptr, TRUE);
+                        }
+                    }
+                    return 0;
+                }
+                int mTop = g_ly.content.top + Scale(72);
+                if (pt.y >= mTop) {
+                    int ih = Scale(56);
+                    int idx = (pt.y - mTop + g_listScroll) / ih;
+                    if (idx >= 0 && idx < (int)g_modHits.size()) {
+                        g_modSel = idx;
+                        g_modDetail = true;
+                        g_modDetailSlug  = g_modHits[idx].slug;
+                        g_modDetailTitle = g_modHits[idx].title;
+                        g_modDetailDesc  = g_modHits[idx].desc;
+                        g_modVerState = 0;
+                        g_listScroll = 0;
+                        std::thread(FetchModVersThread, g_modDetailSlug).detach();
+                        SyncDownloadControls();
+                        InvalidateRect(hwnd, nullptr, TRUE);
+                    }
+                }
+                return 0;
+            }
             if (g_dlDetail) {
                 if (g_dlLoader > 0 && !g_ldVers.empty()) {
                     int itemH0 = Scale(44);
@@ -4117,18 +4245,6 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
-        if (g_page == PAGE_DOWNLOAD && g_dlSection == 1) {
-            int mTop = g_ly.content.top + Scale(72);
-            if (pt.y >= mTop) {
-                int ih = Scale(56);
-                int idx = (pt.y - mTop + g_listScroll) / ih;
-                if (idx >= 0 && idx < (int)g_modHits.size()) {
-                    g_modSel = idx;
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
-            }
-            return 0;
-        }
 
         if (g_page == PAGE_INSTANCES && g_instTab == 1) {
             int mTop = g_ly.content.top + Scale(72);
@@ -4309,6 +4425,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
 
         case ID_DL_BACK: {
+            if (g_modDetail) { g_modDetail = false; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break; }
             g_dlDetail = false;
             InvalidateRect(hwnd, nullptr, TRUE);
             break;
@@ -4555,9 +4672,9 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case ID_DL_SEC_GAME:
-        g_dlSection = 0; g_dlDetail = false; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
+        g_dlSection = 0; g_dlDetail = false; g_modDetail = false; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_DL_SEC_MOD:
-        g_dlSection = 1; g_modSel = -1; g_listScroll = 0;
+        g_dlSection = 1; g_modSel = -1; g_listScroll = 0; g_modDetail = false;
         if (g_modState.load() == 0) std::thread(FetchModSearchThread, std::string()).detach();
         SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_INST_TAB_LIST:
@@ -4578,6 +4695,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(hwnd, nullptr, TRUE);
         break;
     case ID_MOD_INSTALL: {
+        if (g_modDetail) {
+            if (g_modVerSel < 0 || g_modVerSel >= (int)g_modVerFiles.size()) {
+                MessageBoxW(hwnd, L"请先选择一个模组版本。", L"提示", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            std::string info2 = g_modVerFiles[g_modVerSel];
+            size_t nl2 = info2.find((char)10);
+            std::string u2 = (nl2 == std::string::npos) ? info2 : info2.substr(0, nl2);
+            std::string f2 = (nl2 == std::string::npos) ? std::string("mod.jar") : info2.substr(nl2 + 1);
+            std::thread(InstallModVersionThread, u2, f2).detach();
+            break;
+        }
         if (g_modTab != 0 || g_modSel < 0 || g_modSel >= (int)g_modHits.size()) {
             MessageBoxW(hwnd, L"请先在列表里选择一个模组。", L"提示", MB_OK | MB_ICONINFORMATION);
             break;
