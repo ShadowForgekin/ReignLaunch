@@ -161,7 +161,10 @@ static bool g_modDetail = false;
 static std::string g_modDetailSlug, g_modDetailTitle, g_modDetailDesc;
 static std::vector<std::string> g_modVerNames, g_modVerFiles;
 static std::atomic<int> g_modVerState{ 0 };
-static int g_modVerSel = -1;static std::atomic<int> g_modState{ 0 };         // 0未搜 1搜索中 2成功 3失败
+static int g_modVerSel = -1;
+static std::atomic<int> g_modState{ 0 };         // 0未搜 1搜索中 2成功 3失败
+static std::atomic<bool> g_cfFallback{ false };  // CurseForge 镜像不可用，需提示并切回
+static bool FetchCurseForgeViaProxy(std::string query, std::string mcVersion);
 static int  g_modSel = -1;
 static int  g_modFileSel = -1;
 static int  g_modTab = 0;                        // 0=下载 1=已安装
@@ -2989,6 +2992,51 @@ static void RefreshInstalledMods() {
     }
 }
 
+// ============================ CurseForge（免 Key 公共代理） ============================
+static std::string UrlEncode(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out; out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') out.push_back((char)c);
+        else { out.push_back('%'); out.push_back(hex[c >> 4]); out.push_back(hex[c & 0x0F]); }
+    }
+    return out;
+}
+
+// 通过公共镜像搜索 CurseForge（无需 API Key）
+// 成功返回 true 并填充 g_modHits；镜像不可用或解析失败返回 false
+static bool FetchCurseForgeViaProxy(std::string query, std::string mcVersion) {
+    std::string url = "https://api.curse.tools/v1/cf/mods/search"
+                      "?gameId=432"
+                      "&classId=6"
+                      "&pageSize=20"
+                      "&sortField=2&sortOrder=desc";
+    if (!query.empty())     url += "&searchFilter=" + UrlEncode(query);
+    if (!mcVersion.empty()) url += "&gameVersion=" + UrlEncode(mcVersion);
+
+    std::vector<unsigned char> d; std::string e;
+    if (!HttpRequest(url, "GET", "", "", d, e)) return false;
+    if (d.empty()) return false;
+
+    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+    if (!j.is_object() || !j.contains("data") || !j["data"].is_array()) return false;
+
+    std::vector<ModHit> hits;
+    for (auto& m : j["data"]) {
+        ModHit h;
+        long long id = m.value("id", 0LL);
+        h.title     = m.value("name", std::string());
+        h.desc      = m.value("summary", std::string());
+        h.downloads = m.value("downloadCount", 0LL);
+        if (id <= 0 || h.title.empty()) continue;
+        h.slug = "cf:" + std::to_string(id);
+        hits.push_back(h);
+    }
+    if (hits.empty()) return false;
+    g_modHits = hits;
+    return true;
+}
 static void FetchModSearchThread(std::string q) {
     g_modState = 1;
     g_modHits.clear();
@@ -2996,6 +3044,17 @@ static void FetchModSearchThread(std::string q) {
 
     std::string mc = CurrentMcVersion();
     std::string loader = CurrentLoaderTag();
+
+    // CurseForge 源：走公共镜像，免 API Key
+    if (g_modSource == 1) {
+        if (FetchCurseForgeViaProxy(q, mc)) {
+            g_modState = 2;
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+            return;
+        }
+        g_cfFallback = true;   // 镜像不可用：提示并切回 Modrinth
+        g_modSource = 0;
+    }
 
     std::string base = "https://api.modrinth.com/v2/search?limit=20";
     if (q.empty()) base += "&index=downloads";
@@ -3036,6 +3095,31 @@ static void FetchModVersThread(std::string slug) {
 
     std::string mc = CurrentMcVersion();
     std::string loader = CurrentLoaderTag();
+    // CurseForge 来源（slug = cf:<id>）：走镜像取文件列表
+    if (slug.rfind("cf:", 0) == 0) {
+        std::string id = slug.substr(3);
+        std::string curl = "https://api.curse.tools/v1/cf/mods/" + id + "/files?pageSize=50";
+        if (!mc.empty()) curl += "&gameVersion=" + UrlEncode(mc);
+        std::vector<unsigned char> cd; std::string ce;
+        if (HttpRequest(curl, "GET", "", "", cd, ce)) {
+            json cj = json::parse(std::string(cd.begin(), cd.end()), nullptr, false);
+            if (cj.is_object() && cj.contains("data") && cj["data"].is_array()) {
+                for (auto& f : cj["data"]) {
+                    std::string fn = f.value("fileName", std::string());
+                    std::string dl = f.value("downloadUrl", std::string());
+                    std::string dn = f.value("displayName", fn);
+                    if (!dl.empty()) { g_modVerNames.push_back(dn); g_modVerFiles.push_back(dl + "\n" + fn); }
+                }
+                g_modVerState = g_modVerNames.empty() ? 3 : 2;
+                if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+                return;
+            }
+        }
+        g_modVerState = 3;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
     std::string base = "https://api.modrinth.com/v2/project/" + slug + "/version";
 
     // 依次放宽：版本+加载器 -> 仅加载器 -> 全部
@@ -4729,8 +4813,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case ID_MOD_SOURCE:
         g_modSource = (g_modSource + 1) % 2;
         SetWindowTextW(hBtnModSource, g_modSource == 0 ? L"源：Modrinth" : L"源：CurseForge");
+        g_modState = 0;
+        g_modSel = -1;
+        g_listScroll = 0;
+        {
+            std::string q = WToU8(CtlText(hEdModSearch));
+            std::thread(FetchModSearchThread, q).detach();
+        }
         if (g_modSource == 1)
-            MessageBoxW(hwnd, L"CurseForge 需要 API Key，暂未配置。\n目前请使用 Modrinth 源。", L"提示", MB_OK | MB_ICONINFORMATION);
         InvalidateRect(hwnd, nullptr, TRUE);
         break;
     case ID_MOD_INSTALL: {
@@ -5079,6 +5169,10 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_APP_DONE:
         SyncDownloadControls();
+        if (g_cfFallback.exchange(false)) {
+            SetWindowTextW(hBtnModSource, L"源：Modrinth");
+            MessageBoxW(hwnd, L"CurseForge 镜像暂不可用，已切回 Modrinth。", L"提示", MB_OK | MB_ICONINFORMATION);
+        }
         if (g_overlay && g_stepCur.load() >= 4 && g_overlayDoneTick == 0)
             g_overlayDoneTick = GetTickCount();
         InvalidateRect(hwnd, nullptr, FALSE);
