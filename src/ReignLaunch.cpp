@@ -4199,10 +4199,33 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         if (g_page == PAGE_INSTANCES || g_page == PAGE_DOWNLOAD) {
             int delta0 = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
-            bool dl = (g_page == PAGE_DOWNLOAD);
-            int itemH0 = dl ? Scale(48) : Scale(56);
-            int cnt = dl ? (int)g_mcVers.size() : (int)g_versions.size();
-            int listH0 = (int)(g_ly.content.bottom - g_ly.content.top) - Scale(70);
+            int top0 = 0, bot0 = 0, itemH0 = Scale(52), cnt = 0;
+
+            if (g_page == PAGE_INSTANCES) {
+                if (g_instTab == 1) {
+                    top0 = g_ly.content.top + Scale(72);
+                    bot0 = g_ly.content.bottom - Scale(24);
+                    itemH0 = Scale(44); cnt = (int)g_modFiles.size();
+                } else {
+                    top0 = g_ly.content.top + Scale(106);
+                    bot0 = g_ly.content.bottom - Scale(16);
+                    itemH0 = Scale(56); cnt = (int)g_versions.size();
+                }
+            } else if (g_dlDetail) {
+                top0 = g_ly.content.top + Scale(132);
+                bot0 = g_ly.content.bottom - Scale(72);
+                itemH0 = Scale(44); cnt = (int)g_ldVers.size();
+            } else if (g_dlSection == 1) {
+                top0 = g_ly.content.top + Scale(72);
+                bot0 = g_ly.content.bottom - Scale(24);
+                itemH0 = Scale(56); cnt = (int)g_modHits.size();
+            } else {
+                top0 = g_ly.content.top + Scale(58);
+                bot0 = g_ly.content.bottom - Scale(16);
+                itemH0 = Scale(52); cnt = (int)g_dlView.size();
+            }
+
+            int listH0 = bot0 - top0;
             int maxS = std::max(0, cnt * itemH0 - listH0);
             g_listScroll -= delta0 * itemH0;
             g_listScroll = std::max(0, std::min(maxS, g_listScroll));
@@ -4226,10 +4249,33 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
         if (g_page == PAGE_INSTANCES || g_page == PAGE_DOWNLOAD) {
             int delta0 = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
-            bool dl = (g_page == PAGE_DOWNLOAD);
-            int itemH0 = dl ? Scale(48) : Scale(56);
-            int cnt = dl ? (int)g_mcVers.size() : (int)g_versions.size();
-            int listH0 = (int)(g_ly.content.bottom - g_ly.content.top) - Scale(70);
+            int top0 = 0, bot0 = 0, itemH0 = Scale(52), cnt = 0;
+
+            if (g_page == PAGE_INSTANCES) {
+                if (g_instTab == 1) {
+                    top0 = g_ly.content.top + Scale(72);
+                    bot0 = g_ly.content.bottom - Scale(24);
+                    itemH0 = Scale(44); cnt = (int)g_modFiles.size();
+                } else {
+                    top0 = g_ly.content.top + Scale(106);
+                    bot0 = g_ly.content.bottom - Scale(16);
+                    itemH0 = Scale(56); cnt = (int)g_versions.size();
+                }
+            } else if (g_dlDetail) {
+                top0 = g_ly.content.top + Scale(132);
+                bot0 = g_ly.content.bottom - Scale(72);
+                itemH0 = Scale(44); cnt = (int)g_ldVers.size();
+            } else if (g_dlSection == 1) {
+                top0 = g_ly.content.top + Scale(72);
+                bot0 = g_ly.content.bottom - Scale(24);
+                itemH0 = Scale(56); cnt = (int)g_modHits.size();
+            } else {
+                top0 = g_ly.content.top + Scale(58);
+                bot0 = g_ly.content.bottom - Scale(16);
+                itemH0 = Scale(52); cnt = (int)g_dlView.size();
+            }
+
+            int listH0 = bot0 - top0;
             int maxS = std::max(0, cnt * itemH0 - listH0);
             g_listScroll -= delta0 * itemH0;
             g_listScroll = std::max(0, std::min(maxS, g_listScroll));
@@ -4543,15 +4589,15 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case ID_DL_SEC_GAME:
-        g_dlSection = 0; g_dlDetail = false; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
+        g_dlSection = 0; g_dlDetail = false; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_DL_SEC_MOD:
-        g_dlSection = 1; g_modSel = -1;
+        g_dlSection = 1; g_modSel = -1; g_listScroll = 0;
         if (g_modState.load() == 0) std::thread(FetchModSearchThread, std::string()).detach();
         SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_INST_TAB_LIST:
-        g_instTab = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
+        g_instTab = 0; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
     case ID_INST_TAB_MOD:
-        g_instTab = 1; g_modFileSel = -1; RefreshInstalledMods();
+        g_instTab = 1; g_modFileSel = -1; g_listScroll = 0; RefreshInstalledMods();
         SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
 
     case ID_MOD_TABDL:
