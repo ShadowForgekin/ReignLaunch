@@ -2632,6 +2632,39 @@ static std::atomic<int> g_updateState{ 0 };   // 0未查 1查中 2有新版 3已
 static std::atomic<bool> g_updating{ false };
 
 // a 是否比 b 新
+// UTC 时间 -> Unix 秒（不依赖 timegm）
+static long long UtcEpoch(int y, int mo, int d, int h, int mi, int se) {
+    y -= (mo <= 2);
+    long long era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long long days = era * 146097 + (long long)doe - 719468;
+    return days * 86400LL + h * 3600LL + mi * 60LL + se;
+}
+
+// 编译时刻（UTC 秒），作为「本机版本发布时间」
+static long long BuildEpoch() {
+    static long long v = -2;
+    if (v != -2) return v;
+    std::tm tm{};
+    std::istringstream ss(std::string(__DATE__) + " " + __TIME__);   // "Nov  3 2026 20:06:05"
+    ss >> std::get_time(&tm, "%b %d %Y %H:%M:%S");
+    // __DATE__/__TIME__ 是本地时间，用 mktime 转成 UTC 秒
+    v = ss.fail() ? 0 : (long long)mktime(&tm);
+    return v;
+}
+
+// GitHub 的 "2026-11-03T12:34:56Z"
+static long long ParseIsoTime(const std::string& s) {
+    std::tm tm{};
+    std::istringstream ss(s);
+    ss >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+    if (ss.fail()) return 0;
+    return UtcEpoch(tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                    tm.tm_hour, tm.tm_min, tm.tm_sec);
+}
+
 static bool TagNewer(const std::wstring& a, const std::wstring& b) {
     auto parse = [](std::string s) {
         if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s.erase(s.begin());
@@ -2685,7 +2718,17 @@ static void UpdateThread(bool interactive) {
                 if (tag.empty() || url.empty()) continue;
                 g_newTag = U8ToW(tag);
                 g_newUrl = url;
-                g_updateState = TagNewer(g_newTag, APP_TAG) ? 2 : 3;
+                // 按发布时间判断：比本机编译时间晚即为新版本
+                long long pub = ParseIsoTime(r.value("published_at", std::string()));
+                bool newer;
+                if (tag == WToU8(APP_TAG)) {
+                    newer = false;                      // 同一个版本
+                } else if (pub > 0) {
+                    newer = (pub > BuildEpoch() + 120); // 发布时间晚于本机构建
+                } else {
+                    newer = TagNewer(g_newTag, APP_TAG); // 兜底：没有时间就比版本号
+                }
+                g_updateState = newer ? 2 : 3;
                 break;
             }
             if (g_updateState == 1) g_updateState = 3;
