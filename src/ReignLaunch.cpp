@@ -80,6 +80,9 @@ struct Config {
     std::string authName;
     std::string authUuid;
     std::string authlibPath;
+    // CurseForge 中转站与可选 Key
+    std::string cfProxy  = "https://api.curse.tools/v1/cf";
+    std::string cfApiKey;
 };
 
 static Config      g_cfg;
@@ -305,6 +308,8 @@ static void SaveConfig() {
     j["extraJvm"] = g_cfg.extraJvm;
     j["extraGame"] = g_cfg.extraGame;
     j["dlSource"] = g_cfg.dlSource;
+    j["cfProxy"]  = g_cfg.cfProxy;
+    j["cfApiKey"] = g_cfg.cfApiKey;
     j["winMode"] = g_cfg.winMode;
     j["skinPath"] = g_cfg.skinPath;
     {
@@ -346,6 +351,8 @@ static void LoadConfig() {
     g_cfg.extraJvm = j.value("extraJvm", std::string());
     g_cfg.extraGame = j.value("extraGame", std::string());
     g_cfg.dlSource = j.value("dlSource", 0);
+    g_cfg.cfProxy  = j.value("cfProxy",  std::string("https://api.curse.tools/v1/cf"));
+    g_cfg.cfApiKey = j.value("cfApiKey", std::string());
     g_cfg.winMode = j.value("winMode", 0);
     if (!j.contains("winMode") && j.contains("fullscreen"))   // 兼容旧的布尔配置
         g_cfg.winMode = j.value("fullscreen", false) ? 2 : 0;
@@ -3007,35 +3014,48 @@ static std::string UrlEncode(const std::string& s) {
 // 通过公共镜像搜索 CurseForge（无需 API Key）
 // 成功返回 true 并填充 g_modHits；镜像不可用或解析失败返回 false
 static bool FetchCurseForgeViaProxy(std::string query, std::string mcVersion) {
-    std::string url = "https://api.curse.tools/v1/cf/mods/search"
-                      "?gameId=432"
-                      "&classId=6"
-                      "&pageSize=20"
-                      "&sortField=2&sortOrder=desc";
-    if (!query.empty())     url += "&searchFilter=" + UrlEncode(query);
-    if (!mcVersion.empty()) url += "&gameVersion=" + UrlEncode(mcVersion);
+    // 依次尝试：配置里的中转站 -> 内置默认中转站 -> 官方 API（需 Key）
+    std::vector<std::pair<std::string, bool>> mirrors;   // (base, 是否需要 key)
+    if (!g_cfg.cfProxy.empty()) mirrors.push_back({ g_cfg.cfProxy, false });
+    if (g_cfg.cfProxy != "https://api.curse.tools/v1/cf")
+        mirrors.push_back({ "https://api.curse.tools/v1/cf", false });
+    if (!g_cfg.cfApiKey.empty())
+        mirrors.push_back({ "https://api.curseforge.com/v1", true });
 
-    std::vector<unsigned char> d; std::string e;
-    if (!HttpRequest(url, "GET", "", "", d, e)) return false;
-    if (d.empty()) return false;
+    std::string qs = "?gameId=432&classId=6&pageSize=20&sortField=2&sortOrder=desc";
+    if (!query.empty())     qs += "&searchFilter=" + UrlEncode(query);
+    if (!mcVersion.empty()) qs += "&gameVersion=" + UrlEncode(mcVersion);
 
-    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
-    if (!j.is_object() || !j.contains("data") || !j["data"].is_array()) return false;
+    for (auto& m : mirrors) {
+        std::string url = m.first + "/mods/search" + qs;
+        std::string ctype = "application/json";
+        if (m.second && !g_cfg.cfApiKey.empty())
+            ctype += "\r\nx-api-key: " + g_cfg.cfApiKey;   // 官方 API 需要的头
 
-    std::vector<ModHit> hits;
-    for (auto& m : j["data"]) {
-        ModHit h;
-        long long id = m.value("id", 0LL);
-        h.title     = m.value("name", std::string());
-        h.desc      = m.value("summary", std::string());
-        h.downloads = m.value("downloadCount", 0LL);
-        if (id <= 0 || h.title.empty()) continue;
-        h.slug = "cf:" + std::to_string(id);
-        hits.push_back(h);
+        std::vector<unsigned char> d; std::string e;
+        if (!HttpRequest(url, "GET", "", ctype, d, e)) continue;
+        if (d.empty()) continue;
+
+        json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+        if (!j.is_object() || !j.contains("data") || !j["data"].is_array()) continue;
+
+        std::vector<ModHit> hits;
+        for (auto& x : j["data"]) {
+            ModHit h;
+            long long id = x.value("id", 0LL);
+            h.title     = x.value("name", std::string());
+            h.desc      = x.value("summary", std::string());
+            h.downloads = x.value("downloadCount", 0LL);
+            if (id <= 0 || h.title.empty()) continue;
+            h.slug = "cf:" + std::to_string(id);
+            hits.push_back(h);
+        }
+        if (hits.empty()) continue;
+
+        g_modHits = hits;
+        return true;
     }
-    if (hits.empty()) return false;
-    g_modHits = hits;
-    return true;
+    return false;
 }
 static void FetchModSearchThread(std::string q) {
     g_modState = 1;
