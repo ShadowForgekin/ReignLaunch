@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ReignLaunch — 轻量级 Minecraft 启动器</title>
+<meta name="description" content="ReignLaunch 是用 C++17 + Win32 从零手写的 Minecraft 启动器：单文件、无运行时依赖，支持原版/加载器下载、模组下载与管理、多实例隔离。">
+<meta name="theme-color" content="#18191c">
+<meta property="og:title" content="ReignLaunch — 轻量级 Minecraft 启动器">
+<meta property="og:description" content="单文件 7MB，无运行时依赖。原版/Forge/Fabric/NeoForge/Quilt 一键安装，模组直接在启动器里下载。">
+<meta property="og:image" content="shots/ui_launch.jpg">
+<meta property="og:type" content="website">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top">
+      <span class="brand-mark">R</span>
+      <span class="brand-text">ReignLaunch</span>
+    </a>
+    <nav class="nav-links">
+      <a href="#features">功能</a>
+      <a href="#shots">截图</a>
+      <a href="#start">快速开始</a>
+      <a href="#faq">常见问题</a>
+    </nav>
+    <a class="btn btn-ghost nav-github" href="https://github.com/ShadowForgekin/ReignLaunch" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- Hero -->
+  <section class="hero">
+    <div class="wrap hero-inner">
+      <div class="hero-copy">
+        <div class="pill"><span class="dot"></span> <span id="verTag">正在获取…</span> · <span id="verDate">版本来源 GitHub</span></div>
+        <h1>为 Minecraft 而生的<br><em>轻量启动器</em></h1>
+        <p class="lead">
+          用 C++17 + Win32 GDI 从零手写，不套壳、不打包 Electron。
+          一个 7MB 的 exe 就能装原版、装加载器、装模组、管实例。
+        </p>
+        <div class="cta">
+          <a class="btn btn-primary btn-lg" id="dlBtn" role="button" tabindex="0">
+            下载 Windows 版
+          </a>
+          <a class="btn btn-ghost btn-lg" href="https://github.com/ShadowForgekin/ReignLaunch" target="_blank" rel="noopener">
+            查看源码
+          </a>
+        </div>
+        <p class="meta" id="dlMeta">Windows 7 SP1 及以上 · 64 位 · 约 7MB</p>
+        <p class="released" id="dlDate">发布于 —</p>
+
+      </div>
+      <div class="hero-art">
+        <div class="shot-frame">
+          <img src="shots/ui_launch.jpg" alt="ReignLaunch 启动页" loading="eager">
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 特性条 -->
+  <section class="strip">
+    <div class="wrap strip-inner">
+      <div class="stat"><b>7 MB</b><span>单文件免安装</span></div>
+      <div class="stat"><b>0</b><span>外部运行时依赖</span></div>
+      <div class="stat"><b>16</b><span>线程并发下载</span></div>
+      <div class="stat"><b>5</b><span>加载器与模组源</span></div>
+    </div>
+  </section>
+
+  <!-- 功能 -->
+  <section id="features" class="section">
+    <div class="wrap">
+      <header class="section-head">
+        <p class="eyebrow">FEATURES</p>
+        <h2>该有的都有，不该有的没有</h2>
+        <p class="sub">没有广告、没有捆绑、没有登录墙。装完就能玩。</p>
+      </header>
+
+      <div class="grid">
+        <article class="card">
+          <div class="ico">⛏️</div>
+          <h3>原版一键安装</h3>
+          <p>直连 Mojang 清单，按正式版 / 快照 / 远古版 / 愚人节分类，搜到即装。</p>
+        </article>
+        <article class="card">
+          <div class="ico">🧩</div>
+          <h3>五个加载器</h3>
+          <p>Forge、Fabric、NeoForge、Quilt 都能选具体版本；原版则完全不装加载器。</p>
+        </article>
+        <article class="card">
+          <div class="ico">📦</div>
+          <h3>模组下载</h3>
+          <p>启动器内搜索 Modrinth，选中版本直接装进对应实例的 mods 目录。</p>
+        </article>
+        <article class="card">
+          <div class="ico">🗂️</div>
+          <h3>实例隔离</h3>
+          <p>三档隔离策略，彻底解决「Forge 找不到 mods」的老问题。</p>
+        </article>
+        <article class="card">
+          <div class="ico">☕</div>
+          <h3>Java 自动匹配</h3>
+          <p>按版本 JSON 的 majorVersion 选 Java，优先最贴近的版本，不会拿 Java 8 开 1.21。</p>
+        </article>
+        <article class="card">
+          <div class="ico">🎭</div>
+          <h3>多账户 + 离线皮肤</h3>
+          <p>多账户切换，离线皮肤写进 CustomSkinLoader 目录，单人游戏也能看到自己的皮。</p>
+        </article>
+        <article class="card">
+          <div class="ico">🚀</div>
+          <h3>沉浸式启动</h3>
+          <p>启动画面叠在主窗口内，贴底进度条，等游戏窗口真正出现才算完成。</p>
+        </article>
+        <article class="card">
+          <div class="ico">🔄</div>
+          <h3>自动更新</h3>
+          <p>按发布时间判断新版本，下载失败自动切镜像加速。</p>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <!-- 截图 -->
+  <section id="shots" class="section section-alt">
+    <div class="wrap">
+      <header class="section-head">
+        <p class="eyebrow">SCREENSHOTS</p>
+        <h2>界面长这样</h2>
+        <p class="sub">深色、克制、信息密度高。</p>
+      </header>
+
+      <div class="shots">
+        <figure class="shot">
+          <img src="shots/ui_download.jpg" alt="版本下载列表" loading="lazy">
+          <figcaption><b>版本下载</b><span>分类下拉 + 搜索 + 日期类型一屏看完</span></figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="shots/ui_download_detail.jpg" alt="版本详情" loading="lazy">
+          <figcaption><b>版本详情</b><span>原版 / 四种加载器 / Fabric API / QSL</span></figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="shots/ui_download_mod.jpg" alt="模组下载" loading="lazy">
+          <figcaption><b>模组下载</b><span>按当前实例的版本与加载器自动过滤</span></figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="shots/ui_instances.jpg" alt="实例管理" loading="lazy">
+          <figcaption><b>实例管理</b><span>版本列表与模组管理两个分区</span></figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="shots/ui_user.jpg" alt="账户页" loading="lazy">
+          <figcaption><b>账户</b><span>第三方 / 离线 / 微软（开发中）</span></figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="shots/ui_settings.jpg" alt="设置页" loading="lazy">
+          <figcaption><b>设置</b><span>目录、Java、内存、线程、隔离策略</span></figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- 快速开始 -->
+  <section id="start" class="section">
+    <div class="wrap start-grid">
+      <div>
+        <header class="section-head left">
+          <p class="eyebrow">GET STARTED</p>
+          <h2>三步开玩</h2>
+        </header>
+        <ol class="steps">
+          <li><b>下载并解压</b><span>单个 exe，放哪都行，不需要安装。</span></li>
+          <li><b>选 .minecraft 目录</b><span>设置页点「自动检测」，或者手动浏览。</span></li>
+          <li><b>装版本、点启动</b><span>下载页选版本 → 详情 → 安装，回启动页开玩。</span></li>
+        </ol>
+        <p class="note">配置保存在 <code>%APPDATA%\ReignLaunch\config.json</code>，换机器拷过去就行。</p>
+      </div>
+      <div class="code-card">
+        <div class="code-head"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><em>命令行</em></div>
+        <pre><code># 只输出启动命令，不启动游戏（排查用）
+ReignLaunch.exe --dump 1.20.1-Forge
+
+# 生成到 dump.txt：
+java.exe -Xmx4096M -Djava.library.path=... \
+  -cp "libraries/..." net.minecraft.client.main.Main \
+  --username Steve --gameDir ... --version 1.20.1-Forge</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section id="faq" class="section section-alt">
+    <div class="wrap narrow">
+      <header class="section-head">
+        <p class="eyebrow">FAQ</p>
+        <h2>常见问题</h2>
+      </header>
+
+      <details class="qa">
+        <summary>需要装 Java 吗？</summary>
+        <p>需要。启动器会按版本自动挑 Java，本机没有对应版本时会提示并给出 Adoptium 下载入口。</p>
+      </details>
+      <details class="qa">
+        <summary>支持正版登录吗？</summary>
+        <p>微软正版登录仍在开发中。目前支持离线账户和第三方 Yggdrasil（如 LittleSkin）。</p>
+      </details>
+      <details class="qa">
+        <summary>为什么 Forge 实例看不到模组？</summary>
+        <p>这是版本隔离问题。设置页把隔离策略改成「隔离所有实例」，模组就会被放到 <code>versions/&lt;实例&gt;/mods</code>，Forge 才读得到。</p>
+      </details>
+      <details class="qa">
+        <summary>模组下载为什么只有 Modrinth？</summary>
+        <p>CurseForge 官方接口需要 API Key。可以在 <code>config.json</code> 里填 <code>cfApiKey</code>，或填 <code>cfProxy</code> 指向自己的中转站。</p>
+      </details>
+      <details class="qa">
+        <summary>会收集数据吗？</summary>
+        <p>不会。启动器只在你主动检查更新和下载时访问网络，没有遥测。</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- 底部 CTA -->
+  <section class="final">
+    <div class="wrap final-inner">
+      <h2>现在就试试</h2>
+      <p>一个 exe，解压即用。</p>
+      <a class="btn btn-primary btn-lg" id="dlBtn2" role="button" tabindex="0">下载最新版</a>
+    </div>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <div class="wrap foot-inner">
+    <div>
+      <div class="brand small"><span class="brand-mark">R</span><span class="brand-text">ReignLaunch</span></div>
+      <p class="foot-note">用 C++17 + Win32 GDI 手写 · MIT License</p>
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/ShadowForgekin/ReignLaunch" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/ShadowForgekin/ReignLaunch/releases" target="_blank" rel="noopener">全部版本</a>
+      <a href="https://github.com/ShadowForgekin/ReignLaunch/issues" target="_blank" rel="noopener">反馈问题</a>
+    </div>
+  </div>
+  <div class="wrap"><p class="copy">© <span id="year"></span> ReignLaunch · 制作人：加纳Brightchaserove</p></div>
+</footer>
+
+<script src="assets/app.js" defer></script>
+</body>
+</html>
