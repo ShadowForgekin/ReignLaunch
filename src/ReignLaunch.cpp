@@ -7500,7 +7500,7 @@ public:
         struct KV { const char* k; std::string v; };
         KV rows[] = {
             { "版本",     APP_VER_STR },
-            { "制作人",   "ShadowForgekin" },
+            { "制作人",   "加纳Brightchaserove（抖音）" },
             { "游戏目录", g_cfg.gameDir },
         };
         for (auto& r : rows) {

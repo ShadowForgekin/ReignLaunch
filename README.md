@@ -2,6 +2,7 @@
 
 **一个从零手写的 Minecraft 启动器 · FLTK 1.4.5 · 单文件源码**
 
+[![作者](https://img.shields.io/badge/作者-加纳Brightchaserove（抖音）-fe2c55)](https://www.douyin.com/)
 [![Version](https://img.shields.io/badge/version-1.3.0%20RC%201-4a9eff)](https://github.com/ShadowForgekin/ReignLaunch/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4)](https://github.com/ShadowForgekin/ReignLaunch)
 [![FLTK](https://img.shields.io/badge/FLTK-1.4.5-ff6b35)](https://www.fltk.org/)
@@ -154,4 +155,4 @@ Powered by **FLTK** · **miniz** · **nlohmann/json**
 
 [MIT](LICENSE)
 
-作者：**ShadowForgekin**
+作者：**加纳Brightchaserove（抖音）**
