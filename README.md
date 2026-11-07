@@ -1,152 +1,157 @@
 # ReignLaunch
 
-用 **C++17 + Win32 GDI** 从零手写的 Minecraft 启动器，无第三方 UI 框架，单窗口多页面。
+**一个从零手写的 Minecraft 启动器 · FLTK 1.4.5 · 单文件源码**
 
-**v1.0.0** · 制作人：加纳Brightchaserove（抖音）
+[![Version](https://img.shields.io/badge/version-1.3.0%20RC%201-4a9eff)](https://github.com/ShadowForgekin/ReignLaunch/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4)](https://github.com/ShadowForgekin/ReignLaunch)
+[![FLTK](https://img.shields.io/badge/FLTK-1.4.5-ff6b35)](https://www.fltk.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-![启动页](screenshots/ui_launch.jpg?v=20261103)
+ReignLaunch 是一个完全自制的 Minecraft 启动器，不依赖 Electron、JavaFX 或任何大型运行时。
+整个界面由 FLTK 自绘，逻辑层与界面层合并在一个 `.cpp` 文件中，最终产物是 **一个 5.8 MB 的独立 exe**。
 
 ---
 
-## 功能
+## 截图
 
-### 页面结构
-
-顶部五个标签：**启动 / 下载 / 实例 / 用户 / 设置**；「关于」在设置页左侧子菜单里。
-
-| 页面 | 内容 |
+| 启动页 | 版本下载 |
 |---|---|
-| 启动 | 账号 / 内存 / 当前版本，启动按钮 + ▲ 实例选择浮层 |
-| 下载 | 原版游戏 / Mod下载 两个分区 |
-| 实例 | 实例列表 + 模组管理（启用/禁用/删除） |
-| 用户 | 左侧账户列表，右侧三种登录方式 |
-| 设置 | 游戏目录、Java、内存、线程、JVM/游戏参数、下载源、窗口模式、版本隔离 |
+| ![启动页](screenshots/01-launch.png) | ![版本下载](screenshots/02-download.png) |
+
+| 模组下载 | 设置 |
+|---|---|
+| ![模组下载](screenshots/03-mod.png) | ![设置](screenshots/04-settings.png) |
+
+| 用户 | 关于 |
+|---|---|
+| ![用户](screenshots/05-user.png) | ![关于](screenshots/06-about.png) |
+
+---
+
+## 1.3.0 RC 1 更新日志
+
+### 设置页重做
+
+- 改为**纯自绘 UI**，彻底摆脱子控件堆叠导致的卡死
+- 设置项从 7 项扩展到 **11 项**：
+  - 新增 **额外 JVM 参数** —— 例如 `-XX:+UseG1GC -XX:MaxGCPauseMillis=50`
+  - 新增 **额外游戏参数**
+  - 新增 **CurseForge 中转站** —— 可自定义镜像地址
+  - 新增 **authlib-injector** —— 带「自动检测」按钮，一键定位第三方登录所需的 jar
+- 内容超出窗口时支持**滚轮滚动**，行区域自动裁剪，不会盖住底部按钮
+- 修复「使用推荐」按钮与推荐值提示文字重叠
+- 修复下拉框「要点两次才能展开」、滑条「只能拖一点」、手动输入无响应
+
+### 模组面板
+
+- 新增**左侧分类栏**：Mod / 整合包 / 数据包 / 资源包 / 光影包
+  - 通过 Modrinth `project_type` 过滤，选中项蓝底高亮 + 左侧亮条
+- 新增**真正的搜索输入框**（可输入、可聚焦），并修复：
+  - 查询词未 URL 编码导致中文/空格搜索失败
+  - `facets` 参数重复出现，后一个覆盖前一个，导致类型过滤失效
+  - 搜索改为**后台线程**，切换标签不再卡顿 2~5 秒
+- 新增**模组详情页**：简介、下载量、版本自选列表
+- 详情页版本列表改为**后台加载**，点开立即响应，不再冻结界面
+- 移除多余的「推荐模组」卡片，直接平铺全部搜索结果
 
 ### 下载页
 
-**第一级（列表）**：版本类型下拉（正式版 / 快照版 / 远古版 / 愚人节 / 所有版本）、搜索框，
-列表显示 **版本号 · 发布日期 · 类型**。
+- 恢复**版本类型筛选下拉**：正式版 / 快照版 / 远古版 / 所有版本
+- 修复下拉框被版本列表遮挡（绘制顺序问题）
+- 修复首次进入页面「必须刷新才显示列表」
+- 修复「搜索」按钮与顶部标签重叠
 
-**第二级（详情）**：七个选项 `原版` `Fabric` `Quilt` `Forge` `NeoForge` `Fabric API` `QSL`
+### 交互修复
 
-- 选原版 = 不装加载器，直接下载游戏本体
-- 选加载器后列出该 MC 版本可用的**全部加载器版本**，选中再装
-- Fabric API / QSL 从 Modrinth 取版本，下载到 `mods/`
+- **滚轮方向修正**：此前向下滚内容反而向上走（5 处 `event_dy` 符号用反）
+- **事件分发修正**：页面重写 `handle()` 后未转交 `Fl_Group::handle`，导致所有输入框无法获得焦点、打不了字
+- 修复输入框/按钮位置与点击热区不一致（绘制、点击、控件三处坐标统一）
 
-| 下载列表 | 版本详情 |
-|---|---|
-| ![下载](screenshots/ui_download.jpg?v=20261103) | ![详情](screenshots/ui_download_detail.jpg?v=20261103) |
+### 启动与下载
 
-**下载任务面板**：显示「正在下载中：26.3 Fabric」、进度条、已完成/剩余文件数、
-实时速度、取消按钮。
+- 启动浮层改为**沉浸式下载视图**：实时速度、已下载字节、文件数、真实进度条
+- **取消启动真正生效**：轮询取消标志后调用 `TerminateProcess` 结束游戏进程
+- 强制使用 `java.exe` 而非 `javaw.exe`，并以 `CREATE_NO_WINDOW` 启动，不再闪黑框
 
-**下载加速**：每线程复用 WinHTTP 会话，默认 16 线程（可调 1–128）。
+### 关于页
 
-### Mod 下载
+- 补齐信息：版本号、制作人、游戏目录
+- **开源地址可点击**，点击调用 `ShellExecuteW` 打开浏览器
+- 新增**特别鸣谢**区块
+- 新增**检查更新**按钮：检查到新版本后再点一次即下载替换
 
-![Mod下载](screenshots/ui_download_mod.jpg?v=20261103b)
+### 在线源
 
-**模组下载**
+- CurseForge 支持**免 API Key 镜像**，自动探测：`api.curse.tools` → `cf.mcim.moe` → `mcim.bangbang93.com`
+- 镜像不可用时自动回退到 Modrinth
 
-- 下载页顶部切到「Mod下载」分区，源可切 Modrinth（可用）/ CurseForge（需 API Key）
-- 搜索按当前实例自动过滤：原版 MC 版本 + 加载器类型
-  （Forge 实例搜 Forge 版模组，Fabric 实例搜 Fabric 版）
-- 结果列出名称与简介，选中后点「下载并安装」→ 下载到该实例的 `mods/`
-  （开了版本隔离就进 `versions/<实例>/mods`）
+---
 
-**实例页的模组管理**
+## 功能特性
 
-- 列出当前实例 `mods/` 下的所有 `.jar`
-- **启用 / 禁用**：重命名 `.jar` ↔ `.jar.disabled`，禁用的显示「已禁用」
-- **删除**：二次确认后从磁盘移除
+- **多账户管理**：离线 / 微软正版 / 第三方验证（authlib-injector）
+- **版本安装**：Mojang 官方版本清单，支持正式版/快照版/远古版筛选
+- **加载器安装**：Fabric / Quilt / Forge / NeoForge / QSL / Fabric API，版本自选
+- **模组下载**：Modrinth 与 CurseForge 双源，五大分类，版本自选
+- **Java 自动匹配**：按版本需求自动选择/下载合适的 Java
+- **BMCLAPI 镜像**：下载源可切换官方/镜像/自动
+- **版本隔离**：可为每个实例配置独立 `.minecraft` 目录
+- **单文件交付**：一个 exe，无安装、无运行时依赖
 
-### 账户
+---
 
-用户页顶部三种登录方式：
+## 系统要求
 
-| 模式 | 内容 |
-|---|---|
-| 第三方登录 | 认证服务器 + 用户名 + 密码（Yggdrasil / authlib-injector） |
-| 离线登录 | 离线玩家名 + 使用离线 |
-| 微软登录 | 正在开发中，暂不可用 |
+- Windows 10 / 11（x64）
+- 无需 .NET / Java 运行时（启动器自身用 C++ 编写）
+- 运行游戏需要 Java（启动器会自动检测并提示下载）
 
-- 多账户，点左侧卡片切换，每个账户独立保存皮肤
-- 离线皮肤 64×64 或 64×32 PNG，写入 `%APPDATA%\ReignLaunch\skins\` 与
-  `CustomSkinLoader/LocalSkin/textures/`（装 CSL 模组游戏内可见）
-- 离线 UUID = `MD5("OfflinePlayer:名字")` + version 3 / variant 位
-
-![用户页](screenshots/ui_user.jpg?v=20261103)
-
-### Java 自动匹配
-
-按版本 JSON 的 `javaVersion.majorVersion` 选 Java，没有就顺 `inheritsFrom` 找父版本，
-再按 MC 版本推断（1.20.5+ → 21，1.18–1.20.4 → 17，更早 → 8）。优先最贴近的版本。
-
-### 启动流程
-
-点击启动后主窗口内叠一层沉浸式画面：底部 200px 渐变压暗、左下角状态、贴底进度条。
-四步：检测 Java → 处理依赖 → 登录 → 等待游戏启动（等窗口真正出现才算完成）。
-中途取消会立即终止 java 进程。
-
-![启动画面](screenshots/ui_launching.jpg?v=20261103)
-
-### 版本隔离
-
-设置页三档：隔离所有实例 / 仅隔离模组实例 / 不隔离。
-
-### 其他设置
-
-JVM 参数、游戏参数、下载源（自动/仅官方/仅 BMCLAPI）、游戏窗口模式（窗口/最大化/全屏）、
-自动更新（GitHub Releases，失败自动切 gh-proxy 加速）。
+---
 
 ## 构建
 
-需要 **MinGW-w64 GCC 8+** 与 `windres`。
-
-1. 下载 [authlib-injector](https://github.com/yushijinhun/authlib-injector/releases) 的 jar，
-   放到 `src/` 命名 `authlib-injector.jar`
-2. 编译：
-
 ```bat
 cd src
+
+gcc -O2 -c miniz.c -o miniz.o
 windres res.rc -O coff -o res.o
-g++ -std=c++17 -O2 -mwindows -static ^
+
+g++ -std=c++17 -O2 -mwindows -static -static-libgcc -static-libstdc++ ^
     -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE ^
-    -o ReignLaunch.exe ReignLaunch.cpp res.o ^
-    -lcomctl32 -lole32 -lshell32 -lgdi32 -luuid -ladvapi32 -lwinhttp -lshlwapi -lcomdlg32 -lgdiplus
+    -I. -IFL -o ReignLaunch.exe ReignLaunch.cpp miniz.o res.o ^
+    -Wl,--start-group libfltk.a -Wl,--end-group ^
+    -lwinhttp -lshell32 -ladvapi32 -lole32 -luuid -lgdi32 -lcomctl32 ^
+    -loleaut32 -lshlwapi -lcomdlg32 -lgdiplus -lwinspool -lws2_32
 ```
 
-> `-fwide-exec-charset=UTF-16LE` 不能省，否则中文界面全是乱码。
-> GDI+（`-lgdiplus`）用于加载皮肤 PNG。
+需要 MinGW-w64（GCC 13+）与 FLTK 1.4.5 静态库 `libfltk.a`。
 
-也可直接运行 `build.bat`。
+---
 
-## 使用
+## 技术栈
 
-1. 设置页选 `.minecraft` 目录
-2. 用户页建账号（离线登录填名字点「使用离线」）
-3. 下载页选版本 → 详情 → 选原版或加载器 → 安装
-4. 模组页搜模组 → 下载并安装
-5. 实例页选实例，回启动页启动
+| 组件 | 用途 |
+|---|---|
+| FLTK 1.4.5 | 界面（页面全部自绘） |
+| miniz 3.1.2 | zip 解压，替代 `tar.exe` 子进程 |
+| nlohmann/json 3.12.0 | JSON 解析 |
+| WinHTTP | 全部网络请求 |
+| Win32 / GDI | 窗口、图标、字体枚举 |
 
-配置在 `%APPDATA%\ReignLaunch\config.json`（首次运行从旧 `%APPDATA%\MCLite` 迁移）。
+数据源：**MCIM** · **BMCLAPI** · **Modrinth** · **CurseForge** · **Mojang**
 
-### 命令行
+---
 
-```bat
-ReignLaunch.exe --dump 1.20.1-Forge
-```
+## 致谢
 
-只生成启动命令行到 `dump.txt`，不启动游戏。
+Powered by **FLTK** · **miniz** · **nlohmann/json**
 
-## 已知限制
+感谢 MCIM、BMCLAPI 提供的公共镜像服务。
 
-- 微软正版登录未实现
-- CurseForge 模组源需要 API Key，目前仅 Modrinth
-- Forge / NeoForge 依赖官方 installer，受网络影响
-- 第三方登录不做 token 续期
-- 皮肤需 CustomSkinLoader 才能在游戏内显示
+---
 
 ## 许可
 
-MIT。第三方组件：`json.hpp`（MIT, nlohmann）、`authlib-injector`（构建时自行提供）。
+[MIT](LICENSE)
+
+作者：**ShadowForgekin**

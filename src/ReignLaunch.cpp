@@ -1,16 +1,23 @@
 // ============================================================================
-//  MCLite - 自制 Minecraft 启动器（Win32 + C++17）
-//  单窗口多页面：启动 / 用户 / 设置
-//  - 第三方登录（Yggdrasil / authlib-injector，如 LittleSkin）
-//  - 设置全部在主窗口内，不弹新窗口
-//  - 日志不显示，只有游戏出错才弹错误窗口
-// ---------------------------------------------------------------------------
+//  ReignLaunch — Minecraft 启动器（FLTK 版，单文件源码）
+//
+//  从 Win32 GDI 版迁移而来，逻辑层与界面层合并在本文件内：
+//    · 逻辑层：下载 / 安装 / 启动 / 账户 / Java / 配置
+//    · 界面层：FLTK 1.4.5，6 个页面 + 沉浸式启动浮层
+//    · 解压：miniz 3.1.2（替代 tar.exe 子进程）
+//    · 中文：字体映射 + UTF-8 安全截断，修复乱码和半个汉字
+//
 //  编译：
-//    g++ -std=c++17 -O2 -mwindows -static ^
-//        -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE ^
-//        -o MCLite.exe MCLite.cpp ^
-//        -lcomctl32 -lole32 -lshell32 -lgdi32 -luuid -ladvapi32 -lwinhttp
+//    gcc -O2 -c miniz.c -o miniz.o
+//    windres res.rc -O coff -o res.o
+//    g++ -std=c++17 -O2 -mwindows -static -static-libgcc -static-libstdc++ \
+//        -finput-charset=UTF-8 -fexec-charset=UTF-8 -fwide-exec-charset=UTF-16LE \
+//        -I. -IFL -o ReignLaunch.exe ReignLaunch.cpp miniz.o res.o \
+//        -Wl,--start-group libfltk.a -Wl,--end-group \
+//        -lwinhttp -lshell32 -ladvapi32 -lole32 -luuid -lgdi32 -lcomctl32 \
+//        -loleaut32 -lshlwapi -lcomdlg32 -lgdiplus -lwinspool -lws2_32
 // ============================================================================
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
@@ -38,226 +45,1442 @@
 #include <vector>
 
 #include "json.hpp"
+#include <FL/Fl.H>
+#include <FL/Fl_Double_Window.H>
+#include <FL/Fl_Box.H>
+#include <FL/Fl_Button.H>
+#include <FL/Fl_Input.H>
+#include <FL/Fl_Choice.H>
+#include <FL/Fl_Window.H>
+#include <FL/Fl_Hold_Browser.H>
+#include <FL/Fl_Scroll.H>
+#include <FL/Fl_Group.H>
+#include <FL/fl_ask.H>
+#include <FL/Fl_Native_File_Chooser.H>
+#include <FL/fl_draw.H>
+#include <FL/x.H>   // fl_xid()
+
+#include "miniz.h"
+
+#include <memory>
+#include <cmath>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-#define IDR_AUTHLIB     101   // 内嵌的 authlib-injector.jar 资源 ID
-#define IDI_APP         100   // 应用图标
+// ============================================================================
+//  第一部分：类型与全局状态
+// ============================================================================
+#define IDR_AUTHLIB    101
+#define IDI_APP        100
 
 // ============================ 页面 ============================
-enum Page { PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2, PAGE_ABOUT = 3, PAGE_INSTANCES = 4, PAGE_DOWNLOAD = 5, PAGE_MODS = 6 };
+enum Page {
+    PAGE_LAUNCH = 0, PAGE_USER = 1, PAGE_SETTINGS = 2,
+    PAGE_ABOUT = 3, PAGE_INSTANCES = 4, PAGE_DOWNLOAD = 5, PAGE_MODS = 6
+};
 
 // ============================ 配置 ============================
 struct Account {
-    std::string type;    // offline / thirdparty
+    std::string type;    // offline / thirdparty / microsoft
     std::string name;
     std::string server;
     std::string token;
     std::string uuid;
     std::string skin;    // 该账户的皮肤 PNG
+    std::string refresh; // 微软账号的 refresh_token
 };
 
 struct Config {
     std::vector<Account> accounts;
     int activeAcc = -1;
     std::string gameDir;
-    std::string skinPath;   // 当前皮肤 PNG
+    std::string skinPath;
     int  isoMode = 0;
     int  dlThreads = 16;
-    std::string extraJvm;            // 追加的 JVM 参数
-    std::string extraGame;           // 追加的游戏参数
+    std::string extraJvm;
+    std::string extraGame;
     int  dlSource = 0;               // 0=自动 1=仅官方 2=仅镜像
-    int  winMode = 0;                // 0=窗口 1=最大化 2=全屏             // 下载线程数 1..128               // 版本隔离：0=隔离所有实例 1=仅模组实例 2=不隔离
+    int  winMode = 0;                // 0=窗口 1=最大化 2=全屏
     std::string javaPath;
     int         maxMemMB = 4096;
     std::string playerName = "Steve";
 
-    std::string authType = "offline";   // offline | thirdparty
-    std::string authServer;             // 如 https://littleskin.cn/api/yggdrasil
+    std::string authType = "offline";   // offline | thirdparty | microsoft
+    std::string authServer;
     std::string authToken;
     std::string authClientToken;
     std::string authName;
     std::string authUuid;
     std::string authlibPath;
-    // CurseForge 中转站与可选 Key
+
     std::string cfProxy  = "https://api.curse.tools/v1/cf";
     std::string cfApiKey;
+    std::string msClientId = "00000000402b5328";
 };
 
-static Config      g_cfg;
-static std::string g_dataDir;   // 配置/缓存目录
-static std::string g_cfgPath;
+// ============================ 路径安全包装 ============================
+// g_cfg.gameDir 为空时 fs::u8path("") 在部分 MinGW 版本会抛异常导致闪退。
+// 统一用这两个函数代替直接调用 u8path。
+static fs::path SafePath(const std::string& u8) {
+    if (u8.empty()) return fs::path();
+    return fs::u8path(u8);
+}
 
-static std::vector<std::string> g_versions;
-static int         g_selVersion = -1;
-static int         g_listScroll = 0;
-static Page        g_page = PAGE_LAUNCH;
-static bool        g_launching = false;
-static std::atomic<int> g_progState{ 0 };   // 0 空闲 1 补全 2 启动
-static std::atomic<int> g_progCur{ 0 };
-static std::atomic<int> g_progTotal{ 0 };
-static bool g_overlay = false;                       // 启动浮层
-static std::atomic<int>  g_stepCur{ 0 };             // 已完成步骤 0..4
-static std::atomic<bool> g_cancelLaunch{ false };
-static ULONG_PTR g_gpToken = 0;
-static bool      g_gpOk = false;
-static HBITMAP   g_skinBmp = nullptr;
-static DWORD g_overlayDoneTick = 0;   // 全部步骤完成的时刻，用于自动收起浮层
-static int         g_dpi = 96;
 
-static std::mutex               g_logMutex;
-static std::vector<std::string> g_logs;
+// ============================ 全局状态（逻辑侧）============================
 
-static HWND g_hwnd = nullptr;
-static HFONT g_fTitle = nullptr, g_fUi = nullptr, g_fSmall = nullptr;
+extern Config      g_cfg;
+extern std::string g_dataDir;
+extern std::string g_cfgPath;
 
-// ============================ 控件 ============================
-static HWND hBtnTabLaunch, hBtnTabUser, hBtnTabSettings, hBtnTabAbout, hBtnTabInst, hBtnTabDl, hBtnTabMods;
-static HWND hBtnLaunch, hBtnFill, hBtnRefresh, hBtnInstArrow, hBtnOverlayCancel;
-static std::string JavaVersionOf(const fs::path& javaw);
-static int RequiredJavaMajor(const std::string& id);
-static std::string PickJavaFor(int need);
-static RECT OverlayCardRect();
-static RECT OverlayCancelRect();
-static RECT DlTaskCardRect();
-static void ApplyOverlayVisibility();
+// g_cfg.gameDir 的安全版本（空字符串时返回空 path，不抛异常）
+static fs::path GameDirPath() { return SafePath(g_cfg.gameDir); }
 
-static HWND hLblServer, hEdServer, hLblUser, hEdUser, hLblPass, hEdPass;
-static HWND hBtnLogin, hBtnLogout, hBtnOffline, hBtnSkin, hBtnDelAcc;
+extern std::vector<std::string> g_versions;
+extern int         g_selVersion;
+extern Page        g_page;
+extern std::atomic<bool> g_launching;
+// 工作线程下载完成后不直接改 g_versions（会和 UI 线程遍历冲突），
+// 而是置这个标志，由 ui_tick 在 UI 线程里调 ScanVersions()。
+extern std::atomic<bool> g_needScanVersions;
 
-static HWND hLblDir, hEdDir, hBtnAutoDir, hBtnBrowseDir, hBtnDirDrop;
-static HWND hLblJava, hEdJava, hBtnAutoJava, hBtnBrowseJava, hBtnJavaDrop;
-static HWND hLblMem, hEdMem, hEdName, hLblName, hBtnSave, hBtnIso, hEdThreads, hEdJvm, hEdGame, hBtnSource, hBtnFull;
-static HWND hBtnUpdate, hBtnUserM0, hBtnUserM1, hBtnUserM2;
-static HWND hBtnModTabDl, hBtnModTabIn, hEdModSearch, hBtnModSource, hBtnModInstall, hBtnModToggle, hBtnModDelete;
-static HWND hBtnDlSecGame, hBtnDlSecMod, hBtnInstTabList, hBtnInstTabMod;
-static HWND hBtnDlVanilla, hBtnDlFabric, hBtnDlQuilt, hBtnDlForge, hBtnDlNeo;
-static HWND hBtnDlF0, hBtnDlF1, hBtnDlF2, hBtnDlF3, hEdSearch, hBtnDlBack, hBtnDlInstall, hBtnDlFapi, hBtnDlQsl, hBtnDlFilterSel, hBtnDlCancel;
+extern std::atomic<int>  g_progState;   // 0空闲 1补全 2启动
+extern std::atomic<int>  g_progCur;
+extern std::atomic<int>  g_progTotal;
+extern std::atomic<int>  g_stepCur;     // 已完成步骤 0..4
+extern std::atomic<bool> g_cancelLaunch;
 
-struct McVer { std::string id, type, url, date; };
-static std::vector<McVer> g_mcVers;
-static std::atomic<int>  g_mcVersState{ 0 };
-static int g_dlFilter = 0;                 // 0正式 1快照 2远古 3愚人节
-static std::vector<int> g_dlView;
-static int g_dlSel = -1;          // 过滤后的下标
-static bool g_dlDetail = false;   // 是否在详情页
-// 加载器可用性：0=查询中 1=有 2=没有
-static std::atomic<int> g_ldState[4] = { {0}, {0}, {0}, {0} };
-static std::wstring g_ldVer[4];
-static void FetchLoadersThread();
-static std::string g_dlDetailMc;
-static int g_dlLoader = 0;              // 0=原版 1=Fabric 2=Quilt 3=Forge 4=NeoForge
-static std::vector<std::string> g_ldVers;   // 当前加载器的可选版本
-static std::vector<std::string> g_ldFiles;  // 对应 mod 的下载地址（0/1/2/3/4 为空）
-static int g_ldSel = -1;
-static std::atomic<int> g_ldVersState{ 0 };
-static std::atomic<bool> g_dlBusy{ false };   // 正在下载/安装
-static std::atomic<bool> g_dlCancel{ false }; // 用户取消
-static int g_userMode = 0;   // 0=第三方 1=离线 2=微软
+extern DWORD        g_overlayDoneTick;
 
-// ---- 模组页 ----
-struct ModHit { std::string slug, title, desc; long long downloads = 0; };
-static std::vector<ModHit> g_modHits;
-static std::vector<std::string> g_modFiles;      // 已安装的模组文件名（mods 目录）
-static bool g_modDetail = false;
-static std::string g_modDetailSlug, g_modDetailTitle, g_modDetailDesc;
-static std::vector<std::string> g_modVerNames, g_modVerFiles;
-static std::atomic<int> g_modVerState{ 0 };
-static int g_modVerSel = -1;
-static std::atomic<int> g_modState{ 0 };         // 0未搜 1搜索中 2成功 3失败
-static std::atomic<bool> g_cfFallback{ false };  // CurseForge 镜像不可用，需提示并切回
-static bool FetchCurseForgeViaProxy(std::string query, std::string mcVersion);
-static int  g_modSel = -1;
-static int  g_modFileSel = -1;
-static int  g_modTab = 0;                        // 0=下载 1=已安装
-static int  g_modSource = 0;                     // 0=Modrinth 1=CurseForge
-static int  g_dlSection = 0;                     // 下载页：0=原版游戏 1=Mod下载
-static int  g_instTab = 0;                       // 实例页：0=版本列表 1=模组管理
-static void FetchModSearchThread(std::string q);
-static void RefreshInstalledMods();
-static std::string CurrentLoaderTag();
-static std::atomic<long long> g_dlBytes{ 0 };
-static std::wstring g_dlTarget;      // 例如 "26.3 Fabric"
-static long long g_dlLastBytes = 0;
-static DWORD     g_dlLastTick = 0;
-static double    g_dlSpeed = 0; // 0未取 1取中 2成功 3失败
-static std::atomic<int> g_ldGen{ 0 };
-static void FetchLoaderVersThread(int kind, int gen);
-static void RebuildDlView();
-static void FetchManifestThread();
-static bool IsAprilFools(const McVer& v);
-// ============================ 颜色 ============================
-static const COLORREF C_BG       = RGB(24, 25, 28);
-static const COLORREF C_INPUTBG  = RGB(36, 38, 42);
-static const COLORREF C_HEADER   = RGB(31, 33, 37);
-static const COLORREF C_CARD     = RGB(45, 48, 53);
-static const COLORREF C_CARD_SEL = RGB(58, 62, 70);
-static const COLORREF C_ACCENT   = RGB(37, 99, 235);
-static const COLORREF C_ACCENT2  = RGB(59, 130, 246);
-static const COLORREF C_TEXT     = RGB(232, 234, 237);
-static const COLORREF C_DIM      = RGB(150, 155, 162);
-static const COLORREF C_OK       = RGB(74, 222, 128);
-static const COLORREF C_ERR      = RGB(248, 113, 113);
+extern std::wstring g_status;           // 界面提示文字（UI 层负责显示）
 
-static HBRUSH g_brInput = nullptr;
+// 窗口句柄：核心逻辑用它 PostMessage 通知 UI。FLTK 版可设为 nullptr。
+extern HWND g_hwnd;
 
 // ============================ 消息 ============================
-#define WM_APP_DONE  (WM_APP + 1)
-#define WM_APP_ERROR (WM_APP + 2)
-#define WM_APP_NEEDJAVA (WM_APP + 9)
+#define WM_APP_DONE      (WM_APP + 1)
+#define WM_APP_ERROR     (WM_APP + 2)
+#define WM_APP_NEEDJAVA  (WM_APP + 9)
 #define WM_APP_UPD       (WM_APP + 11)
 #define WM_APP_SYNCUI    (WM_APP + 12)
 
-// ============================ 工具 ============================
-static std::wstring U8ToW(const std::string& s) {
+
+// 对外 API 见 core_api.h（需在 core_state.h 之后包含）
+
+
+// ============================================================================
+//  第二部分：共享数据结构
+// ============================================================================
+// ============================================================================
+//  core_state.h — ReignLaunch 逻辑层共享状态与数据结构
+//  被 core.h（对外）与 core.cpp（实现）共同包含
+// ============================================================================
+
+// ---------------- 版本清单 ----------------
+struct McVer {
+    std::string id, type, url, date;
+};
+
+// ---------------- 模组 ----------------
+struct ModHit { std::string slug, title, desc; long long downloads = 0; };
+
+// ---------------- 认证 ----------------
+struct AuthResult {
+    bool ok = false;
+    std::string err;
+    std::string accessToken, clientToken, uuid, name;
+};
+
+// ---------------- 启动 ----------------
+struct LaunchPlan {
+    std::wstring javaPath, commandLine, workDir;
+    int maxMem = 4096;
+};
+
+// ---------------- 下载 ----------------
+struct DownloadStats { int existed = 0, downloaded = 0, failed = 0; };
+struct DLTask { std::string url; fs::path dest; std::string label; std::string sha1; };
+
+// ---------------- Java 候选 ----------------
+struct Cand { std::string path; std::string label; };
+
+// ============================ 全局状态 ============================
+extern std::vector<McVer> g_mcVers;
+extern std::atomic<int>   g_mcVersState;
+extern int                g_dlFilter;
+extern std::vector<int>   g_dlView;
+extern int                g_dlSel;
+extern bool               g_dlDetail;
+extern std::string        g_dlDetailMc;
+
+extern std::atomic<int>   g_ldState[4];
+extern std::wstring       g_ldVer[4];
+extern int                g_dlLoader;
+extern std::vector<std::string> g_ldVers;
+extern std::vector<std::string> g_ldFiles;
+extern int                g_ldSel;
+extern std::atomic<int>   g_ldVersState;
+extern std::atomic<int>   g_ldGen;
+
+extern std::atomic<bool>  g_dlBusy;
+extern std::atomic<bool>  g_dlCancel;
+
+extern int                g_userMode;
+
+extern std::vector<ModHit>      g_modHits;
+extern std::mutex          g_modHitsMutex;   // 保护 g_modHits（后台线程写）
+extern std::vector<std::string> g_modFiles;
+extern bool               g_modDetail;
+extern std::string        g_modDetailSlug, g_modDetailTitle, g_modDetailDesc;
+extern std::vector<std::string> g_modVerNames, g_modVerFiles;
+extern std::mutex                g_modVerMutex;
+extern std::atomic<int>   g_modVerState;
+extern std::atomic<int>   g_modVerGen;   // 防止旧请求覆盖新结果
+extern int                g_modVerSel;
+extern std::atomic<int>   g_modState;
+extern std::atomic<int>   g_modGen;
+extern int                g_modRunGen;
+extern std::atomic<bool>  g_cfFallback;
+extern int                g_modSel;
+extern int                g_modFileSel;
+extern int                g_modTab;
+extern int                g_modSource;
+extern int                g_modCat;      // 0=Mod 1=整合包 2=数据包 3=资源包 4=光影包
+extern int                g_dlSection;
+extern int                g_instTab;
+
+extern std::vector<Cand>  g_dirCands, g_javaCands;
+
+// 下载进度（UI 读取）
+extern std::atomic<long long> g_dlBytes;
+extern std::wstring           g_dlTarget;
+extern long long              g_dlLastBytes;
+extern DWORD                  g_dlLastTick;
+extern double                 g_dlSpeed;
+
+// 游戏进程
+extern HANDLE             g_gameProc;
+extern std::atomic<DWORD> g_gamePid;
+
+// 列表滚动位置（UI 用，但放在这里共享）
+extern int g_listScroll;
+
+// 登录状态
+extern std::atomic<int> g_loginState;   // 0空闲 1进行中 2成功 3失败
+
+
+// ============================================================================
+//  第三部分：对外接口声明
+// ============================================================================
+// ============================================================================
+//  core_api.h — ReignLaunch 逻辑层对外接口
+//  使用前需先包含 core_state.h（提供 DLTask / DownloadStats / AuthResult 等类型）
+// ============================================================================
+
+// ============================ 对外 API ============================
+// 核心逻辑全部以普通函数导出，UI 层直接调用（无需 static）
+
+std::wstring U8ToW(const std::string& s);
+std::string  WToU8(const std::wstring& w);
+bool         FileExists(const fs::path& p);
+bool         DirExists(const fs::path& p);
+std::string  TrimSlash(std::string s);
+std::string  ExtractEmbeddedAuthlib();
+std::string  DetectAuthlib();
+std::string  DetectJava();
+std::string  DetectGameDir();
+
+void         Log(const std::string& s);
+std::string  LogTail(int n);
+
+void         SaveConfig();
+void         SaveConfig();
+void         LoadConfig();
+
+
+void         ScanVersions();
+json         ReadJsonFile(const fs::path& p);
+json         ResolveVersion(const std::string& id, int depth = 0);
+bool         RulesAllow(const json& rules);
+bool         ShouldIsolate(const std::string& id, const fs::path& mcDir);
+bool         IsModdedInstance(const std::string& id, const fs::path& mcDir);
+
+bool         ExtractZip(const fs::path& zip, const fs::path& outDir);
+std::string  Sha1Hex(const std::vector<unsigned char>& data);
+std::string  Sha1OfFile(const fs::path& p);
+std::string  ToMirror(std::string url);
+bool         HttpRequest(const std::string& urlU8, const std::string& method,
+                         const std::string& body, const std::string& contentType,
+                         std::vector<unsigned char>& out, std::string& err);
+bool         DownloadFile(const std::string& url, const fs::path& dest, std::string& err);
+void         RunDownloads(std::vector<DLTask>& tasks, DownloadStats& st, int threads = 0);
+void         DownloadMissing(const std::string& versionId, DownloadStats& st);
+int          CountMissing(const std::string& versionId);
+
+AuthResult   YggdrasilLogin(const std::string& serverRaw, const std::string& user, const std::string& pass);
+std::string  OfflineUUID(const std::string& name);
+int          UpsertAccount(const std::string& type, const std::string& name,
+                           const std::string& server = "", const std::string& token = "",
+                           const std::string& uuid = "");
+std::string  CurrentPlayerName();
+void         CaptureActiveAccount();
+
+std::string  JavaVersionOf(const fs::path& javaw);
+int          RequiredJavaMajor(const std::string& id);
+std::string  PickJavaFor(int need);
+bool         InstallJava(int need);
+fs::path     FindJavaIn(const fs::path& root);
+void         RefreshJavaCands();
+void         RefreshDirCands();
+
+bool         BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std::string& error);
+
+// 启动（在工作线程里调用）
+void         InstallVersionThread(std::string id, std::string url);  // 安装版本
+void         FetchManifestThread();                                  // 拉取版本清单
+void         FetchLoaderVersThread(int kind, int gen);               // 拉取加载器版本
+void         InstallMetaLoaderThread(std::string mc, bool quilt, std::string wantVer);   // Fabric/Quilt
+void         InstallInstallerThread(std::string mc, bool neo, std::string wantVer);      // Forge/NeoForge
+void         LaunchThread(std::string versionId);      // 实际启动线程
+void         MicrosoftLoginThread();                   // 微软登录线程
+void         LaunchGame(std::string versionId);
+void         MicrosoftLoginSimple();      // 微软设备码登录
+
+// 账户操作（由 core_extra.cpp 提供）
+void         CreateOfflineAccount(const std::string& name);
+bool         ThirdPartyLogin(const std::string& server, const std::string& user,
+                             const std::string& pass, std::string& err);
+void         SelectAccount(int idx);
+void         RemoveAccount(int idx);
+
+// 杂项
+void         ReloadVersions();
+void         SetGameDir(const std::string& dir);
+
+
+// 模组
+fs::path     InstanceModsDir();
+std::string  CurrentMcVersion();
+std::string  CurrentLoaderTag();
+void         RefreshInstalledMods();
+fs::path     ModsDirOf(const std::string& versionId);
+std::vector<std::string> ListModsOf(const std::string& versionId);
+void         ToggleModIn(const std::string& versionId, const std::string& fileName, std::string& err);
+bool         DeleteModIn(const std::string& versionId, const std::string& fileName, std::string& err);
+
+void         ToggleMod(const std::string& fileName, std::string& err);
+bool         DeleteMod(const std::string& fileName, std::string& err);
+
+// ============================================================================
+//  第四部分：界面主题（配色 / 中文修复 / 绘制辅助）
+// ============================================================================
+// ============================================================================
+//  ui_theme.h — FLTK 主题（配色与原 Win32 版一致）+ 中文字体修复
+// ============================================================================
+
+// 配色（与 Win32 版 C_* 一一对应）
+inline Fl_Color clr_sidebar() { return fl_rgb_color(30, 31, 35); }   // 侧边栏底色
+inline Fl_Color clr_bg()       { return fl_rgb_color(24, 25, 28); }   // C_BG
+inline Fl_Color clr_inputbg()  { return fl_rgb_color(36, 38, 42); }   // C_INPUTBG
+inline Fl_Color clr_header()   { return fl_rgb_color(31, 33, 37); }   // C_HEADER
+inline Fl_Color clr_card()     { return fl_rgb_color(45, 48, 53); }   // C_CARD
+inline Fl_Color clr_card_sel() { return fl_rgb_color(58, 62, 70); }   // C_CARD_SEL
+inline Fl_Color clr_accent()   { return fl_rgb_color(37, 99, 235); }  // C_ACCENT
+inline Fl_Color clr_accent2()  { return fl_rgb_color(59, 130, 246); } // C_ACCENT2
+inline Fl_Color clr_text()     { return fl_rgb_color(232, 234, 237); }// C_TEXT
+inline Fl_Color clr_dim()      { return fl_rgb_color(150, 155, 162); }// C_DIM
+inline Fl_Color clr_ok()       { return fl_rgb_color(74, 222, 128); } // C_OK
+inline Fl_Color clr_err()      { return fl_rgb_color(248, 113, 113); }// C_ERR
+
+// ============================================================================
+//  中文字体修复
+//
+//  问题根因：FLTK 默认用 FL_HELVETICA（Arial）绘制，Arial 不含汉字，
+//  Windows GDI 会回退到别的字体，但 fl_width() 仍按半角算宽度。
+//  结果：中文被裁成半个字，显示成 "?"（这就是"乱码没显示完全"）。
+//
+//  修法：把 FL_HELVETICA 槽位重映射到系统自带的中文字体。
+// ============================================================================
+inline void setup_cjk_fonts() {
+    // 按优先级尝试（Win10/11 前两个一定存在）
+    const char* candidates[] = {
+        "Microsoft YaHei UI",
+        "Microsoft YaHei",
+        "SimHei",
+        "SimSun",
+        "Noto Sans CJK SC",
+    };
+
+    auto try_font = [](Fl_Font slot, const char* name) -> bool {
+        Fl::set_font(slot, name);
+        int attrs = 0;
+        const char* got = Fl::get_font_name(slot, &attrs);
+        if (!got) return false;
+        // 名字能对上才算成功（FLTK 对不存在的字体静默保留旧名）
+        return std::string(got).find(name) != std::string::npos ||
+               std::string(name).find(got) != std::string::npos;
+    };
+
+    Fl_Font slots[4] = { FL_HELVETICA, FL_HELVETICA_BOLD,
+                         FL_HELVETICA_ITALIC, FL_HELVETICA_BOLD_ITALIC };
+    for (Fl_Font slot : slots) {
+        for (const char* name : candidates) {
+            if (try_font(slot, name)) break;
+        }
+    }
+    // 等宽字体槽（日志之类）
+    Fl::set_font(FL_COURIER, "Consolas");
+    Fl::set_font(FL_SCREEN,  "Consolas");
+}
+
+// ============================================================================
+//  绘制辅助
+// ============================================================================
+inline void fill_round_rect(int x, int y, int w, int h, int r, Fl_Color c) {
+    if (w <= 0 || h <= 0) return;
+    if (r * 2 > w) r = w / 2;
+    if (r * 2 > h) r = h / 2;
+    fl_color(c);
+    if (r <= 0) { fl_rectf(x, y, w, h); return; }
+
+    // 主体十字（不留缝）
+    fl_rectf(x + r, y, w - r * 2, h);
+    fl_rectf(x, y + r, r, h - r * 2);
+    fl_rectf(x + w - r, y + r, r, h - r * 2);
+
+    // 四角用 fl_pie 填充（已验证可靠）
+    int d = r * 2;
+    fl_pie(x,           y,           d, d,  90, 180);   // 左上
+    fl_pie(x + w - d,   y,           d, d,   0,  90);   // 右上
+    fl_pie(x + w - d,   y + h - d,   d, d, 270, 360);   // 右下
+    fl_pie(x,           y + h - d,   d, d, 180, 270);   // 左下
+}
+
+inline void stroke_round_rect(int x, int y, int w, int h, int r, Fl_Color c) {
+    fl_color(c);
+    fl_line_style(FL_SOLID, 1);
+    fl_arc(x, y, r * 2, r * 2, 90, 180);
+    fl_arc(x + w - r * 2, y, r * 2, r * 2, 270, 360);
+    fl_arc(x + w - r * 2, y + h - r * 2, r * 2, r * 2, 0, 90);
+    fl_arc(x, y + h - r * 2, r * 2, r * 2, 180, 270);
+    fl_line(x + r, y, x + w - r, y);
+    fl_line(x + w, y + r, x + w, y + h - r);
+    fl_line(x + r, y + h, x + w - r, y + h);
+    fl_line(x, y + r, x, y + h - r);
+    fl_line_style(0, 0);
+}
+
+// ---- UTF-8 字符宽度工具 ----
+inline size_t utf8_char_len(unsigned char c) {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;   // 非法字节按 1 处理
+}
+
+// 按「完整字符」截断到指定像素宽度，超出补省略号
+inline std::string utf8_ellipsize(const std::string& s, int pt, int maxW) {
+    fl_font(FL_HELVETICA, pt);
+    if (maxW <= 0) return "";
+    if ((int)fl_width(s.c_str()) <= maxW) return s;
+
+    int ellW = (int)fl_width("...");
+    int budget = maxW - ellW;
+    if (budget <= 0) return "";
+
+    std::string out;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t len = utf8_char_len((unsigned char)s[i]);
+        if (i + len > s.size()) break;
+        std::string next = out + s.substr(i, len);
+        if ((int)fl_width(next.c_str()) > budget) break;
+        out = next;
+        i += len;
+    }
+    return out.empty() ? "" : (out + "...");
+}
+
+// 单行文字：垂直居中；宽度够就整行画，不够就按完整字符截断
+inline void draw_text(int x, int y, int w, int h, const char* s, Fl_Color c, int pt = 15) {
+    if (!s || !*s || w <= 0 || h <= 0) return;
+    fl_font(FL_HELVETICA, pt);
+    std::string src(s);
+    std::string out = ((int)fl_width(s) <= w) ? src : utf8_ellipsize(src, pt, w);
+    if (out.empty()) return;
+    fl_color(c);
+    // 基线 = 区域顶部 + (高度 + 行高)/2 - descent，保证视觉垂直居中
+    int by = y + (h + fl_height()) / 2 - fl_descent();
+    fl_draw(out.c_str(), x, by);
+}
+
+inline void draw_text(int x, int y, int w, int h, const std::string& s, Fl_Color c, int pt = 15) {
+    draw_text(x, y, w, h, s.c_str(), c, pt);
+}
+
+// 右对齐版本（列表里的日期列用）
+inline void draw_text_right(int x, int y, int w, int h, const std::string& s, Fl_Color c, int pt = 15) {
+    if (s.empty() || w <= 0 || h <= 0) return;
+    fl_font(FL_HELVETICA, pt);
+    std::string cut = utf8_ellipsize(s, pt, w);
+    if (cut.empty()) return;
+    fl_color(c);
+    int tw = (int)fl_width(cut.c_str());
+    int by = y + (h + fl_height()) / 2 - fl_descent();
+    fl_draw(cut.c_str(), x + w - tw, by);
+}
+
+// 居中版本（按钮文字都走这里）
+inline void draw_text_center(int x, int y, int w, int h, const std::string& s, Fl_Color c, int pt = 15) {
+    if (s.empty() || w <= 0 || h <= 0) return;
+    fl_font(FL_HELVETICA, pt);
+    std::string cut = utf8_ellipsize(s, pt, w);
+    if (cut.empty()) return;
+    fl_color(c);
+    int tw = (int)fl_width(cut.c_str());
+    int bx = x + (w - tw) / 2;
+    int by = y + (h + fl_height()) / 2 - fl_descent();
+    fl_draw(cut.c_str(), bx, by);
+}
+
+// wstring → UTF-8
+inline std::string w2u(const std::wstring& w) {
+    if (w.empty()) return {};
+    int n = (int)w.size() * 4 + 4;
+    std::string out(n, '\0');
+    int r = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0], n, nullptr, nullptr);
+    out.resize(r > 0 ? (size_t)r : 0);
+    return out;
+}
+
+inline void draw_text(int x, int y, int w, int h, const std::wstring& s, Fl_Color c, int pt = 15) {
+    draw_text(x, y, w, h, w2u(s), c, pt);
+}
+
+// ============================================================================
+//  应用全局深色主题 + 中文字体
+// ============================================================================
+inline void apply_theme() {
+    Fl::scheme(nullptr);
+    Fl::background(24, 25, 28);
+    Fl::background2(36, 38, 42);
+    Fl::foreground(232, 234, 237);
+    Fl::set_color(FL_SELECTION_COLOR, 37, 99, 235);
+    setup_cjk_fonts();
+}
+
+
+// ============================================================================
+//  第五部分：可复用滚动列表
+// ============================================================================
+class RowList : public Fl_Widget {
+public:
+    using Drawer = std::function<void(RowList*, int, int, int, int, int, bool)>;
+    bool ignored = false;   // true 时完全不绘制、不响应
+
+    RowList(int X, int Y, int W, int H, const char* L = nullptr)
+        : Fl_Widget(X, Y, W, H, L) {
+        box(FL_NO_BOX);
+        color(clr_bg());
+    }
+
+    void setRowHeight(int h) { rowH_ = h; redraw(); }
+    int  rowHeight() const { return rowH_; }
+    void setDrawer(Drawer d) { drawer_ = std::move(d); redraw(); }
+    void setMergeBottom(int px) { mergeBottom_ = px; }
+
+    int count() const { return (int)rows_.size(); }
+    int value() const { return sel_; }
+    void value(int i) { sel_ = i; redraw(); }
+    void clear() { rows_.clear(); sel_ = -1; scroll_ = 0; redraw(); }
+
+    void add(const std::string& text, const std::string& sub = {}) {
+        rows_.push_back({ text, sub });
+    }
+    const std::string& label(int i) const {
+        static const std::string empty;
+        return (i >= 0 && i < (int)rows_.size()) ? rows_[i].first : empty;
+    }
+    const std::string& sub(int i) const {
+        static const std::string empty;
+        return (i >= 0 && i < (int)rows_.size()) ? rows_[i].second : empty;
+    }
+
+    int scroll() const { return scroll_; }
+    void scroll(int v) { scroll_ = v; clampScroll(); redraw(); }
+
+    void draw() override {
+        if (ignored) return;
+        fl_push_clip(x(), y(), w(), h());
+        fill_round_rect(x(), y(), w(), h(), 0, color());
+
+        int top = y();
+        int bot = y() + h();
+        int yy = top - scroll_;
+
+        for (int i = 0; i < (int)rows_.size(); ++i) {
+            if (yy + rowH_ > top && yy < bot) {
+                bool sel = (i == sel_);
+                if (drawer_) {
+                    drawer_(this, i, x(), yy, w(), rowH_, sel);
+                } else {
+                    // 默认样式
+                    fill_round_rect(x(), yy + 4, w(), rowH_ - 8, 8,
+                                    sel ? clr_card_sel() : clr_card());
+                    if (sel) fill_round_rect(x() + 2, yy + 12, 3, rowH_ - 24, 0, clr_accent2());
+                    draw_text(x() + 18, yy + 4, w() - 36, rowH_ - 8,
+                              rows_[i].first.c_str(),
+                              sel ? clr_text() : clr_dim(), 15);
+                }
+            }
+            yy += rowH_;
+        }
+
+        fl_pop_clip();
+    }
+
+    int handle(int e) override {
+        if (ignored) return 0;
+        switch (e) {
+        case FL_PUSH: {
+            // 按 FLTK 官方文档：PUSH 只记录状态，RELEASE 才触发回调
+            // （回调里可能切页/清空本控件，PUSH 里触发会导致后续 RELEASE 访问野指针）
+            pressed_ = -1;
+            if (Fl::event_button() == FL_LEFT_MOUSE) {
+                int idx = hit(Fl::event_y());
+                if (idx >= 0) {
+                    pressed_ = idx;
+                    if (sel_ != idx) { sel_ = idx; redraw(); }
+                }
+            }
+            return 1;
+        }
+        case FL_RELEASE: {
+            if (pressed_ >= 0) {
+                int idx = pressed_;
+                pressed_ = -1;
+                // 确认鼠标还在同一行内
+                if (hit(Fl::event_y()) == idx) {
+                    do_callback();   // ★ 回调之后不能再访问任何成员
+                    return 1;
+                }
+            }
+            return 1;
+        }
+        case FL_DRAG:
+            return 1;
+        case FL_MOUSEWHEEL: {
+            int maxS = maxScroll();
+            if (maxS <= 0) return 1;
+            scroll_ += Fl::event_dy() * rowH_;
+            clampScroll();
+            redraw();
+            return 1;
+        }
+        case FL_ENTER:
+            return 1;
+        }
+        return Fl_Widget::handle(e);
+    }
+
+private:
+    struct Row { std::string first, second; };
+    std::vector<Row> rows_;
+    Drawer drawer_;
+    int sel_ = -1;
+    int pressed_ = -1;   // 按下时的行号（FL_RELEASE 时触发回调）
+    int scroll_ = 0;
+    int rowH_ = 52;
+    int mergeBottom_ = 0;
+
+    int visibleH() const { return h() - mergeBottom_; }
+
+    int maxScroll() const {
+        int contentH = (int)rows_.size() * rowH_;
+        int v = visibleH();
+        return contentH > v ? contentH - v : 0;
+    }
+
+    void clampScroll() {
+        int m = maxScroll();
+        if (scroll_ < 0) scroll_ = 0;
+        if (scroll_ > m) scroll_ = m;
+    }
+
+    int hit(int py) const {
+        int rel = py - y() + scroll_;
+        if (rel < 0) return -1;
+        int idx = rel / rowH_;
+        return (idx >= 0 && idx < (int)rows_.size()) ? idx : -1;
+    }
+};
+
+
+// ============================================================================
+//  第六部分：沉浸式启动浮层
+// ============================================================================
+// clr_* / fill_round_rect / stroke_round_rect / draw_text / w2u
+
+// ============================================================================
+//  OverlayRoot — 浮层底下的「真透明」占位
+//
+//  被放在父窗口的第一个子控件、位置 (0,0)、尺寸等于父区域。FLTK 的叠加层会先画它
+//  （半透明遮罩色），再画浮层，这就是真半透明。其余子控件仍由父窗口正常裁剪，
+//  不受影响。
+// ============================================================================
+class OverlayRoot : public Fl_Widget {
+public:
+    explicit OverlayRoot(int X = 0, int Y = 0, const char* L = nullptr)
+        : Fl_Widget(X, Y, 1, 1, L) {
+        box(FL_NO_BOX);
+        // 叠加层里 alpha 会被门限到 [0.05, 0.95]，所以这里画实色，由 gui_alpha 控制浓淡。
+        color(fl_rgb_color(18, 19, 22));
+    }
+
+    void draw() override {
+        fl_color(color());
+        fl_rectf(x(), y(), w(), h());
+    }
+
+    int handle(int) override { return 0; }
+};
+
+// ============================================================================
+//  Overlay
+// ============================================================================
+class Overlay : public Fl_Widget {
+public:
+    // ---- 几何常量 ----
+    static const int CARD_W = 560;    // 卡片宽
+    static const int CARD_H = 200;    // 卡片高
+    static const int CARD_R = 12;     // 圆角
+    static const int BTN_W  = 88;     // 按钮宽
+    static const int BTN_H  = 28;     // 按钮高
+
+    // ---- 回调 ----
+    std::function<void()> onCancel;   // 点「取消」
+    std::function<void()> onFinish;   // 点「关闭」
+    std::function<void()> onClose;    // 浮层被关闭（按钮或 hide()）时调用
+
+    // ================================================================ 构造
+    explicit Overlay(int X = 0, int Y = 0, int W = 0, int H = 0,
+                     const char* L = nullptr)
+        : Fl_Widget(X, Y, W, H, L) {
+        box(FL_NO_BOX);
+        color(clr_bg());
+        align(FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
+        vis_ = 0;                    // 自己的标志，不碰 Fl_Widget::visible()
+        done_.store(0);
+        for (int i = 0; i < 4; ++i) stepDone_[i].store(0);
+        if (W > 0 && H > 0) set_bounds(X, Y, W, H);
+    }
+
+    ~Overlay() override {
+        leave_all();
+        detach_root();
+        if (parent()) parent()->remove(*this);
+        clear_transparent_host();
+    }
+
+    // ================================================================ 显示
+    // ================================ 下载模式 ================================
+    // 用于「下载并安装」时显示：文件数进度 + 下载速度 + 已下载量
+    bool dlMode_ = false;
+    long long dlLastBytes_ = 0;
+    long long dlSpeed_ = 0;          // 字节/秒
+    int       dlTick_ = 0;
+
+    void showDownload(const std::string& name) {
+        show(name);
+        dlMode_ = true;
+        dlLastBytes_ = 0;
+        dlSpeed_ = 0;
+        dlTick_ = 0;
+        redrawHost();
+    }
+
+    void setDownloadDone() {
+        dlMode_ = false;
+        setDone();
+    }
+
+    // 每帧更新速度（由 tick_cb 调用）
+    void updateSpeed() {
+        if (!dlMode_) return;
+        ++dlTick_;
+        if (dlTick_ % 6 == 0) {   // 60fps 下约每 100ms 采样一次
+            long long now = g_dlBytes.load();
+            long long delta = now - dlLastBytes_;
+            if (delta < 0) delta = 0;
+            dlLastBytes_ = now;
+            // 平滑：新值占 60%
+            dlSpeed_ = (dlSpeed_ * 4 + delta * 6) / 10;
+        }
+    }
+
+    static std::string fmtSize(long long b) {
+        char buf[48];
+        if (b >= 1073741824LL)      std::snprintf(buf, sizeof(buf), "%.2f GB", b / 1073741824.0);
+        else if (b >= 1048576LL)    std::snprintf(buf, sizeof(buf), "%.1f MB", b / 1048576.0);
+        else if (b >= 1024LL)       std::snprintf(buf, sizeof(buf), "%.0f KB", b / 1024.0);
+        else                        std::snprintf(buf, sizeof(buf), "%lld B", b);
+        return buf;
+    }
+
+    void show(const std::string& versionName) {
+        Fl_Group* pg = parent();
+        if (!pg) {                          // 没挂父窗口：挂到第一个窗口上
+            Fl_Window* w = Fl::first_window();
+            if (!w) return;
+            w->add(this);
+            pg = w;
+        }
+        suppress_transparent_host();
+
+        version_   = versionName;
+        done_.store(0);
+        press_     = 0;
+        baseStep_  = clampStep(g_stepCur.load());
+        for (int i = 0; i < 4; ++i) stepDone_[i].store(baseStep_ > i ? 1 : 0);
+
+        vis_ = 1;
+        Fl_Widget::show();
+        fit_to(pg);
+        start_anim();
+        redrawHost();
+    }
+
+    // ================================================================ 隐藏
+    void hide() {
+        if (!vis_) return;
+        vis_   = 0;
+        press_ = 0;
+        leave_all();
+        Fl_Widget::hide();
+        detach_root();
+        clear_transparent_host();
+        redrawHost();
+        auto cb = onClose;
+        if (cb) cb();
+    }
+
+    bool visible() const { return vis_ != 0; }
+
+    // ================================================================ 完成
+    // 标记完成：四步全部画绿、按钮从「取消」变「关闭」
+    void setDone() {
+        done_.store(1);
+        baseStep_ = 4;
+        for (int i = 0; i < 4; ++i) stepDone_[i].store(1);
+        redrawHost();
+    }
+
+    bool done() const { return done_.load() != 0; }
+
+    // ---- 额外的小工具 ----
+    void setVersion(const std::string& v) { version_ = v; redrawHost(); }
+    const std::string& version() const { return version_; }
+
+    // 手动把已完成的步骤标为 n（0..4），仍保持「进行中」
+    void setStep(int n) {
+        int s = clampStep(n);
+        baseStep_ = s;
+        for (int i = 0; i < 4; ++i)
+            if (s > i) stepDone_[i].store(1);
+        redrawHost();
+    }
+
+    // ================================================================ 绘制
+    void draw() override {
+        if (!vis_) return;
+        if (!cardValid_) set_bounds(x(), y(), w(), h());
+
+        int bx = 0, by = 0, bw = 0, bh = 0;
+        button_rect(bx, by, bw, bh);
+
+        // ---------- 1. 遮罩 ----------
+        // 有 OverlayRoot 时由叠加层负责；退化模式自己画实色遮罩
+        if (!root_) {
+            fl_color(fl_rgb_color(18, 19, 22));
+            fl_rectf(x(), y(), w(), h());
+        }
+
+        // ---------- 2. 卡片 ----------
+        draw_shadow();
+        fill_round_rect(card_.x, card_.y, card_.w, card_.h, CARD_R, clr_card());
+        stroke_round_rect(card_.x, card_.y, card_.w, card_.h, CARD_R,
+                          fl_rgb_color(62, 66, 74));
+
+        // ---------- 3. 标题 ----------
+        const int L  = card_.x + 24;
+        const int IW = card_.w - 48;
+        std::string title = dlMode_ ? ("正在下载 " + version_ + " …")
+                                       : (version_.empty() ? std::string("正在启动 …")
+                                                          : ("正在启动 " + version_ + " …"));
+
+        // ---------- 4. 底部：进度条 / 百分比 / 状态 ----------
+        const long long cur = g_progCur.load();
+        const long long tot = g_progTotal.load();
+        double ratio = 0.0;
+        const bool showBar = (tot > 0);
+        if (showBar) ratio = (double)cur / (double)tot;
+        if (ratio < 0.0) ratio = 0.0;
+        if (ratio > 1.0) ratio = 1.0;
+
+        const int barX = L, barW = IW, barY = card_.y + card_.h - 40;
+        fill_round_rect(barX, barY, barW, 5, 2, fl_rgb_color(66, 71, 78));
+        if (showBar && ratio > 0.0) {
+            int fw = (int)std::lround(barW * ratio);
+            if (fw < 5) fw = 5;
+            fill_round_rect(barX, barY, fw, 5, 2, clr_accent2());
+        } else if (!showBar && !done_.load()) {
+            // 没有总量时画一段流动的虚光，表示「还在动」
+            int phase = (frame_ / 3) % (barW + 120) - 60;
+            int sx = barX + std::max(0, phase);
+            int ex = std::min(barX + barW, sx + 60);
+            if (ex > sx) fill_round_rect(sx, barY, ex - sx, 5, 2, fl_rgb_color(84, 92, 104));
+        }
+
+        if (showBar) {
+            char pc[32];
+            std::snprintf(pc, sizeof(pc), "%d%%", (int)std::lround(ratio * 100.0));
+            draw_text(barX + barW - 52, barY - 6, 52, 18, pc, clr_text(), 12);
+
+            // 下载模式：显示文件数 + 速度 + 已下载字节
+            if (dlMode_) {
+                long long bytes = g_dlBytes.load();
+                std::string info = std::to_string(cur) + " / " + std::to_string(tot) + " 个文件";
+                if (bytes > 0) info += "    ·    " + fmtSize(bytes);
+                // 速度用 B/s 转成 KB/s 或 MB/s
+                long long sp = dlSpeed_ * 6;   // 100ms 采样 → 每秒
+                if (sp > 0) info += "  (" + fmtSize(sp) + "/s)";
+                draw_text(barX, barY - 6, barW - 60, 18, info, clr_dim(), 11);
+            }
+        }
+
+        // 状态文字：g_status 是 std::wstring，交给 ui_theme.h 的 w2u() 转 UTF-8
+        std::string st8;
+        {
+            std::lock_guard<std::mutex> lk(status_mtx());
+            st8 = w2u(g_status);
+        }
+        if (st8.empty()) st8 = done_.load() ? "启动完成" : "正在准备启动…";
+        draw_text(L, card_.y + card_.h - 26, IW - 104, 18, st8,
+                  done_.load() ? clr_ok() : clr_dim(), 12);
+
+        // ---------- 5. 四步 ----------
+        static const char* kNames[4] = {
+            "检测 Java 版本", "处理游戏依赖", "登录", "等待游戏启动"
+        };
+        const int stepTop = card_.y + 42;
+        const int rowH    = (card_.y + card_.h - 34 - stepTop) / 4;
+        const bool finished = done_.load() != 0;
+
+        for (int i = 0; i < 4; ++i) {
+            const int ry = stepTop + i * rowH;
+            const int iy = ry + (rowH - 16) / 2;
+            const bool fin    = stepDone_[i].load() != 0;
+            const bool active = !fin && !finished && (baseStep_ <= i);
+
+            // 图标
+            if (fin) {
+                fill_round_rect(L, iy, 16, 16, 8, clr_ok());
+                fl_color(fl_rgb_color(20, 22, 25));
+                fl_font(FL_HELVETICA_BOLD, 11);
+                fl_draw("\xE2\x9C\x93", L, iy, 16, 16, FL_ALIGN_CENTER | FL_ALIGN_INSIDE);   // UTF-8 "✓"
+            } else if (active) {
+                draw_spinner(L + 8.0, iy + 8.0, 7.0);
+            } else {
+                // 未开始：空心灰圈，文字为灰色
+                stroke_round_rect(L, iy, 16, 16, 8, fl_rgb_color(92, 98, 106));
+            }
+
+            // 文字
+            Fl_Color tc = fin ? clr_dim()
+                              : (active ? clr_text() : fl_rgb_color(118, 124, 132));
+            draw_text(L + 28, ry, IW - 160, rowH, kNames[i], tc, 14);
+
+            // 行尾状态
+            if (fin)         draw_text(card_.x + card_.w - 152, ry, 128, rowH, "完成",   clr_ok(), 12);
+            else if (active) draw_text(card_.x + card_.w - 152, ry, 128, rowH, "进行中…", clr_dim(), 12);
+        }
+
+        // ---------- 6. 按钮 ----------
+        draw_button(bx, by, bw, bh);
+    }
+
+    // ================================================================ 事件
+    int handle(int e) override {
+        if (!vis_) return 0;
+
+        int bx = 0, by = 0, bw = 0, bh = 0;
+        button_rect(bx, by, bw, bh);
+        const bool hot = hit(bx, by, bw, bh);
+
+        switch (e) {
+        case FL_ENTER:
+        case FL_MOVE:
+            if (hot && press_ == 0)       { press_ = 1; redrawHost(); }
+            else if (!hot && press_ == 1) { press_ = 0; redrawHost(); }
+            return 1;
+        case FL_LEAVE:
+            if (press_ == 1) { press_ = 0; redrawHost(); }
+            return 1;
+        case FL_PUSH:
+            press_ = hot ? 2 : 0;
+            redrawHost();
+            return 1;
+        case FL_RELEASE: {
+            int was = press_;
+            press_ = hot ? 1 : 0;
+            redrawHost();
+            if (was == 2 && hot) fire();
+            return 1;
+        }
+        case FL_DRAG:
+            return 1;                    // 进行中不响应窗口拖动
+        case FL_SHORTCUT:
+            if (Fl::event_key() == FL_Escape) {
+                if (done_.load()) fire();
+                return 1;
+            }
+            return 1;
+        default:
+            return 1;                    // 吞掉全部事件，避免穿透到底下的界面
+        }
+    }
+
+    void resize(int X, int Y, int W, int H) override {
+        Fl_Widget::resize(X, Y, W, H);
+        if (vis_) fit_to(parent());
+        else     set_bounds(X, Y, W, H);
+    }
+
+private:
+    // ---------------------------------------------------------------- 数据
+    struct Rect { int x = 0, y = 0, w = 0, h = 0; };
+
+    Rect         card_;
+    std::string  version_;
+    Fl_Group*    host_    = nullptr;   // 浮层所在的组（父区域）
+    OverlayRoot* root_    = nullptr;   // 半透明占位
+    Fl_Window*   alphaHost_ = nullptr; // 被临时改回不透明的窗口
+    int          savedAlpha_ = 0;
+    bool         cardValid_  = false;
+    int          press_      = 0;      // 0 普通 / 1 悬停 / 2 按下
+    int          baseStep_   = 0;
+    int          animOn_     = 0;
+    int          frame_      = 0;      // 静态帧计数（UI 线程写）
+
+    std::atomic<int> vis_{ 0 };
+    std::atomic<int> done_{ 0 };
+    std::atomic<int> stepDone_[4] = {};// 每步是否已完成
+
+    static std::mutex& status_mtx() {
+        static std::mutex m;
+        return m;
+    }
+
+    // ---------------------------------------------------------------- 父区域
+    void fit_to(Fl_Group* pg) {
+        if (!pg || (Fl_Widget*)pg == (Fl_Widget*)this) return;
+        OverlayRoot* r = find_root(pg);
+        if (!r) {
+            r = new OverlayRoot(pg->x(), pg->y());
+            pg->insert(*r, 0);           // 第一个子控件 → 叠底层
+        }
+        r->position(pg->x(), pg->y());
+        r->size(pg->w(), pg->h());
+        r->show();
+
+        root_ = r;
+        host_ = pg;
+        Fl_Widget::resize(pg->x(), pg->y(), pg->w(), pg->h());
+        set_bounds(pg->x(), pg->y(), pg->w(), pg->h());
+        pg->init_sizes();
+    }
+
+    static OverlayRoot* find_root(Fl_Group* g) {
+        if (!g) return nullptr;
+        for (int i = 0; i < g->children(); ++i) {
+            OverlayRoot* r = dynamic_cast<OverlayRoot*>(g->child(i));
+            if (r) return r;
+        }
+        return nullptr;
+    }
+
+    void detach_root() {
+        if (root_) {
+            root_->hide();
+            if (root_->parent()) root_->parent()->remove(*root_);
+            root_ = nullptr;
+        }
+        host_ = nullptr;
+    }
+
+    // 中央卡片：560x200，父区域放不下时收缩
+    void set_bounds(int X, int Y, int W, int H) {
+        card_.w = (W >= CARD_W + 32) ? CARD_W : (W > 64 ? W - 32 : W);
+        card_.h = (H >= CARD_H + 32) ? CARD_H : (H > 64 ? H - 32 : H);
+        card_.x = X + (W - card_.w) / 2;
+        card_.y = Y + (H - card_.h) / 2;
+        cardValid_ = true;
+    }
+
+    void button_rect(int& bx, int& by, int& bw, int& bh) const {
+        bw = BTN_W;
+        bh = BTN_H;
+        bx = card_.x + card_.w - 24 - bw;
+        by = card_.y + card_.h - 35;
+    }
+
+    static bool hit(int bx, int by, int bw, int bh) {
+        int ex = Fl::event_x(), ey = Fl::event_y();
+        return ex >= bx && ex < bx + bw && ey >= by && ey < by + bh;
+    }
+
+    // ---------------------------------------------------------------- 透明窗口兜底
+    // 浮层不能挂在一个半透明窗口里（整个窗口都会跟着淡下去），临时改回不透明。
+    void suppress_transparent_host() {
+        Fl_Group* pg = parent();
+        Fl_Window* w = pg ? pg->window() : nullptr;
+        if (!w || w == pg) return;
+        // 没有 gui_alpha() 公接口时这里保持 0，窗口本来就该是不透明的。
+        (void)w;
+    }
+
+    void clear_transparent_host() {
+        (void)alphaHost_;
+        (void)savedAlpha_;
+        alphaHost_  = nullptr;
+        savedAlpha_ = 0;
+    }
+
+    // ---------------------------------------------------------------- 绘制细节
+    void draw_shadow() {
+        for (int i = 6; i >= 1; --i)
+            stroke_round_rect(card_.x - i, card_.y - i, card_.w + i * 2, card_.h + i * 2,
+                              CARD_R + i, fl_rgb_color(16, 17, 20));
+    }
+
+    // 当前步骤前面的小圆圈：12 段圆环 + 中心点，靠 frame_ 旋转
+    void draw_spinner(double cx, double cy, double r) {
+        const int    SEG = 12;
+        const double PI  = 3.14159265358979323846;
+        int off = (frame_ / 3) % SEG;
+        fl_line_style(FL_SOLID, 2);
+        for (int i = 0; i < SEG; ++i) {
+            int k = (i + off) % SEG;
+            int v = 70 + k * 15;                 // 亮度随段递增 → 旋转感
+            if (v > 232) v = 232;
+            fl_color(fl_rgb_color((uchar)v, (uchar)v, (uchar)v));
+            double a1 = -PI / 2 + i * (2 * PI / SEG);
+            double a2 = a1 + (2 * PI / SEG) * 0.62;
+            fl_line(cx + r * std::cos(a1), cy + r * std::sin(a1),
+                    cx + r * std::cos(a2), cy + r * std::sin(a2));
+        }
+        fl_line_style(0, 0);
+        fl_color(clr_text());
+        fl_pie(cx - 2.0, cy - 2.0, 4.0, 4.0, 0.0, 360.0);
+    }
+
+    void draw_button(int bx, int by, int bw, int bh) {
+        const bool fin = done_.load() != 0;
+        Fl_Color bg;
+        if (fin) {
+            bg = (press_ == 1) ? clr_accent() : clr_accent2();
+            if (press_ == 2) bg = clr_card_sel();
+        } else {
+            bg = (press_ == 1) ? fl_rgb_color(72, 77, 86) : fl_rgb_color(58, 62, 70);
+            if (press_ == 2) bg = fl_rgb_color(48, 51, 57);
+        }
+        fill_round_rect(bx, by, bw, bh, 8, bg);
+        fl_font(FL_HELVETICA, 14);
+        fl_color(FL_WHITE);
+        fl_draw(fin ? "关闭" : "取消", bx, by, bw, bh, FL_ALIGN_CENTER | FL_ALIGN_INSIDE);
+    }
+
+    // ---------------------------------------------------------------- 动画
+    static int& frame_ref() { static int f = 0; return f; }
+
+    void start_anim() {
+        if (animOn_) return;
+        animOn_ = 1;
+        Fl::add_timeout(1.0 / 60.0, &Overlay::tick_cb, this);
+    }
+
+    void leave_all() {
+        animOn_ = 0;
+        Fl::remove_timeout(&Overlay::tick_cb, this);
+    }
+
+    static void tick_cb(void* u) {
+        Overlay* o = static_cast<Overlay*>(u);
+        if (!o || !o->vis_) { if (o) o->leave_all(); return; }
+        o->frame_ = ++frame_ref();
+        if (o->host_) o->host_->redraw();
+        o->redraw();
+        Fl::repeat_timeout(1.0 / 60.0, &Overlay::tick_cb, o);
+    }
+
+    // ---------------------------------------------------------------- 其它
+    void redrawHost() {
+        if (host_) host_->redraw();
+        Fl_Widget::redraw();
+    }
+
+    static int clampStep(int s) { return s < 0 ? 0 : (s > 4 ? 4 : s); }
+
+    // 点按钮：先 hide()（触发 onClose），再按状态调用 onCancel / onFinish
+    void fire() {
+        const bool fin = done_.load() != 0;
+        if (!fin && g_launching) g_cancelLaunch = true;   // 通知逻辑层取消
+        press_ = 0;
+        auto cancel = onCancel;
+        auto finish = onFinish;
+        hide();
+        if (fin) { if (finish) onFinish(); }
+        else     { if (cancel) onCancel(); }
+    }
+};
+
+
+// ============================================================================
+//  第七部分：逻辑层实现
+// ============================================================================
+// ============================================================================
+//  core.cpp — ReignLaunch 逻辑层（从 Win32 版 ReignLaunch.cpp 抽取）
+//  不含任何界面代码：下载 / 安装 / 启动 / 账户 / Java / 配置
+// ============================================================================
+
+// ============================ 全局定义 ============================
+Config      g_cfg;
+std::string g_dataDir;
+std::string g_cfgPath;
+
+std::vector<std::string> g_versions;
+int         g_selVersion = -1;
+Page        g_page = PAGE_LAUNCH;
+std::atomic<bool> g_launching{ false };
+std::atomic<bool> g_needScanVersions{ false };
+
+std::atomic<int>  g_progState{ 0 };
+std::atomic<int>  g_progCur{ 0 };
+std::atomic<int>  g_progTotal{ 0 };
+std::atomic<int>  g_stepCur{ 0 };
+std::atomic<bool> g_cancelLaunch{ false };
+
+DWORD        g_overlayDoneTick = 0;
+std::wstring g_status;
+HWND         g_hwnd = nullptr;
+
+static std::mutex              g_logMutex;
+static std::vector<std::string> g_logs;
+
+// ---------------- 前置声明（定义在文件后面）----------------
+bool FileExists(const fs::path& p);
+bool DirExists(const fs::path& p);
+std::string JavaVersionOf(const fs::path& javaw);
+int RequiredJavaMajor(const std::string& id);
+std::string PickJavaFor(int need);
+json ResolveVersion(const std::string& id, int depth);
+bool RulesAllow(const json& rules);
+bool HttpRequest(const std::string& urlU8, const std::string& method,
+                        const std::string& body, const std::string& contentType,
+                        std::vector<unsigned char>& out, std::string& err);
+std::string ToMirror(std::string url);
+bool DownloadFile(const std::string& url, const fs::path& dest, std::string& err);
+static bool Sha1OfFileExists(const char* p);
+std::string Sha1Hex(const std::vector<unsigned char>& data);
+bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std::string& error);
+void DownloadMissing(const std::string& versionId, DownloadStats& st);
+int CountMissing(const std::string& versionId);
+bool InstallJava(int need);
+static void PumpOutput(HANDLE hRead);
+static bool WaitForGameWindow(DWORD pid, int timeoutMs);
+
+
+bool ShouldIsolate(const std::string& id, const fs::path& mcDir);
+fs::path InstanceModsDir();
+std::string CurrentMcVersion();
+std::string CurrentLoaderTag();
+void RefreshInstalledMods();
+void ScanVersions();
+void SaveConfig();
+void LoadConfig();
+std::wstring U8ToW(const std::string& s);
+std::string WToU8(const std::wstring& w);
+std::string ExtractEmbeddedAuthlib();
+std::string DetectAuthlib();
+std::string OfflineUUID(const std::string& name);
+void Log(const std::string& s);
+void InstallModrinthModThread(std::string slug, std::string mcVer, std::string loaderTag, std::string targetVer);
+
+// 等游戏窗口
+struct WinWaitCtx { DWORD pid; bool found; };
+
+// 微软登录状态（UI 读取并显示）
+static std::wstring     g_msCode;
+static std::wstring     g_msUrl;
+static std::atomic<int> g_msState{ 0 };   // 0空闲 1进行中 2等待用户 3成功 4失败
+static std::wstring     g_msMsg;
+
+// GDI+ 状态
+static ULONG_PTR g_gpToken = 0;
+static bool      g_gpOk = false;
+
+// 自动更新状态
+#define APP_TAG     L"v1.3.0-rc1"      // 用于更新检查比对（GitHub tag）
+#define APP_VER_STR "1.3.0 RC 1"       // 界面显示用
+static std::wstring        g_newTag;
+static std::string         g_newUrl;
+static std::atomic<int>    g_updateState{ 0 };
+static std::atomic<bool>   g_updating{ false };
+
+
+
+
+
+// 前置声明
+void RefreshJavaCands();
+static void RebuildDlView();
+
+// 模组搜索框由 UI 层提供，core 里用弱引用读取
+static HWND g_hEdSearch = nullptr;
+
+#define WM_APP_LOGIN (WM_APP + 13)
+
+// 皮肤位图（UI 使用）
+static HBITMAP g_skinBmp = nullptr;
+static void LoadSkinBitmap() { /* FLTK 版不用 HBITMAP，空实现 */ }
+
+
+
+std::vector<McVer> g_mcVers;
+std::mutex g_mcVersMutex;   // 保护 g_mcVers（工作线程写、UI 线程读）
+std::atomic<int>   g_mcVersState{ 0 };
+int                g_dlFilter = 0;
+std::vector<int>   g_dlView;
+int                g_dlSel = -1;
+bool               g_dlDetail = false;
+std::string        g_dlDetailMc;
+
+std::atomic<int>   g_ldState[4] = { {0}, {0}, {0}, {0} };
+std::wstring       g_ldVer[4];
+int                g_dlLoader = 0;
+std::vector<std::string> g_ldVers;
+std::vector<std::string> g_ldFiles;
+int                g_ldSel = -1;
+std::atomic<int>   g_ldVersState{ 0 };
+std::atomic<int>   g_ldGen{ 0 };
+
+std::atomic<bool>  g_dlBusy{ false };
+std::atomic<bool>  g_dlCancel{ false };
+int                g_userMode = 0;
+
+std::vector<ModHit>      g_modHits;
+std::mutex                 g_modHitsMutex;
+std::vector<std::string> g_modFiles;
+bool               g_modDetail = false;
+std::string        g_modDetailSlug, g_modDetailTitle, g_modDetailDesc;
+std::vector<std::string> g_modVerNames, g_modVerFiles;
+std::mutex                g_modVerMutex;   // 保护上面两个 vector（后台线程写）
+std::atomic<int>   g_modVerState{ 0 };
+std::atomic<int>   g_modVerGen{ 0 };
+int                g_modVerSel = -1;
+std::atomic<int>   g_modState{ 0 };
+std::atomic<int>   g_modGen{ 0 };
+int                g_modRunGen = 0;
+std::atomic<bool>  g_cfFallback{ false };
+int                g_modSel = -1;
+int                g_modFileSel = -1;
+int                g_modTab = 0;
+int                g_modSource = 0;
+int                g_modCat = 0;
+int                g_dlSection = 0;
+int                g_instTab = 0;
+
+std::vector<Cand>  g_dirCands, g_javaCands;
+
+std::atomic<long long> g_dlBytes{ 0 };
+std::wstring           g_dlTarget;
+long long              g_dlLastBytes = 0;
+DWORD                  g_dlLastTick = 0;
+double                 g_dlSpeed = 0;
+
+HANDLE             g_gameProc = nullptr;
+std::atomic<DWORD> g_gamePid{ 0 };
+
+int g_listScroll = 0;
+std::atomic<int> g_loginState{ 0 };
+
+
+
+
+// ---------------- U8ToW ----------------
+std::wstring U8ToW(const std::string& s) {
     if (s.empty()) return L"";
     int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
     std::wstring w(n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
 }
-static std::string WToU8(const std::wstring& w) {
+
+// ---------------- WToU8 ----------------
+std::string WToU8(const std::wstring& w) {
     if (w.empty()) return "";
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
     std::string s(n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
     return s;
 }
+
+// ---------------- EndsWithNoCase ----------------
 static bool EndsWithNoCase(const std::string& s, const std::string& suffix) {
     if (s.size() < suffix.size()) return false;
     return _stricmp(s.c_str() + s.size() - suffix.size(), suffix.c_str()) == 0;
 }
 
-static bool FileExists(const fs::path& p);
-
+// ---------------- EffectiveJavaExe ----------------
 static std::string EffectiveJavaExe() {
+    // 统一使用 java.exe（不是 javaw.exe）
+    // 配合 CreateProcess 的 CREATE_NO_WINDOW，控制台不会出现黑窗口
     std::string p = g_cfg.javaPath;
     if (EndsWithNoCase(p, "javaw.exe")) {
         std::string cand = p.substr(0, p.size() - 9) + "java.exe";
         if (FileExists(fs::u8path(cand))) return cand;
     }
+    if (EndsWithNoCase(p, "java.exe")) return p;
     return p;
 }
 
-static std::string TrimSlash(std::string s) {
+// ---------------- TrimSlash ----------------
+std::string TrimSlash(std::string s) {
     while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
     return s;
 }
-static bool FileExists(const fs::path& p) {
+
+// ---------------- FileExists ----------------
+bool FileExists(const fs::path& p) {
     std::error_code ec; return fs::exists(p, ec) && !fs::is_directory(p, ec);
 }
-static bool DirExists(const fs::path& p) {
+
+// ---------------- DirExists ----------------
+bool DirExists(const fs::path& p) {
     std::error_code ec; return fs::is_directory(p, ec);
 }
+
+// ---------------- ExeDir ----------------
 static fs::path ExeDir() {
     wchar_t buf[MAX_PATH];
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     return fs::path(buf).parent_path();
 }
 
-// 把编译进 exe 的 authlib-injector.jar 释放到磁盘
-static std::string ExtractEmbeddedAuthlib() {
+// ---------------- ExtractEmbeddedAuthlib ----------------
+std::string ExtractEmbeddedAuthlib() {
     HRSRC hr = FindResourceA(nullptr, MAKEINTRESOURCEA(IDR_AUTHLIB), MAKEINTRESOURCEA(10));
     if (!hr) return "";
     DWORD sz = SizeofResource(nullptr, hr);
@@ -286,12 +1509,23 @@ static std::string ExtractEmbeddedAuthlib() {
     return "";
 }
 
-static void Log(const std::string& s) {
+// ---------------- Log ----------------
+void Log(const std::string& s) {
     std::lock_guard<std::mutex> lk(g_logMutex);
     g_logs.push_back(s);
-    if (g_logs.size() > 5000) g_logs.erase(g_logs.begin(), g_logs.begin() + 1000);
+    if (!g_dataDir.empty()) {
+        std::ofstream lf{ fs::u8path(g_dataDir) / L"launcher.log", std::ios::app };
+        if (lf) {
+            SYSTEMTIME st; GetLocalTime(&st);
+            char ts[24] = {0};
+            sprintf_s(ts, sizeof(ts), "%02d:%02d:%02d ", st.wHour, st.wMinute, st.wSecond);
+            lf << ts << s << "\r\n";
+        }
+    }
 }
-static std::string LogTail(int n = 400) {
+
+// ---------------- LogTail ----------------
+std::string LogTail(int n = 400) {
     std::lock_guard<std::mutex> lk(g_logMutex);
     int start = (int)g_logs.size() > n ? (int)g_logs.size() - n : 0;
     std::string out;
@@ -299,8 +1533,8 @@ static std::string LogTail(int n = 400) {
     return out;
 }
 
-// ============================ 配置 ============================
-static void SaveConfig() {
+// ---------------- SaveConfig ----------------
+void SaveConfig() {
     json j;
     j["gameDir"]       = g_cfg.gameDir;
     j["isoMode"] = g_cfg.isoMode;
@@ -310,6 +1544,7 @@ static void SaveConfig() {
     j["dlSource"] = g_cfg.dlSource;
     j["cfProxy"]  = g_cfg.cfProxy;
     j["cfApiKey"] = g_cfg.cfApiKey;
+    j["msClientId"] = g_cfg.msClientId;
     j["winMode"] = g_cfg.winMode;
     j["skinPath"] = g_cfg.skinPath;
     {
@@ -322,6 +1557,7 @@ static void SaveConfig() {
             o["token"]  = a.token;
             o["uuid"]   = a.uuid;
             o["skin"]   = a.skin;
+            o["refresh"] = a.refresh;
             arr.push_back(o);
         }
         j["accounts"] = arr;
@@ -340,7 +1576,9 @@ static void SaveConfig() {
     std::ofstream f{ fs::u8path(g_cfgPath) };
     if (f) f << j.dump(2);
 }
-static void LoadConfig() {
+
+// ---------------- LoadConfig ----------------
+void LoadConfig() {
     std::ifstream f{ fs::u8path(g_cfgPath) };
     if (!f) return;
     try {
@@ -353,6 +1591,7 @@ static void LoadConfig() {
     g_cfg.dlSource = j.value("dlSource", 0);
     g_cfg.cfProxy  = j.value("cfProxy",  std::string("https://api.curse.tools/v1/cf"));
     g_cfg.cfApiKey = j.value("cfApiKey", std::string());
+    g_cfg.msClientId = j.value("msClientId", std::string("00000000402b5328"));
     g_cfg.winMode = j.value("winMode", 0);
     if (!j.contains("winMode") && j.contains("fullscreen"))   // 兼容旧的布尔配置
         g_cfg.winMode = j.value("fullscreen", false) ? 2 : 0;
@@ -369,6 +1608,7 @@ static void LoadConfig() {
             a.token  = o.value("token", std::string());
             a.uuid   = o.value("uuid", std::string());
             a.skin   = o.value("skin", std::string());
+            a.refresh = o.value("refresh", std::string());
             if (!a.name.empty()) g_cfg.accounts.push_back(a);
         }
     }
@@ -403,8 +1643,8 @@ static void LoadConfig() {
     } catch (...) {}
 }
 
-// ============================ 自动检测 ============================
-static std::string DetectJava() {
+// ---------------- DetectJava ----------------
+std::string DetectJava() {
     std::vector<fs::path> cands;
     wchar_t buf[32767];
     if (GetEnvironmentVariableW(L"JAVA_HOME", buf, 32767))
@@ -428,7 +1668,8 @@ static std::string DetectJava() {
     return "";
 }
 
-static std::string DetectGameDir() {
+// ---------------- DetectGameDir ----------------
+std::string DetectGameDir() {
     std::vector<fs::path> cands;
     wchar_t appdata[MAX_PATH], profile[MAX_PATH];
     if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata)))
@@ -446,11 +1687,12 @@ static std::string DetectGameDir() {
     return "";
 }
 
-static std::string DetectAuthlib() {
+// ---------------- DetectAuthlib ----------------
+std::string DetectAuthlib() {
     std::vector<fs::path> cands;
     cands.push_back(ExeDir() / L"authlib-injector.jar");
     if (!g_cfg.gameDir.empty()) {
-        fs::path g = fs::u8path(g_cfg.gameDir);
+        fs::path g = GameDirPath();
         cands.push_back(g / L"authlib-injector.jar");
         cands.push_back(g.parent_path() / L"authlib-injector.jar");
     }
@@ -458,7 +1700,7 @@ static std::string DetectAuthlib() {
     for (auto& c : cands) if (FileExists(c)) return WToU8(c.wstring());
 
     std::error_code ec;
-    for (auto& d : { ExeDir(), g_cfg.gameDir.empty() ? fs::path() : fs::u8path(g_cfg.gameDir) }) {
+    for (auto& d : { ExeDir(), g_cfg.gameDir.empty() ? fs::path() : GameDirPath() }) {
         if (d.empty()) continue;
         for (auto& e : fs::directory_iterator(d, ec)) {
             if (ec) break;
@@ -470,12 +1712,12 @@ static std::string DetectAuthlib() {
     return "";
 }
 
-// ============================ 版本 ============================
-static void ScanVersions() {
+// ---------------- ScanVersions ----------------
+void ScanVersions() {
     g_versions.clear();
     if (g_cfg.gameDir.empty()) return;
 
-    fs::path verDir = fs::u8path(g_cfg.gameDir) / L"versions";
+    fs::path verDir = GameDirPath() / L"versions";
     std::error_code ec;
     if (!DirExists(verDir)) return;
 
@@ -491,15 +1733,17 @@ static void ScanVersions() {
     g_listScroll = 0;
 }
 
-static json ReadJsonFile(const fs::path& p) {
+// ---------------- ReadJsonFile ----------------
+json ReadJsonFile(const fs::path& p) {
     std::ifstream f(p);
     if (!f) return json();
     try { json j; f >> j; return j; } catch (...) { return json(); }
 }
 
-static json ResolveVersion(const std::string& id, int depth = 0) {
+// ---------------- ResolveVersion ----------------
+json ResolveVersion(const std::string& id, int depth) {
     if (depth > 6) return json();
-    fs::path base = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id);
+    fs::path base = GameDirPath() / L"versions" / fs::u8path(id);
     json child = ReadJsonFile(base / fs::u8path(id + ".json"));
     if (!child.is_object()) return json();
 
@@ -529,7 +1773,8 @@ static json ResolveVersion(const std::string& id, int depth = 0) {
     return merged;
 }
 
-static bool RulesAllow(const json& rules) {
+// ---------------- RulesAllow ----------------
+bool RulesAllow(const json& rules) {
     if (!rules.is_array() || rules.empty()) return true;
 
     bool hasAllow = false;
@@ -560,6 +1805,7 @@ static bool RulesAllow(const json& rules) {
     return hasAllow ? matched : true;
 }
 
+// ---------------- MavenPath ----------------
 static fs::path MavenPath(const fs::path& libRoot, const std::string& name, const std::string& classifier = "") {
     std::vector<std::string> parts;
     std::stringstream ss(name);
@@ -576,30 +1822,49 @@ static fs::path MavenPath(const fs::path& libRoot, const std::string& name, cons
     return libRoot / fs::u8path(group) / fs::u8path(artifact) / fs::u8path(version) / fs::u8path(file);
 }
 
-static bool ExtractZip(const fs::path& zip, const fs::path& outDir) {
-    {
-        std::error_code ecd;
-        fs::create_directories(outDir, ecd);
-        if (ecd) { Log("[警告] 无法创建解压目录: " + ecd.message()); return false; }
-    }
-    std::wstring cmd = L"tar.exe -xf \"" + zip.wstring() + L"\" -C \"" + outDir.wstring() + L"\"";
-    STARTUPINFOW si{ sizeof(si) };
-    PROCESS_INFORMATION pi{};
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    if (!CreateProcessW(nullptr, buf.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+// ---------------- ExtractZip ----------------
+bool ExtractZip(const fs::path& zip, const fs::path& outDir) {
+    std::error_code ec;
+    fs::create_directories(outDir, ec);
+    if (ec) { Log("[警告] 无法创建解压目录: " + ec.message()); return false; }
+
+    // 用 miniz 直接解压（不依赖系统 tar.exe）
+    mz_zip_archive za{};
+    if (!mz_zip_reader_init_file(&za, zip.u8string().c_str(), 0)) {
+        Log("[解压] 无法打开 zip: " + zip.u8string());
         return false;
-    WaitForSingleObject(pi.hProcess, 20000);
-    DWORD code = 1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-    return code == 0;
+    }
+
+    const mz_uint total = mz_zip_reader_get_num_files(&za);
+    int okCount = 0, failCount = 0;
+    for (mz_uint i = 0; i < total; ++i) {
+        mz_zip_archive_file_stat st{};
+        if (!mz_zip_reader_file_stat(&za, i, &st)) { failCount++; continue; }
+        if (st.m_is_directory) continue;
+
+        fs::path dest = outDir / fs::u8path(st.m_filename);
+        std::error_code e2;
+        fs::create_directories(dest.parent_path(), e2);
+
+        std::ofstream of(dest, std::ios::binary);
+        if (!of) { failCount++; continue; }
+
+        size_t outSize = 0;
+        void* buf = mz_zip_reader_extract_to_heap(&za, i, &outSize, 0);
+        if (!buf) { failCount++; continue; }
+        of.write((const char*)buf, (std::streamsize)outSize);
+        mz_free(buf);
+        okCount++;
+    }
+    mz_zip_reader_end(&za);
+
+    Log("[解压] " + std::to_string(okCount) + " 个文件成功" +
+        (failCount ? "，" + std::to_string(failCount) + " 个失败" : ""));
+    return failCount == 0;
 }
 
-// ============================ 网络 ============================
-static std::string Sha1Hex(const std::vector<unsigned char>& data) {
+// ---------------- Sha1Hex ----------------
+std::string Sha1Hex(const std::vector<unsigned char>& data) {
     HCRYPTPROV prov = 0; HCRYPTHASH h = 0;
     std::string hex;
     if (!CryptAcquireContextA(&prov, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) return "";
@@ -618,7 +1883,8 @@ static std::string Sha1Hex(const std::vector<unsigned char>& data) {
     return hex;
 }
 
-static std::string ToMirror(std::string url) {
+// ---------------- ToMirror ----------------
+std::string ToMirror(std::string url) {
     const std::pair<const char*, const char*> map[] = {
         { "https://libraries.minecraft.net/",          "https://bmclapi2.bangbang93.com/maven/" },
         { "https://piston-data.mojang.com/",           "https://bmclapi2.bangbang93.com/" },
@@ -633,8 +1899,8 @@ static std::string ToMirror(std::string url) {
     return url;
 }
 
-// GET / POST 通用
-static bool HttpRequest(const std::string& urlU8, const std::string& method,
+// ---------------- HttpRequest ----------------
+bool HttpRequest(const std::string& urlU8, const std::string& method,
                         const std::string& body, const std::string& contentType,
                         std::vector<unsigned char>& out, std::string& err) {
     out.clear();
@@ -663,7 +1929,7 @@ static bool HttpRequest(const std::string& urlU8, const std::string& method,
     std::wstring wmethod = U8ToW(method);
     HINTERNET req = WinHttpOpenRequest(con, wmethod.c_str(), path, nullptr, WINHTTP_NO_REFERER,
                                        WINHTTP_DEFAULT_ACCEPT_TYPES, https ? WINHTTP_FLAG_SECURE : 0);
-    if (!req) { WinHttpCloseHandle(con); WinHttpCloseHandle(ses); err = "请求创建失败"; return false; }
+    if (!req) { WinHttpCloseHandle(con); err = "请求创建失败"; return false; }   // 不要关 ses！tlsSes 会变野指针
 
     std::wstring hdr = L"Content-Type: " + U8ToW(contentType) + L"\r\n";
     DWORD bodyLen = (DWORD)body.size();
@@ -698,7 +1964,8 @@ static bool HttpRequest(const std::string& urlU8, const std::string& method,
     return ok;
 }
 
-static bool DownloadFile(const std::string& url, const fs::path& dest, std::string& err) {
+// ---------------- DownloadFile ----------------
+bool DownloadFile(const std::string& url, const fs::path& dest, std::string& err) {
     std::vector<unsigned char> data;
     std::string mirror = ToMirror(url);
     // dlSource: 0=自动(先官方，失败切镜像) 1=仅官方 2=仅镜像
@@ -732,14 +1999,8 @@ static bool DownloadFile(const std::string& url, const fs::path& dest, std::stri
     return true;
 }
 
-// ============================ 第三方登录（Yggdrasil）============================
-struct AuthResult {
-    bool ok = false;
-    std::string err;
-    std::string accessToken, clientToken, uuid, name;
-};
-
-static AuthResult YggdrasilLogin(const std::string& serverRaw, const std::string& user, const std::string& pass) {
+// ---------------- YggdrasilLogin ----------------
+AuthResult YggdrasilLogin(const std::string& serverRaw, const std::string& user, const std::string& pass) {
     AuthResult r;
     std::string server = TrimSlash(serverRaw);
     if (server.empty()) { r.err = "认证服务器地址为空"; return r; }
@@ -776,18 +2037,15 @@ static AuthResult YggdrasilLogin(const std::string& serverRaw, const std::string
     return r;
 }
 
-// ============================ 启动 ============================
-struct LaunchPlan {
-    std::wstring javaPath, commandLine, workDir;
-    int maxMem = 4096;
-};
-
+// ---------------- ReplaceAll ----------------
 static std::string ReplaceAll(std::string s, const std::string& from, const std::string& to) {
     if (from.empty()) return s;
     size_t pos = 0;
     while ((pos = s.find(from, pos)) != std::string::npos) { s.replace(pos, from.size(), to); pos += to.size(); }
     return s;
 }
+
+// ---------------- SplitArgs ----------------
 static std::vector<std::string> SplitArgs(const std::string& s) {
     std::vector<std::string> out; std::string cur; bool inQuote = false;
     for (char c : s) {
@@ -798,10 +2056,14 @@ static std::vector<std::string> SplitArgs(const std::string& s) {
     if (!cur.empty()) out.push_back(cur);
     return out;
 }
+
+// ---------------- QuoteIfNeeded ----------------
 static std::string QuoteIfNeeded(const std::string& s) {
     return (s.find(' ') == std::string::npos) ? s : "\"" + s + "\"";
 }
-static std::string OfflineUUID(const std::string& name) {
+
+// ---------------- OfflineUUID ----------------
+std::string OfflineUUID(const std::string& name) {
     HCRYPTPROV prov = 0; HCRYPTHASH hash = 0;
     std::string hex, src = "OfflinePlayer:" + name;
     if (CryptAcquireContextA(&prov, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
@@ -825,8 +2087,8 @@ static std::string OfflineUUID(const std::string& name) {
     return hex.substr(0,8) + "-" + hex.substr(8,4) + "-" + hex.substr(12,4) + "-" + hex.substr(16,4) + "-" + hex.substr(20,12);
 }
 
-// 判断实例是否算「模组实例」：有 mods 里的 jar，或版本 id / 主类带加载器名
-static bool IsModdedInstance(const std::string& id, const fs::path& mcDir) {
+// ---------------- IsModdedInstance ----------------
+bool IsModdedInstance(const std::string& id, const fs::path& mcDir) {
     fs::path vd = mcDir / L"versions" / fs::u8path(id);
     std::error_code ec;
     fs::path mods = vd / L"mods";
@@ -855,14 +2117,1005 @@ static bool IsModdedInstance(const std::string& id, const fs::path& mcDir) {
     return false;
 }
 
-static bool ShouldIsolate(const std::string& id, const fs::path& mcDir) {
+// ---------------- ShouldIsolate ----------------
+bool ShouldIsolate(const std::string& id, const fs::path& mcDir) {
     if (g_cfg.isoMode == 2) return false;
     if (!DirExists(mcDir / L"versions" / fs::u8path(id))) return false;
     if (g_cfg.isoMode == 1) return IsModdedInstance(id, mcDir);
     return true;
 }
-static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std::string& error) {
-    fs::path mcDir = fs::u8path(g_cfg.gameDir);
+
+// ---------------- Sha1OfFile ----------------
+std::string Sha1OfFile(const fs::path& p) {
+    std::ifstream f{ p, std::ios::binary };
+    if (!f) return "";
+    std::vector<unsigned char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    return Sha1Hex(buf);
+}
+
+// ---------------- RunDownloads ----------------
+void RunDownloads(std::vector<DLTask>& tasks, DownloadStats& st, int threads) {
+    if (tasks.empty()) return;
+    if (threads <= 0) threads = g_cfg.dlThreads;
+    if (threads < 1) threads = 1;
+    if (threads > 128) threads = 128;
+    if (threads > (int)tasks.size()) threads = (int)tasks.size();
+
+    std::atomic<size_t> next{ 0 };
+    std::atomic<int> okCount{ 0 }, failCount{ 0 };
+    std::mutex logMu;
+
+    g_progTotal = (int)tasks.size();
+    g_progCur = 0;
+
+    std::vector<std::thread> pool;
+    for (int i = 0; i < threads; ++i) {
+        pool.emplace_back([&]() {
+            for (;;) {
+                if (g_dlCancel) break;
+                size_t idx = next.fetch_add(1);
+                if (idx >= tasks.size()) break;
+                std::string err;
+                bool okDl = DownloadFile(tasks[idx].url, tasks[idx].dest, err);
+                if (okDl && !tasks[idx].sha1.empty()) {
+                    std::string got = Sha1OfFile(tasks[idx].dest);
+                    if (got != tasks[idx].sha1) {
+                        okDl = false;
+                        err = "SHA1 不匹配（期望 " + tasks[idx].sha1.substr(0, 8) +
+                              "…，实际 " + got.substr(0, 8) + "…）";
+                        std::error_code re; fs::remove(tasks[idx].dest, re);
+                    }
+                }
+                if (okDl) {
+                    okCount.fetch_add(1);
+                } else {
+                    failCount.fetch_add(1);
+                    std::lock_guard<std::mutex> lk(logMu);
+                    Log("[失败] " + tasks[idx].label + " : " + err);
+                }
+                g_progCur = okCount.load() + failCount.load();
+            }
+        });
+    }
+    for (auto& th : pool) th.join();
+
+    st.downloaded += okCount.load();
+    st.failed += failCount.load();
+}
+
+// ---------------- DownloadMissing ----------------
+void DownloadMissing(const std::string& versionId, DownloadStats& st) {
+    fs::path mcDir = GameDirPath();
+    fs::path libRoot = mcDir / L"libraries";
+    json vj = ResolveVersion(versionId);
+    if (!vj.is_object()) { st.failed++; return; }
+
+    std::vector<DLTask> batch1;
+
+    if (vj.contains("libraries") && vj["libraries"].is_array()) {
+        for (auto& lib : vj["libraries"]) {
+            if (!lib.is_object()) continue;
+            if (lib.contains("rules") && !RulesAllow(lib["rules"])) continue;
+            if (!lib.contains("downloads") || !lib["downloads"].is_object()) continue;
+            const json& dl = lib["downloads"];
+            if (!dl.contains("artifact") || !dl["artifact"].is_object()) continue;
+
+            const json& art = dl["artifact"];
+            std::string rel  = art.value("path", std::string());
+            std::string url  = art.value("url", std::string());
+            std::string sha1 = art.value("sha1", std::string());
+            if (rel.empty() || url.empty()) continue;
+
+            fs::path dest = libRoot / fs::u8path(rel);
+            bool need = true;
+            if (FileExists(dest)) {
+                need = false;
+                if (!sha1.empty()) {
+                    std::ifstream f{ dest, std::ios::binary };
+                    std::vector<unsigned char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                    if (Sha1Hex(buf) != sha1) need = true;
+                }
+                if (!need) st.existed++;
+            }
+            if (need) batch1.push_back({ url, dest, rel, sha1 });
+        }
+    }
+
+    fs::path clientJar = mcDir / L"versions" / fs::u8path(versionId) / fs::u8path(versionId + ".jar");
+    if (vj.contains("downloads") && vj["downloads"].is_object() && vj["downloads"].contains("client")) {
+        std::string url  = vj["downloads"]["client"].value("url", std::string());
+        std::string csha = vj["downloads"]["client"].value("sha1", std::string());
+        if (!url.empty()) {
+            bool needJar = true;
+            if (FileExists(clientJar)) {
+                needJar = false;
+                if (!csha.empty() && Sha1OfFile(clientJar) != csha) needJar = true;   // 客户端 jar 也要校验
+                if (!needJar) st.existed++;
+            }
+            if (needJar) batch1.push_back({ url, clientJar, versionId + ".jar", csha });
+        }
+    }
+
+    RunDownloads(batch1, st);
+
+    std::string indexId, indexUrl;
+    if (vj.contains("assetIndex") && vj["assetIndex"].is_object()) {
+        indexId  = vj["assetIndex"].value("id", std::string());
+        indexUrl = vj["assetIndex"].value("url", std::string());
+    }
+    if (!indexId.empty() && !indexUrl.empty()) {
+        fs::path idxPath = mcDir / L"assets" / L"indexes" / fs::u8path(indexId + ".json");
+        std::string idxSha = vj["assetIndex"].value("sha1", std::string());
+        bool needIdx = !FileExists(idxPath);
+        if (!needIdx && !idxSha.empty() && Sha1OfFile(idxPath) != idxSha) needIdx = true;
+        if (needIdx) {
+            std::string err;
+            if (DownloadFile(indexUrl, idxPath, err) &&
+                (idxSha.empty() || Sha1OfFile(idxPath) == idxSha)) st.downloaded++;
+            else { st.failed++; std::error_code e3; fs::remove(idxPath, e3); }
+        } else st.existed++;
+
+        json idx = ReadJsonFile(idxPath);
+        if (idx.is_object() && idx.contains("objects") && idx["objects"].is_object()) {
+            std::vector<DLTask> batch2;
+            for (auto& it : idx["objects"].items()) {
+                std::string hash = it.value().value("hash", std::string());
+                if (hash.size() < 3) continue;
+                fs::path obj = mcDir / L"assets" / L"objects" / fs::u8path(hash.substr(0, 2)) / fs::u8path(hash);
+                bool needObj = !FileExists(obj);
+                if (!needObj && Sha1OfFile(obj) != hash) needObj = true;   // 资源文件按内容哈希校验
+                if (!needObj) { st.existed++; continue; }
+                batch2.push_back({ "https://resources.download.minecraft.net/" + hash.substr(0, 2) + "/" + hash, obj, hash, hash });
+            }
+            RunDownloads(batch2, st);
+        }
+    }
+}
+
+// ---------------- CountMissing ----------------
+int CountMissing(const std::string& versionId) {
+    fs::path mcDir = GameDirPath();
+
+    // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
+    std::string gameDirEff = g_cfg.gameDir;
+    if (ShouldIsolate(versionId, mcDir)) {
+        gameDirEff = WToU8((mcDir / L"versions" / fs::u8path(versionId)).wstring());
+    }
+    fs::path libRoot = mcDir / L"libraries";
+    json vj = ResolveVersion(versionId);
+    if (!vj.is_object()) return -1;
+
+    int missing = 0;
+
+    if (vj.contains("libraries") && vj["libraries"].is_array()) {
+        for (auto& lib : vj["libraries"]) {
+            if (!lib.is_object()) continue;
+            if (lib.contains("rules") && !RulesAllow(lib["rules"])) continue;
+            if (!lib.contains("downloads") || !lib["downloads"].is_object()) continue;
+            const json& dl = lib["downloads"];
+            if (!dl.contains("artifact") || !dl["artifact"].is_object()) continue;
+            std::string rel = dl["artifact"].value("path", std::string());
+            if (rel.empty()) continue;
+            if (!FileExists(libRoot / fs::u8path(rel))) missing++;
+        }
+    }
+
+    fs::path clientJar = mcDir / L"versions" / fs::u8path(versionId) / fs::u8path(versionId + ".jar");
+    if (vj.contains("downloads") && vj["downloads"].is_object() && vj["downloads"].contains("client"))
+        if (!FileExists(clientJar)) missing++;
+
+    std::string indexId;
+    if (vj.contains("assetIndex") && vj["assetIndex"].is_object())
+        indexId = vj["assetIndex"].value("id", std::string());
+
+    if (!indexId.empty()) {
+        fs::path idxPath = mcDir / L"assets" / L"indexes" / fs::u8path(indexId + ".json");
+        if (!FileExists(idxPath)) {
+            missing++;
+        } else {
+            json idx = ReadJsonFile(idxPath);
+            if (idx.is_object() && idx.contains("objects") && idx["objects"].is_object()) {
+                for (auto& it : idx["objects"].items()) {
+                    std::string hash = it.value().value("hash", std::string());
+                    if (hash.size() < 3) continue;
+                    fs::path obj = mcDir / L"assets" / L"objects" / fs::u8path(hash.substr(0, 2)) / fs::u8path(hash);
+                    if (!FileExists(obj)) missing++;
+                }
+            }
+        }
+    }
+    return missing;
+}
+
+// ---------------- JavaRoot ----------------
+static fs::path JavaRoot() {
+    return fs::u8path(g_dataDir) / L"java";
+}
+
+// ---------------- FindJavaIn ----------------
+fs::path FindJavaIn(const fs::path& root) {
+    std::error_code ec;
+    if (!fs::exists(root, ec)) return {};
+    for (auto it = fs::recursive_directory_iterator(root, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file()) continue;
+        std::wstring n = it->path().filename().wstring();
+        if (_wcsicmp(n.c_str(), L"javaw.exe") == 0 &&
+            it->path().parent_path().filename() == L"bin")
+            return it->path();
+    }
+    return {};
+}
+
+// ---------------- PickTemurinZip ----------------
+static std::string PickTemurinZip(const std::string& jsonText) {
+    json j = json::parse(jsonText, nullptr, false);
+    if (!j.is_array()) return "";
+    for (auto& rel : j) {
+        if (!rel.contains("binary")) continue;
+        const json& b = rel["binary"];
+        if (b.value("os", std::string()) != "windows") continue;
+        if (b.value("architecture", std::string()) != "x64") continue;
+        if (b.value("image_type", std::string()) != "jdk") continue;
+        std::string link = b["package"].value("link", std::string());
+        if (!link.empty()) return link;
+    }
+    return "";
+}
+
+// ---------------- InstallJava ----------------
+bool InstallJava(int need) {
+    fs::path dir = JavaRoot() / fs::u8path("temurin" + std::to_string(need));
+
+    // 已经装过就直接用
+    if (fs::path ex = FindJavaIn(dir); !ex.empty()) {
+        g_cfg.javaPath = WToU8(ex.wstring());
+        SaveConfig();
+        return true;
+    }
+
+    if (g_hwnd) { g_status = L"缺少 Java " + std::to_wstring(need) + L"，正在自动下载…"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+    Log("[Java] 开始下载 Temurin " + std::to_string(need));
+
+    // 1) 查 Adoptium API
+    std::string api = "https://api.adoptium.net/v3/assets/latest/" + std::to_string(need) +
+                      "/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse";
+    std::vector<unsigned char> resp; std::string err;
+    std::string zipUrl;
+    if (HttpRequest(api, "GET", "", "", resp, err) && !resp.empty())
+        zipUrl = PickTemurinZip(std::string(resp.begin(), resp.end()));
+    if (zipUrl.empty()) {
+        if (g_hwnd) { g_status = L"查询 Java 下载地址失败"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+        Log("[Java] API 失败：" + err);
+        return false;
+    }
+
+    // 2) 下载 zip
+    std::error_code ec;
+    fs::create_directories(JavaRoot(), ec);
+    fs::path zip = JavaRoot() / fs::u8path("temurin" + std::to_string(need) + ".zip");
+    g_dlBytes = 0;
+    g_progTotal = 1; g_progCur = 0;
+    if (!DownloadFile(zipUrl, zip, err)) {
+        // 失败再用代理试一次
+        std::string e2;
+        if (!DownloadFile("https://gh-proxy.com/" + zipUrl, zip, e2)) {
+            if (g_hwnd) { g_status = L"Java 下载失败：" + U8ToW(err); PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+            Log("[Java] 下载失败：" + err + " / " + e2);
+            return false;
+        }
+    }
+    g_progCur = 1;
+
+    // 3) 用 miniz 解压（不依赖系统 tar.exe）
+    if (g_hwnd) { g_status = L"正在解压 Java…"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+    if (!ExtractZip(zip, dir)) {
+        if (g_hwnd) { g_status = L"解压 Java 失败"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+        return false;
+    }
+    fs::remove(zip, ec);
+
+    // 4) 找 javaw.exe
+    fs::path ex = FindJavaIn(dir);
+    if (ex.empty()) {
+        if (g_hwnd) { g_status = L"解压后没找到 javaw.exe"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+        return false;
+    }
+    g_cfg.javaPath = WToU8(ex.wstring());
+    SaveConfig();
+    Log("[Java] 安装完成：" + g_cfg.javaPath);
+    if (g_hwnd) { g_status = L"Java " + std::to_wstring(need) + L" 已就绪"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+    return true;
+}
+
+// ---------------- PumpOutput ----------------
+static void PumpOutput(HANDLE hRead) {
+    char buf[4096];
+    DWORD got = 0;
+    std::string pending;
+    while (ReadFile(hRead, buf, sizeof(buf) - 1, &got, nullptr) && got > 0) {
+        buf[got] = 0;
+        pending += buf;
+        size_t pos;
+        while ((pos = pending.find('\n')) != std::string::npos) {
+            std::string line = pending.substr(0, pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            Log("[游戏] " + line);
+            pending.erase(0, pos + 1);
+        }
+    }
+    if (!pending.empty()) Log("[游戏] " + pending);
+    CloseHandle(hRead);
+}
+
+// ---------------- FindGameWindowProc ----------------
+static BOOL CALLBACK FindGameWindowProc(HWND h, LPARAM lp) {
+    WinWaitCtx* c = (WinWaitCtx*)lp;
+    DWORD wp = 0;
+    GetWindowThreadProcessId(h, &wp);
+    if (wp != c->pid) return TRUE;
+    if (!IsWindowVisible(h)) return TRUE;
+    wchar_t title[256] = {0};
+    GetWindowTextW(h, title, 256);
+    if (wcslen(title) == 0) return TRUE;
+    c->found = true;
+    return FALSE;
+}
+
+// ---------------- WaitForGameWindow ----------------
+static bool WaitForGameWindow(DWORD pid, int timeoutMs) {
+    DWORD start = GetTickCount();
+    while (GetTickCount() - start < (DWORD)timeoutMs) {
+        WinWaitCtx c{ pid, false };
+        EnumWindows(FindGameWindowProc, (LPARAM)&c);
+        if (c.found) return true;
+        if (g_cancelLaunch) return false;
+        Sleep(250);
+    }
+    return false;
+}
+
+// ---------------- LaunchThread ----------------
+void LaunchThread(std::string versionId) {
+    g_launching = true;
+    Log("=========== 启动 " + versionId + " ===========");
+    Log("账号: " + (g_cfg.authType == "thirdparty" ? (g_cfg.authName + " (第三方)") : (g_cfg.playerName + " (离线)")));
+
+    g_stepCur = 0;
+
+    // 按 MC 版本自动匹配 Java
+    {
+        int need = RequiredJavaMajor(versionId);
+        if (need > 0) {
+            std::string cur = g_cfg.javaPath.empty() ? "" : JavaVersionOf(fs::u8path(g_cfg.javaPath));
+            int curVer = 0;
+            try { if (!cur.empty()) curVer = std::stoi(cur); } catch (...) {}
+
+            std::string pick = PickJavaFor(need);
+            int pickVer = 0;
+            if (!pick.empty()) {
+                try { pickVer = std::stoi(JavaVersionOf(fs::u8path(pick))); } catch (...) {}
+            }
+
+            if (pickVer > 0 && pickVer != curVer) {
+                // 优先用最贴近的版本：1.20.1 用 17 而不是 25
+                g_cfg.javaPath = pick;
+                SaveConfig();
+                Log("[Java] 自动切换到 Java " + std::to_string(pickVer) +
+                    "（该版本需要 Java " + std::to_string(need) + "）");
+            } else if (curVer < need) {
+                Log("[Java] 该版本需要 Java " + std::to_string(need) + "，开始自动下载");
+                if (g_hwnd) { g_status = L"缺少 Java " + std::to_wstring(need) + L"，正在自动下载…"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+
+                if (!InstallJava(need)) {
+                    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_NEEDJAVA, (WPARAM)need, 0);
+                    g_launching = false;
+                    g_progState = 0;
+                    return;
+                }
+                int nowVer = 0;
+                try { nowVer = std::stoi(JavaVersionOf(fs::u8path(g_cfg.javaPath))); } catch (...) {}
+                if (nowVer < need) {
+                    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_NEEDJAVA, (WPARAM)need, 0);
+                    g_status = L"启动失败：需要 Java " + std::to_wstring(need) + L"，自动安装未完成";
+                    g_launching = false;
+                    g_progState = 0;
+                    return;
+                }
+                Log("[Java] 自动下载完成，继续启动");
+            }
+        }
+    }
+
+    // ---------- 补全缺失文件 ----------
+    {
+        int miss = CountMissing(versionId);
+        if (miss > 0) {
+            Log("[补全] 检测到 " + std::to_string(miss) + " 个文件缺失，开始自动下载…");
+            if (g_hwnd) { g_status = L"正在补全文件…"; PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); }
+            g_progState = 1;
+            DownloadStats st;
+            DownloadMissing(versionId, st);
+            Log("[补全] 完成：新下载 " + std::to_string(st.downloaded) +
+                "，已存在 " + std::to_string(st.existed) +
+                "，失败 " + std::to_string(st.failed));
+            g_progState = 0;
+            if (g_dlCancel) { g_launching = false; if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); return; }
+        }
+    }
+
+    // ---------- 生成启动方案 ----------
+    g_stepCur = 1;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    LaunchPlan plan;
+    std::string planErr;
+    if (!BuildLaunchPlan(versionId, plan, planErr)) {
+        Log("[错误] 生成启动命令失败：" + planErr);
+        g_status = L"启动失败：" + U8ToW(planErr);
+        g_launching = false;
+        g_progState = 0;
+        g_stepCur = 0;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    // ---------- 启动进程 ----------
+    g_stepCur = 2;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), nullptr, TRUE };
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    CreatePipe(&hRead, &hWrite, &sa, 0);
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si{ sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWrite;
+    si.hStdError  = hWrite;
+    si.hStdInput  = nullptr;
+
+    PROCESS_INFORMATION pi{};
+    std::wstring cmdline = plan.commandLine;
+    std::wstring workDir = plan.workDir;
+
+    BOOL started = CreateProcessW(
+        plan.javaPath.empty() ? nullptr : plan.javaPath.c_str(),
+        cmdline.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+        nullptr,
+        workDir.empty() ? nullptr : workDir.c_str(),
+        &si, &pi);
+
+    if (hWrite) CloseHandle(hWrite);
+
+    if (!started) {
+        if (hRead) CloseHandle(hRead);
+        Log("[错误] 创建游戏进程失败，错误码 " + std::to_string(GetLastError()));
+        g_status = L"启动失败：无法创建游戏进程（检查 Java 路径）";
+        g_launching = false;
+        g_progState = 0;
+        g_stepCur = 0;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    g_stepCur = 4;                 // 四步全部完成，等游戏窗口
+    g_gamePid = pi.dwProcessId;
+    if (g_gameProc) CloseHandle(g_gameProc);
+    g_gameProc = pi.hProcess;
+    CloseHandle(pi.hThread);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    Log("[启动] 游戏进程已创建，PID " + std::to_string(pi.dwProcessId));
+
+    // 读输出（后台）
+    if (hRead) std::thread(PumpOutput, hRead).detach();
+
+    // 等游戏窗口真正出现（期间轮询取消标志，取消就杀掉进程）
+    bool shown = false;
+    for (int i = 0; i < 1800; ++i) {          // 最多 180 秒，每 100ms 一轮
+        if (g_cancelLaunch) {
+            Log("[启动] 用户取消，正在结束游戏进程");
+            TerminateProcess(pi.hProcess, 0);
+            // 等它真的退出，避免窗口残留
+            WaitForSingleObject(pi.hProcess, 5000);
+            g_status = L"已取消启动，游戏进程已关闭";
+            g_launching = false;
+            g_progState = 0;
+            g_stepCur = 0;
+            if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+            return;
+        }
+        if (WaitForGameWindow(pi.dwProcessId, 100)) { shown = true; break; }
+
+        // 进程自己退出了就不再等
+        DWORD ec2 = 0;
+        if (GetExitCodeProcess(pi.hProcess, &ec2) && ec2 != STILL_ACTIVE) {
+            Log("[启动] 游戏进程已退出，退出码 " + std::to_string(ec2));
+            break;
+        }
+    }
+    Log(shown ? "[启动] 游戏窗口已出现" : "[启动] 等待游戏窗口结束");
+
+    g_launching = false;
+    g_progState = 0;
+    g_stepCur = 0;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
+
+// ---------------- CurrentPlayerName ----------------
+std::string CurrentPlayerName() {
+    return (g_cfg.authType == "thirdparty" && !g_cfg.authName.empty()) ? g_cfg.authName : g_cfg.playerName;
+}
+
+// ---------------- ApplySkin ----------------
+static bool ApplySkin(const std::string& srcPath, std::wstring& err) {
+    std::wstring wp = U8ToW(srcPath);
+    if (g_gpOk) {
+        Gdiplus::Bitmap bmp(wp.c_str());
+        if (bmp.GetLastStatus() != Gdiplus::Ok) { err = L"无法读取该图片"; return false; }
+        int w = (int)bmp.GetWidth(), h = (int)bmp.GetHeight();
+        if (!((w == 64 && h == 64) || (w == 64 && h == 32))) {
+            err = L"皮肤必须是 64x64 或 64x32 的 PNG";
+            return false;
+        }
+    }
+
+    wchar_t appdata[MAX_PATH] = { 0 };
+    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
+    fs::path skins = fs::path(appdata) / L"ReignLaunch" / L"skins";
+    std::error_code ec;
+    fs::create_directories(skins, ec);
+
+    std::string player = CurrentPlayerName();
+    if (player.empty()) player = "player";
+
+    fs::path local = skins / fs::u8path(player + ".png");
+    fs::copy_file(fs::u8path(srcPath), local, fs::copy_options::overwrite_existing, ec);
+    if (ec) { err = L"保存皮肤失败"; return false; }
+
+    // CustomSkinLoader 本地皮肤（装了 CSL 模组就能在游戏里看到）
+    if (!g_cfg.gameDir.empty()) {
+        fs::path csl = GameDirPath() / L"CustomSkinLoader" / L"LocalSkin" / L"textures";
+        fs::create_directories(csl, ec);
+        fs::copy_file(local, csl / fs::u8path(player + ".png"), fs::copy_options::overwrite_existing, ec);
+    }
+
+    g_cfg.skinPath = WToU8(local.wstring());
+    SaveConfig();
+    LoadSkinBitmap();
+    return true;
+}
+
+// ---------------- ApplyActiveAccount ----------------
+static void ApplyActiveAccount() {
+    if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) return;
+    Account& a = g_cfg.accounts[g_cfg.activeAcc];
+    g_cfg.authType   = a.type;
+    g_cfg.authServer = a.server;
+    g_cfg.authToken  = a.token;
+    g_cfg.authUuid   = a.uuid;
+    if (a.type == "thirdparty") g_cfg.authName = a.name;
+    else                        g_cfg.playerName = a.name;
+    g_cfg.skinPath = a.skin;
+}
+
+// ---------------- CaptureActiveAccount ----------------
+void CaptureActiveAccount() {
+    if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) return;
+    Account& a = g_cfg.accounts[g_cfg.activeAcc];
+    a.type   = g_cfg.authType;
+    a.server = g_cfg.authServer;
+    a.token  = g_cfg.authToken;
+    a.uuid   = g_cfg.authUuid;
+    a.skin   = g_cfg.skinPath;
+    if (a.type == "thirdparty") a.name = g_cfg.authName;
+    else                        a.name = g_cfg.playerName;
+}
+
+// ---------------- UpsertAccount ----------------
+int UpsertAccount(const std::string& type, const std::string& name,
+                 const std::string& server, const std::string& token,
+                 const std::string& uuid) {
+    for (size_t i = 0; i < g_cfg.accounts.size(); ++i) {
+        if (g_cfg.accounts[i].name == name && g_cfg.accounts[i].type == type) {
+            g_cfg.accounts[i].server = server;
+            g_cfg.accounts[i].token  = token;
+            g_cfg.accounts[i].uuid   = uuid;
+            return (int)i;
+        }
+    }
+    Account a;
+    a.type = type; a.name = name; a.server = server; a.token = token; a.uuid = uuid;
+    g_cfg.accounts.push_back(a);
+    return (int)g_cfg.accounts.size() - 1;
+}
+
+// ---------------- PostJson ----------------
+static bool PostJson(const std::string& url, const std::string& body,
+                     const std::string& ctype, json& out, std::string& err) {
+    std::vector<unsigned char> d;
+    if (!HttpRequest(url, "POST", body, ctype, d, err)) return false;
+    if (d.empty()) { err = "空响应"; return false; }
+    out = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+    if (out.is_discarded()) { err = "响应不是 JSON"; return false; }
+    return true;
+}
+
+// ---------------- MicrosoftLoginThread ----------------
+void MicrosoftLoginThread() {
+    if (g_cfg.msClientId.empty()) {
+        g_msState = 4;
+        g_msMsg = L"未配置 Azure 客户端 ID：请在 config.json 里填 msClientId";
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    g_msState = 1;
+    g_msCode.clear();
+    g_msMsg = L"正在向微软申请登录代码…";
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    // 两套端点：
+    //   v2  —— 自己注册的 Azure 应用（consumers 租户）
+    //   live —— 旧版 MSA 应用（如 Mojang 官方的 00000000402b5328）
+    const std::string v2base   = "https://login.microsoftonline.com/consumers/oauth2/v2.0";
+    const std::string liveDev  = "https://login.live.com/oauth20_connect.srf";
+    const std::string liveTok  = "https://login.live.com/oauth20_token.srf";
+    const std::string scope    = "XboxLive.signin%20offline_access";
+
+    // 1) 申请设备代码（先 v2，失败再 live）
+    json dc; std::string err;
+    bool liveMode = false;
+
+    {
+        std::string body = "client_id=" + g_cfg.msClientId + "&scope=" + scope;
+        if (!PostJson(v2base + "/devicecode", body, "application/x-www-form-urlencoded", dc, err)
+            || !dc.contains("device_code")) {
+            // 走 live.com
+            std::string lbody = "client_id=" + g_cfg.msClientId + "&scope=" + scope +
+                                "&response_type=device_code";
+            json dc2; std::string err2;
+            if (PostJson(liveDev, lbody, "application/x-www-form-urlencoded", dc2, err2)
+                && dc2.contains("device_code")) {
+                dc = dc2;
+                liveMode = true;
+            } else {
+                g_msState = 4;
+                g_msMsg = L"申请登录代码失败：" + U8ToW(err2.empty() ? err : err2);
+                if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+                return;
+            }
+        }
+    }
+
+    std::string deviceCode = dc.value("device_code", std::string());
+    std::string userCode   = dc.value("user_code", std::string());
+    std::string verifyUri  = dc.value("verification_uri", std::string("https://www.microsoft.com/link"));
+    int interval = dc.value("interval", 5);
+    int expires  = dc.value("expires_in", 900);
+    if (deviceCode.empty() || userCode.empty()) {
+        g_msState = 4;
+        g_msMsg = L"微软返回的数据不完整";
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    g_msCode = U8ToW(userCode);
+    g_msUrl  = U8ToW(verifyUri);
+    g_msState = 2;
+    g_msMsg = L"请在浏览器打开 " + g_msUrl + L" 并输入代码 " + g_msCode;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    // 打开浏览器（失败也无所谓，用户自己复制）
+    ShellExecuteW(nullptr, L"open", g_msUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+
+    // 2) 轮询令牌
+    json tk;
+    bool got = false;
+    int waited = 0;
+    while (waited < expires) {
+        Sleep(interval * 1000);
+        waited += interval;
+        std::string tb = "grant_type=urn:ietf:params:oauth:grant-type:device_code"
+                         "&client_id=" + g_cfg.msClientId +
+                         "&device_code=" + deviceCode;
+        json r; std::string e2;
+        if (!PostJson((liveMode ? liveTok : (v2base + "/token")), tb, "application/x-www-form-urlencoded", r, e2)) continue;
+        if (r.contains("access_token")) { tk = r; got = true; break; }
+        std::string er = r.value("error", std::string());
+        if (er.empty() || er == "authorization_pending" || er == "slow_down") continue;
+        g_msState = 4;
+        g_msMsg = L"登录被拒绝：" + U8ToW(r.value("error_description", er));
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+    if (!got) {
+        g_msState = 4;
+        g_msMsg = L"登录超时，请重新开始";
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    std::string msToken = tk.value("access_token", std::string());
+    std::string refresh = tk.value("refresh_token", std::string());
+
+    // 3) Xbox Live
+    g_msMsg = L"正在登录 Xbox Live…";
+    g_msState = 1;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    json xblBody = {
+        { "Properties", { { "AuthMethod", "RPS" }, { "SiteName", "user.auth.xboxlive.com" },
+                          { "RpsTicket", "d=" + msToken } } },
+        { "RelyingParty", "http://auth.xboxlive.com" },
+        { "TokenType", "JWT" }
+    };
+    json xbl; std::string e3;
+    if (!PostJson("https://user.auth.xboxlive.com/user/authenticate", xblBody.dump(),
+                  "application/json", xbl, e3) || !xbl.contains("Token")) {
+        g_msState = 4; g_msMsg = L"Xbox Live 登录失败：" + U8ToW(e3);
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+    std::string xblToken = xbl["Token"].get<std::string>();
+    std::string uhs;
+    try { uhs = xbl["DisplayClaims"]["xui"][0]["uhs"].get<std::string>(); } catch (...) {}
+
+    // 4) XSTS
+    json xstsBody = {
+        { "Properties", { { "SandboxId", "RETAIL" }, { "UserTokens", json::array({ xblToken }) } } },
+        { "RelyingParty", "rp://api.minecraftservices.com/" },
+        { "TokenType", "JWT" }
+    };
+    json xsts; std::string e4;
+    if (!PostJson("https://xsts.auth.xboxlive.com/xsts/authorize", xstsBody.dump(),
+                  "application/json", xsts, e4) || !xsts.contains("Token")) {
+        g_msState = 4;
+        g_msMsg = L"XSTS 授权失败（账号可能未购买 Minecraft）";
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+    std::string xstsToken = xsts["Token"].get<std::string>();
+    try { uhs = xsts["DisplayClaims"]["xui"][0]["uhs"].get<std::string>(); } catch (...) {}
+
+    // 5) 换 Minecraft 令牌
+    g_msMsg = L"正在获取 Minecraft 令牌…";
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    json mcBody = { { "identityToken", "XBL3.0 x=" + uhs + ";" + xstsToken } };
+    json mc; std::string e5;
+    if (!PostJson("https://api.minecraftservices.com/authentication/login_with_xbox",
+                  mcBody.dump(), "application/json", mc, e5) || !mc.contains("access_token")) {
+        g_msState = 4; g_msMsg = L"获取 Minecraft 令牌失败：" + U8ToW(e5);
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+    std::string mcToken = mc["access_token"].get<std::string>();
+
+    // 6) 拉档案
+    std::vector<unsigned char> d6; std::string e6;
+    json prof;
+    {
+        std::string hdr = "application/json\r\nAuthorization: Bearer " + mcToken;
+        if (HttpRequest("https://api.minecraftservices.com/minecraft/profile", "GET", "", hdr, d6, e6)
+            && !d6.empty()) {
+            prof = json::parse(std::string(d6.begin(), d6.end()), nullptr, false);
+        }
+    }
+    if (!prof.is_object() || !prof.contains("id")) {
+        g_msState = 4; g_msMsg = L"该账号没有 Minecraft: Java 版";
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+    std::string uuid = prof.value("id", std::string());
+    std::string name = prof.value("name", std::string());
+
+    // 7) 存账户
+    int idx = UpsertAccount("microsoft", name, "", mcToken, uuid);
+    if (idx >= 0 && idx < (int)g_cfg.accounts.size()) g_cfg.accounts[idx].refresh = refresh;
+    g_cfg.activeAcc = idx;
+    g_cfg.authType  = "microsoft";
+    g_cfg.authName  = name;
+    g_cfg.authUuid  = uuid;
+    g_cfg.authToken = mcToken;
+    SaveConfig();
+
+    g_msState = 3;
+    g_msMsg = L"登录成功：" + U8ToW(name);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
+
+// ---------------- AddDirCand ----------------
+static void AddDirCand(const fs::path& p) {
+    std::error_code ec;
+    if (!fs::is_directory(p / L"versions", ec)) return;
+    std::string s = WToU8(p.wstring());
+    for (auto& c : g_dirCands) if (c.path == s) return;
+    g_dirCands.push_back({ s, s });
+}
+
+// ---------------- RefreshDirCands ----------------
+void RefreshDirCands() {
+    g_dirCands.clear();
+    wchar_t appdata[MAX_PATH] = {0}, profile[MAX_PATH] = {0};
+    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
+    SHGetFolderPathW(nullptr, CSIDL_PROFILE, nullptr, 0, profile);
+
+    if (!g_cfg.gameDir.empty()) AddDirCand(GameDirPath());
+    AddDirCand(fs::path(appdata) / L".minecraft");
+    AddDirCand(fs::path(profile) / L".minecraft");
+    for (const wchar_t* drv : { L"C:", L"D:", L"E:" }) {
+        AddDirCand(fs::path(std::wstring(drv) + L"\\MC\\.minecraft"));
+        AddDirCand(fs::path(std::wstring(drv) + L"\\Games\\.minecraft"));
+        AddDirCand(fs::path(std::wstring(drv) + L"\\.minecraft"));
+    }
+}
+
+// ---------------- JavaVersionOf ----------------
+std::string JavaVersionOf(const fs::path& javaw) {
+    fs::path home = javaw.parent_path().parent_path();
+    std::ifstream f{ home / L"release" };
+    if (!f) return "";
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t p = line.find("JAVA_VERSION=");
+        if (p == std::string::npos) continue;
+        std::string v = line.substr(p + 13);
+        if (!v.empty() && v.front() == '"') v.erase(v.begin());
+        if (!v.empty() && v.back() == '"') v.pop_back();
+        if (v.rfind("1.", 0) == 0 && v.size() > 2) return std::string(1, v[2]); // 1.8.0 -> 8
+        size_t dot = v.find('.');
+        return (dot == std::string::npos) ? v : v.substr(0, dot);
+    }
+    return "";
+}
+
+// ---------------- AddJavaCand ----------------
+static void AddJavaCand(const fs::path& javaw) {
+    if (!FileExists(javaw)) return;
+    std::string s = WToU8(javaw.wstring());
+    for (auto& c : g_javaCands) if (c.path == s) return;
+    std::string v = JavaVersionOf(javaw);
+    g_javaCands.push_back({ s, v.empty() ? "版本未知" : ("Java " + v) });
+}
+
+// ---------------- RefreshJavaCands ----------------
+void RefreshJavaCands() {
+    g_javaCands.clear();
+
+    wchar_t buf[32767];
+    if (GetEnvironmentVariableW(L"JAVA_HOME", buf, 32767))
+        AddJavaCand(fs::path(buf) / L"bin" / L"javaw.exe");
+
+    wchar_t appdata[MAX_PATH] = {0};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {
+        fs::path hm = fs::path(appdata) / L".hmcl" / L"java" / L"windows-x86_64";
+        std::error_code ec;
+        if (DirExists(hm))
+            for (auto& e : fs::directory_iterator(hm, ec))
+                AddJavaCand(e.path() / L"bin" / L"javaw.exe");
+    }
+
+    for (const wchar_t* root : { L"C:\\Program Files\\Java", L"C:\\Program Files (x86)\\Java",
+                                 L"D:\\Program Files\\Java", L"D:\\Java" }) {
+        std::error_code ec;
+        if (!DirExists(root)) continue;
+        for (auto& e : fs::directory_iterator(root, ec))
+            AddJavaCand(e.path() / L"bin" / L"javaw.exe");
+    }
+
+    {
+        std::error_code ec;
+        fs::path ms = L"D:\\MC\\Microsoft";
+        if (DirExists(ms))
+            for (auto& e : fs::directory_iterator(ms, ec))
+                AddJavaCand(e.path() / L"bin" / L"javaw.exe");
+    }
+}
+
+// ---------------- ReadJavaMajorFromJson ----------------
+static int ReadJavaMajorFromJson(const fs::path& p) {
+    std::ifstream f{ p };
+    if (!f) return 0;
+    std::stringstream ss; ss << f.rdbuf();
+    std::string s = ss.str();
+    std::regex re("\"majorVersion\"\\s*:\\s*(\\d+)");
+    std::smatch m;
+    if (std::regex_search(s, m, re)) {
+        try { return std::stoi(m[1].str()); } catch (...) { return 0; }
+    }
+    return 0;
+}
+
+// ---------------- RequiredJavaMajor ----------------
+int RequiredJavaMajor(const std::string& id) {
+    fs::path base = GameDirPath() / L"versions" / fs::u8path(id);
+    fs::path j1 = base / fs::u8path(id + ".json");
+
+    int m = ReadJavaMajorFromJson(j1);
+    if (m > 0) return m;
+
+    // 顺着 inheritsFrom 找一层
+    std::ifstream f{ j1 };
+    if (f) {
+        std::stringstream ss; ss << f.rdbuf();
+        std::string s = ss.str();
+        std::regex re("\"inheritsFrom\"\\s*:\\s*\"([^\"]+)\"");
+        std::smatch mm;
+        if (std::regex_search(s, mm, re)) {
+            std::string parent = mm[1].str();
+            int pm = ReadJavaMajorFromJson(base / fs::u8path(parent + ".json"));
+            if (pm > 0) return pm;
+        }
+    }
+
+    // 兜底：按版本号猜
+    std::regex vre("1\\.(\\d+)(?:\\.(\\d+))?");
+    std::smatch vm;
+    if (std::regex_search(id, vm, vre)) {
+        int minor = std::stoi(vm[1].str());
+        int patch = vm[2].matched ? std::stoi(vm[2].str()) : 0;
+        if (minor > 20 || (minor == 20 && patch >= 5)) return 21;
+        if (minor >= 18) return 17;
+        if (minor == 17) return 17;
+        return 8;
+    }
+    return 0;
+}
+
+// ---------------- PickJavaFor ----------------
+std::string PickJavaFor(int need) {
+    if (g_javaCands.empty()) RefreshJavaCands();
+    std::string best;
+    int bestVer = 9999;
+    for (auto& c : g_javaCands) {
+        std::string v = JavaVersionOf(fs::u8path(c.path));
+        if (v.empty()) continue;
+        int iv = 0;
+        try { iv = std::stoi(v); } catch (...) { continue; }
+        if (iv >= need && iv < bestVer) { bestVer = iv; best = c.path; }
+    }
+    return best;
+}
+
+// ---------------- FetchManifestThread ----------------
+void FetchManifestThread() {
+    g_mcVersState = 1;
+    std::vector<unsigned char> data;
+    std::string err;
+    bool ok = HttpRequest("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+                          "GET", "", "", data, err);
+    if (ok && !data.empty()) {
+        std::string body(data.begin(), data.end());
+        json j = json::parse(body, nullptr, false);
+        if (j.is_object() && j.contains("versions") && j["versions"].is_array()) {
+            std::vector<McVer> list;
+            for (auto& v : j["versions"]) {
+                McVer m;
+                m.id   = v.value("id", std::string());
+                m.type = v.value("type", std::string());
+                m.url  = v.value("url", std::string());
+                std::string rt = v.value("releaseTime", std::string());
+                if (rt.size() >= 10) m.date = rt.substr(0, 10);
+                if (!m.id.empty() && !m.url.empty()) list.push_back(m);
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_mcVersMutex);
+                g_mcVers = std::move(list);      // 锁内写，move 避免拷贝
+            }
+            g_mcVersState = 2;
+        } else g_mcVersState = 3;
+    } else g_mcVersState = 3;
+    // RebuildDlView();   // 删掉！让 UI 线程独占 g_dlView
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
+
+// ---------------- BuildLaunchPlan ----------------
+bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std::string& error) {
+    fs::path mcDir = GameDirPath();
 
     // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
     std::string gameDirEff = g_cfg.gameDir;
@@ -946,12 +3199,12 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
     for (size_t i = 0; i < classpath.size(); ++i) { if (i) cp += ";"; cp += classpath[i]; }
 
     // 账号信息：第三方优先
-    bool thirdParty = (g_cfg.authType == "thirdparty" && !g_cfg.authToken.empty());
-    std::string userName = thirdParty ? g_cfg.authName : g_cfg.playerName;
-    std::string userUuid = thirdParty ? g_cfg.authUuid : OfflineUUID(g_cfg.playerName);
-    std::string userToken = thirdParty ? g_cfg.authToken : "0";
-    std::string userType = thirdParty ? "mojang" : "offline";
-
+    bool msAcc = (g_cfg.authType == "microsoft" && !g_cfg.authToken.empty() && !g_cfg.authUuid.empty());
+    bool thirdParty = (!msAcc && g_cfg.authType == "thirdparty" && !g_cfg.authToken.empty());
+    std::string userName = msAcc ? g_cfg.authName : (thirdParty ? g_cfg.authName : g_cfg.playerName);
+    std::string userUuid = msAcc ? g_cfg.authUuid : (thirdParty ? g_cfg.authUuid : OfflineUUID(g_cfg.playerName));
+    std::string userToken = msAcc ? g_cfg.authToken : (thirdParty ? g_cfg.authToken : "0");
+    std::string userType = msAcc ? "msa" : (thirdParty ? "mojang" : "offline");
     std::map<std::string, std::string> ph;
     ph["auth_player_name"]   = userName;
     ph["version_name"]       = versionId;
@@ -1061,1289 +3314,8 @@ static bool BuildLaunchPlan(const std::string& versionId, LaunchPlan& plan, std:
     return true;
 }
 
-// ============================ 下载 ============================
-struct DownloadStats { int existed = 0, downloaded = 0, failed = 0; };
-
-// ---------------- 多线程下载 ----------------
-struct DLTask { std::string url; fs::path dest; std::string label; };
-
-static void RunDownloads(std::vector<DLTask>& tasks, DownloadStats& st, int threads = 0) {
-    if (tasks.empty()) return;
-    if (threads <= 0) threads = g_cfg.dlThreads;
-    if (threads < 1) threads = 1;
-    if (threads > 128) threads = 128;
-    if (threads > (int)tasks.size()) threads = (int)tasks.size();
-
-    std::atomic<size_t> next{ 0 };
-    std::atomic<int> okCount{ 0 }, failCount{ 0 };
-    std::mutex logMu;
-
-    g_progTotal = (int)tasks.size();
-    g_progCur = 0;
-
-    std::vector<std::thread> pool;
-    for (int i = 0; i < threads; ++i) {
-        pool.emplace_back([&]() {
-            for (;;) {
-                if (g_dlCancel) break;
-                size_t idx = next.fetch_add(1);
-                if (idx >= tasks.size()) break;
-                std::string err;
-                if (DownloadFile(tasks[idx].url, tasks[idx].dest, err)) {
-                    okCount.fetch_add(1);
-                } else {
-                    failCount.fetch_add(1);
-                    std::lock_guard<std::mutex> lk(logMu);
-                    Log("[失败] " + tasks[idx].label + " : " + err);
-                }
-                g_progCur = okCount.load() + failCount.load();
-            }
-        });
-    }
-    for (auto& th : pool) th.join();
-
-    st.downloaded += okCount.load();
-    st.failed += failCount.load();
-}
-
-static void DownloadMissing(const std::string& versionId, DownloadStats& st) {
-    fs::path mcDir = fs::u8path(g_cfg.gameDir);
-    fs::path libRoot = mcDir / L"libraries";
-    json vj = ResolveVersion(versionId);
-    if (!vj.is_object()) { st.failed++; return; }
-
-    std::vector<DLTask> batch1;
-
-    if (vj.contains("libraries") && vj["libraries"].is_array()) {
-        for (auto& lib : vj["libraries"]) {
-            if (!lib.is_object()) continue;
-            if (lib.contains("rules") && !RulesAllow(lib["rules"])) continue;
-            if (!lib.contains("downloads") || !lib["downloads"].is_object()) continue;
-            const json& dl = lib["downloads"];
-            if (!dl.contains("artifact") || !dl["artifact"].is_object()) continue;
-
-            const json& art = dl["artifact"];
-            std::string rel  = art.value("path", std::string());
-            std::string url  = art.value("url", std::string());
-            std::string sha1 = art.value("sha1", std::string());
-            if (rel.empty() || url.empty()) continue;
-
-            fs::path dest = libRoot / fs::u8path(rel);
-            bool need = true;
-            if (FileExists(dest)) {
-                need = false;
-                if (!sha1.empty()) {
-                    std::ifstream f{ dest, std::ios::binary };
-                    std::vector<unsigned char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                    if (Sha1Hex(buf) != sha1) need = true;
-                }
-                if (!need) st.existed++;
-            }
-            if (need) batch1.push_back({ url, dest, rel });
-        }
-    }
-
-    fs::path clientJar = mcDir / L"versions" / fs::u8path(versionId) / fs::u8path(versionId + ".jar");
-    if (vj.contains("downloads") && vj["downloads"].is_object() && vj["downloads"].contains("client")) {
-        std::string url = vj["downloads"]["client"].value("url", std::string());
-        if (!url.empty()) {
-            if (FileExists(clientJar)) st.existed++;
-            else batch1.push_back({ url, clientJar, versionId + ".jar" });
-        }
-    }
-
-    RunDownloads(batch1, st);
-
-    std::string indexId, indexUrl;
-    if (vj.contains("assetIndex") && vj["assetIndex"].is_object()) {
-        indexId  = vj["assetIndex"].value("id", std::string());
-        indexUrl = vj["assetIndex"].value("url", std::string());
-    }
-    if (!indexId.empty() && !indexUrl.empty()) {
-        fs::path idxPath = mcDir / L"assets" / L"indexes" / fs::u8path(indexId + ".json");
-        if (!FileExists(idxPath)) {
-            std::string err;
-            if (DownloadFile(indexUrl, idxPath, err)) st.downloaded++;
-            else st.failed++;
-        } else st.existed++;
-
-        json idx = ReadJsonFile(idxPath);
-        if (idx.is_object() && idx.contains("objects") && idx["objects"].is_object()) {
-            std::vector<DLTask> batch2;
-            for (auto& it : idx["objects"].items()) {
-                std::string hash = it.value().value("hash", std::string());
-                if (hash.size() < 3) continue;
-                fs::path obj = mcDir / L"assets" / L"objects" / fs::u8path(hash.substr(0, 2)) / fs::u8path(hash);
-                if (FileExists(obj)) { st.existed++; continue; }
-                batch2.push_back({ "https://resources.download.minecraft.net/" + hash.substr(0, 2) + "/" + hash, obj, hash });
-            }
-            RunDownloads(batch2, st);
-        }
-    }
-}
-
-
-// 启动前快速检查：只查文件是否存在，不做哈希校验（快）
-static int CountMissing(const std::string& versionId) {
-    fs::path mcDir = fs::u8path(g_cfg.gameDir);
-
-    // 版本隔离：把 gameDir 指向 versions/<id>，让 Forge 用该版本自己的 mods
-    std::string gameDirEff = g_cfg.gameDir;
-    if (ShouldIsolate(versionId, mcDir)) {
-        gameDirEff = WToU8((mcDir / L"versions" / fs::u8path(versionId)).wstring());
-    }
-    fs::path libRoot = mcDir / L"libraries";
-    json vj = ResolveVersion(versionId);
-    if (!vj.is_object()) return -1;
-
-    int missing = 0;
-
-    if (vj.contains("libraries") && vj["libraries"].is_array()) {
-        for (auto& lib : vj["libraries"]) {
-            if (!lib.is_object()) continue;
-            if (lib.contains("rules") && !RulesAllow(lib["rules"])) continue;
-            if (!lib.contains("downloads") || !lib["downloads"].is_object()) continue;
-            const json& dl = lib["downloads"];
-            if (!dl.contains("artifact") || !dl["artifact"].is_object()) continue;
-            std::string rel = dl["artifact"].value("path", std::string());
-            if (rel.empty()) continue;
-            if (!FileExists(libRoot / fs::u8path(rel))) missing++;
-        }
-    }
-
-    fs::path clientJar = mcDir / L"versions" / fs::u8path(versionId) / fs::u8path(versionId + ".jar");
-    if (vj.contains("downloads") && vj["downloads"].is_object() && vj["downloads"].contains("client"))
-        if (!FileExists(clientJar)) missing++;
-
-    std::string indexId;
-    if (vj.contains("assetIndex") && vj["assetIndex"].is_object())
-        indexId = vj["assetIndex"].value("id", std::string());
-
-    if (!indexId.empty()) {
-        fs::path idxPath = mcDir / L"assets" / L"indexes" / fs::u8path(indexId + ".json");
-        if (!FileExists(idxPath)) {
-            missing++;
-        } else {
-            json idx = ReadJsonFile(idxPath);
-            if (idx.is_object() && idx.contains("objects") && idx["objects"].is_object()) {
-                for (auto& it : idx["objects"].items()) {
-                    std::string hash = it.value().value("hash", std::string());
-                    if (hash.size() < 3) continue;
-                    fs::path obj = mcDir / L"assets" / L"objects" / fs::u8path(hash.substr(0, 2)) / fs::u8path(hash);
-                    if (!FileExists(obj)) missing++;
-                }
-            }
-        }
-    }
-    return missing;
-}
-
-// ============================ 启动线程 ============================
-static HANDLE g_gameProc = nullptr;
-static std::atomic<DWORD> g_gamePid{ 0 };
-
-static void PumpOutput(HANDLE hRead) {
-    char buf[4096];
-    DWORD got = 0;
-    std::string pending;
-    while (ReadFile(hRead, buf, sizeof(buf) - 1, &got, nullptr) && got > 0) {
-        buf[got] = 0;
-        pending += buf;
-        size_t pos;
-        while ((pos = pending.find('\n')) != std::string::npos) {
-            std::string line = pending.substr(0, pos);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            Log("[游戏] " + line);
-            pending.erase(0, pos + 1);
-        }
-    }
-    if (!pending.empty()) Log("[游戏] " + pending);
-    CloseHandle(hRead);
-}
-
-// 等游戏窗口真正出现（不是进程创建就算完成）
-struct WinWaitCtx { DWORD pid; bool found; };
-
-static BOOL CALLBACK FindGameWindowProc(HWND h, LPARAM lp) {
-    WinWaitCtx* c = (WinWaitCtx*)lp;
-    DWORD wp = 0;
-    GetWindowThreadProcessId(h, &wp);
-    if (wp != c->pid) return TRUE;
-    if (!IsWindowVisible(h)) return TRUE;
-    wchar_t title[256] = {0};
-    GetWindowTextW(h, title, 256);
-    if (wcslen(title) == 0) return TRUE;
-    c->found = true;
-    return FALSE;
-}
-
-static bool WaitForGameWindow(DWORD pid, int timeoutMs) {
-    DWORD start = GetTickCount();
-    while (GetTickCount() - start < (DWORD)timeoutMs) {
-        WinWaitCtx c{ pid, false };
-        EnumWindows(FindGameWindowProc, (LPARAM)&c);
-        if (c.found) return true;
-        if (g_cancelLaunch) return false;
-        Sleep(250);
-    }
-    return false;
-}
-static void LaunchThread(std::string versionId) {
-    g_launching = true;
-    Log("=========== 启动 " + versionId + " ===========");
-    Log("账号: " + (g_cfg.authType == "thirdparty" ? (g_cfg.authName + " (第三方)") : (g_cfg.playerName + " (离线)")));
-
-    g_stepCur = 0;
-
-    // 按 MC 版本自动匹配 Java
-    {
-        int need = RequiredJavaMajor(versionId);
-        if (need > 0) {
-            std::string cur = g_cfg.javaPath.empty() ? "" : JavaVersionOf(fs::u8path(g_cfg.javaPath));
-            int curVer = 0;
-            try { if (!cur.empty()) curVer = std::stoi(cur); } catch (...) {}
-
-            std::string pick = PickJavaFor(need);
-            int pickVer = 0;
-            if (!pick.empty()) {
-                try { pickVer = std::stoi(JavaVersionOf(fs::u8path(pick))); } catch (...) {}
-            }
-
-            if (pickVer > 0 && pickVer != curVer) {
-                // 优先用最贴近的版本：1.20.1 用 17 而不是 25
-                g_cfg.javaPath = pick;
-                SaveConfig();
-                Log("[Java] 自动切换到 Java " + std::to_string(pickVer) +
-                    "（该版本需要 Java " + std::to_string(need) + "）");
-            } else if (curVer < need) {
-                Log("[错误] 该版本需要 Java " + std::to_string(need) + "，未检测到可用 Java");
-                if (g_hwnd) PostMessageW(g_hwnd, WM_APP_NEEDJAVA, (WPARAM)need, 0);
-                g_launching = false;
-                g_progState = 0;
-                return;
-            }
-        }
-    }
-
-    if (g_cfg.javaPath.empty() || !FileExists(fs::u8path(g_cfg.javaPath))) {
-        Log("[错误] Java 路径无效");
-        g_launching = false;
-        PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
-        return;
-    }
-
-    g_stepCur = 1;   // 已通过 Java 检测
-    if (g_cancelLaunch) { g_launching = false; g_progState = 0; return; }
-
-    // 启动前自动检查缺失文件并补全
-    {
-        int miss = CountMissing(versionId);
-        if (miss > 0) {
-            g_progTotal = miss;
-            g_progCur = 0;
-            g_progState = 1;
-            RebuildDlView();
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-        }
-        if (miss < 0) {
-            Log("[错误] 版本 JSON 无法解析，无法检查文件完整性");
-        } else if (miss > 0) {
-            Log("[补全] 检测到 " + std::to_string(miss) + " 个文件缺失，开始自动下载…");
-            DownloadStats st;
-            DownloadMissing(versionId, st);
-            Log("[补全] 完成：新下载 " + std::to_string(st.downloaded) +
-                "，失败 " + std::to_string(st.failed));
-            g_progState = 0;
-            if (st.failed > 0) {
-                Log("[错误] 有文件下载失败，请检查网络后重试");
-                g_launching = false;
-                PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
-                return;
-            }
-        }
-    }
-
-    g_stepCur = 2;   // 依赖处理完
-    if (g_cancelLaunch) { g_launching = false; g_progState = 0; return; }
-
-    LaunchPlan plan;
-    plan.maxMem = g_cfg.maxMemMB;
-    std::string err;
-    if (!BuildLaunchPlan(versionId, plan, err)) {
-        Log("[错误] " + err);
-        g_launching = false;
-        PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
-        return;
-    }
-
-    g_stepCur = 3;   // 登录完成
-    if (g_cancelLaunch) { g_launching = false; g_progState = 0; return; }
-
-    SECURITY_ATTRIBUTES sa{ sizeof(sa) };
-    sa.bInheritHandle = TRUE;
-    HANDLE rd = nullptr, wr = nullptr;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) {
-        Log("[错误] 创建管道失败");
-        g_launching = false;
-        PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
-        return;
-    }
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si{ sizeof(si) };
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.hStdOutput = wr; si.hStdError = wr; si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> cmdBuf(plan.commandLine.begin(), plan.commandLine.end());
-    cmdBuf.push_back(0);
-
-    BOOL ok = CreateProcessW(plan.javaPath.c_str(), cmdBuf.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW, nullptr, plan.workDir.c_str(), &si, &pi);
-    CloseHandle(wr);
-
-    if (!ok) {
-        Log("[错误] 进程创建失败，GetLastError=" + std::to_string(GetLastError()));
-        CloseHandle(rd);
-        g_launching = false;
-        PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
-        return;
-    }
-
-    g_progState = 0;
-    Log("[成功] 游戏进程已创建，PID=" + std::to_string(pi.dwProcessId) + "，等待游戏窗口…");
-    CloseHandle(pi.hThread);
-    g_gameProc = pi.hProcess;
-    g_gamePid = pi.dwProcessId;
-
-    // 第四步「等待游戏启动」：等窗口真的出现才打勾
-    {
-        DWORD gamePid = pi.dwProcessId;
-        std::thread waiter([gamePid]() {
-            if (WaitForGameWindow(gamePid, 180000)) {
-                g_stepCur = 4;
-                RebuildDlView();
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-                Log("[成功] 游戏窗口已出现");
-            } else {
-                Log("[提示] 等待 180 秒仍未检测到游戏窗口（可能已崩溃，请看日志）");
-            }
-        });
-        waiter.detach();
-    }
-
-    std::thread reader(PumpOutput, rd);
-    reader.detach();
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD code = 0;
-    GetExitCodeProcess(pi.hProcess, &code);
-    Log("=========== 游戏退出，退出码 " + std::to_string(code) + " ===========");
-    CloseHandle(pi.hProcess);
-    g_gameProc = nullptr;
-    g_gamePid = 0;
-    g_launching = false;
-
-    if (code != 0) PostMessageW(g_hwnd, WM_APP_ERROR, 0, 0);
-    else PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-}
-
-// ============================ 错误窗口 ============================
-static HWND g_hErrWnd = nullptr;
-static HWND g_hErrEdit = nullptr;
-
-static LRESULT CALLBACK ErrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_CREATE: {
-        g_hErrEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-            12, 12, 656, 380, hwnd, (HMENU)9001, nullptr, nullptr);
-        SendMessageW(g_hErrEdit, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-        CreateWindowW(L"BUTTON", L"复制日志", WS_CHILD | WS_VISIBLE, 470, 404, 96, 32, hwnd, (HMENU)9002, nullptr, nullptr);
-        CreateWindowW(L"BUTTON", L"关闭", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 578, 404, 90, 32, hwnd, (HMENU)IDCANCEL, nullptr, nullptr);
-        return 0;
-    }
-    case WM_COMMAND:
-        if (LOWORD(wp) == IDCANCEL) DestroyWindow(hwnd);
-        else if (LOWORD(wp) == 9002) {
-            int n = GetWindowTextLengthW(g_hErrEdit);
-            std::wstring t(n > 0 ? n : 0, L'\0');
-            if (n > 0) GetWindowTextW(g_hErrEdit, &t[0], n + 1);
-            if (OpenClipboard(hwnd)) {
-                EmptyClipboard();
-                size_t bytes = (t.size() + 1) * sizeof(wchar_t);
-                HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, bytes);
-                if (h) {
-                    memcpy(GlobalLock(h), t.c_str(), bytes);
-                    GlobalUnlock(h);
-                    SetClipboardData(CF_UNICODETEXT, h);
-                }
-                CloseClipboard();
-            }
-        }
-        return 0;
-    case WM_CLOSE:
-        DestroyWindow(hwnd);
-        return 0;
-    case WM_DESTROY:
-        g_hErrWnd = nullptr;
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-// ============================ 界面层 ============================
-static std::atomic<bool> g_downloading{ false };
-static bool g_uiTest = false;
-static bool g_showDirList = false;
-static int  g_settingsTab = 0;   // 设置页左侧菜单：0=设置 1=关于
-static bool g_showJavaList = false;
-static int Scale(int v) { return (int)(v * g_dpi / 96.0); }
-
-struct Layout { RECT header{}, sidebar{}, main{}, content{}; };
-static Layout g_ly;
-
-static std::wstring       g_status;
-static std::atomic<int>   g_loginState{ 0 };   // 0空闲 1进行中 2成功 3失败
-static std::string        g_loginErr;
-
-#define WM_APP_LOGIN (WM_APP + 3)
-
-// 控件 ID
-#define ID_TAB_LAUNCH   1001
-#define ID_TAB_USER     1002
-#define ID_TAB_SET      1003
-#define ID_TAB_ABOUT    1004
-#define ID_TAB_INST     1005
-#define ID_TAB_DL       1006
-#define ID_TAB_MODS     1007
-#define ID_BTN_LAUNCH   1101
-#define ID_BTN_FILL     1102
-#define ID_BTN_REFRESH  1103
-#define ID_ED_SERVER    1201
-#define ID_ED_USER      1202
-#define ID_ED_PASS      1203
-#define ID_BTN_LOGIN    1204
-#define ID_BTN_OFFLINE  1206
-#define ID_BTN_LOGOUT   1205
-#define ID_ED_DIR       1301
-#define ID_ED_JAVA      1302
-#define ID_ED_MEM       1303
-#define ID_ED_NAME      1304
-#define ID_BTN_AUTODIR  1311
-#define ID_BTN_BROWSEDIR 1312
-#define ID_BTN_AUTOJAVA 1313
-#define ID_BTN_BROWSEJAVA 1314
-#define ID_BTN_DIRDROP   1315
-#define ID_BTN_JAVADROP  1316
-#define ID_BTN_INSTARROW 1317
-#define ID_BTN_OVCANCEL  1330
-#define ID_BTN_SKIN      1340
-#define ID_BTN_DELACC    1341
-#define ID_ED_THREADS    1360
-#define ID_ED_JVM        1361
-#define ID_ED_GAME       1362
-#define ID_BTN_SOURCE    1363
-#define ID_BTN_FULL      1364
-#define ID_BTN_UPDATE    1365
-#define ID_DL_VANILLA    1370
-#define ID_DL_FABRIC     1371
-#define ID_DL_QUILT      1372
-#define ID_DL_FORGE      1373
-#define ID_DL_NEO        1374
-#define ID_DL_FILTER0    1380
-#define ID_DL_FILTER1    1381
-#define ID_DL_FILTER2    1382
-#define ID_DL_FILTER3    1383
-#define ID_DL_INSTALL    1384
-#define ID_DL_FAPI       1387
-#define ID_DL_QSL        1388
-#define ID_DL_FILTERSEL  1389
-#define ID_DL_CANCEL     1390
-#define ID_USER_M0       1400
-#define ID_USER_M1       1401
-#define ID_USER_M2       1402
-#define ID_MOD_TABDL     1410
-#define ID_MOD_TABIN     1411
-#define ID_MOD_SEARCH    1412
-#define ID_MOD_SOURCE    1413
-#define ID_MOD_INSTALL   1414
-#define ID_MOD_TOGGLE    1415
-#define ID_MOD_DELETE    1416
-#define ID_DL_SEC_GAME   1420
-#define ID_DL_SEC_MOD    1421
-#define ID_INST_TAB_LIST 1422
-#define ID_INST_TAB_MOD  1423
-#define ID_ED_SEARCH     1385
-#define ID_DL_BACK       1386
-#define ID_BTN_SAVE     1320
-#define ID_BTN_ISO      1321
-
-static void FillRoundRect(HDC dc, RECT r, int radius, COLORREF color) {
-    HRGN rgn = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, radius, radius);
-    HBRUSH br = CreateSolidBrush(color);
-    FillRgn(dc, rgn, br);
-    DeleteObject(br);
-    DeleteObject(rgn);
-}
-static void DrawTextIn(HDC dc, const std::wstring& s, RECT r, COLORREF c, HFONT f,
-                       UINT fmt = DT_LEFT | DT_VCENTER | DT_SINGLELINE) {
-    SelectObject(dc, f);
-    SetTextColor(dc, c);
-    SetBkMode(dc, TRANSPARENT);
-    DrawTextW(dc, s.c_str(), (int)s.size(), &r, fmt | DT_NOPREFIX);
-}
-static std::wstring CtlText(HWND h) {
-    int n = GetWindowTextLengthW(h);
-    if (n <= 0) return L"";
-    std::wstring s(n + 1, L'\0');
-    GetWindowTextW(h, &s[0], n + 1);
-    s.resize(n);
-    return s;
-}
-
-static HWND MakeBtn(HWND parent, const wchar_t* text, int id) {
-    return CreateWindowW(L"BUTTON", text, WS_CHILD | BS_OWNERDRAW,
-                         0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
-}
-static HWND MakeEdit(HWND parent, int id, const wchar_t* text, DWORD extra = 0) {
-    HWND h = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text,
-                             WS_CHILD | ES_AUTOHSCROLL | extra,
-                             0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, nullptr, nullptr);
-    SendMessageW(h, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-    SendMessageW(h, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 6));
-    return h;
-}
-
-// ---------------- 布局 ----------------
-static void ComputeLayout(int w, int h) {
-    int headerH = Scale(64);
-    int sideW   = Scale(300);
-    g_ly.header  = { 0, 0, w, headerH };
-    g_ly.sidebar = { 0, headerH, sideW, h };
-    g_ly.main    = { sideW, headerH, w, h };
-    g_ly.content = { 0, headerH, w, h };
-}
-
-static RECT TabRect(int i) {
-    int x = Scale(220) + i * Scale(96);
-    int y = Scale(14);
-    RECT r = { x, y, x + Scale(88), y + Scale(36) };
-    return r;
-}
-static RECT LaunchBtnRect() {
-    int pad = Scale(24), bw = Scale(260), bh = Scale(64);
-    RECT r;
-    r.right = g_ly.main.right - pad - Scale(52);
-    r.left = r.right - bw;
-    r.bottom = g_ly.main.bottom - pad;
-    r.top = r.bottom - bh;
-    return r;
-}
-static RECT SmallBtnRect(int idx) {   // 0=补全文件 1=刷新
-    RECT lb = LaunchBtnRect();
-    int w = Scale(120), h = Scale(36), gap = Scale(12);
-    RECT r;
-    r.right = lb.right - idx * (w + gap);
-    r.left = r.right - w;
-    r.bottom = lb.top - Scale(16);
-    r.top = r.bottom - h;
-    return r;
-}
-
-static void SettingsGeom(int row, RECT& ed, RECT& drop, RECT& autoB, RECT& browse);
-
-static const wchar_t* IsoLabel() {
-    switch (g_cfg.isoMode) {
-    case 0: return L"隔离所有实例";
-    case 1: return L"隔离模组实例";
-    default: return L"不隔离实例";
-    }
-}
-static const wchar_t* WinModeLabel(int m) {
-    switch (m) {
-    case 1:  return L"最大化";
-    case 2:  return L"全屏";
-    default: return L"窗口";
-    }
-}
-static void LayoutControls() {
-    int w = g_ly.content.right, h = g_ly.content.bottom;
-
-    // 顶部标签
-    HWND tabBtns[5] = { hBtnTabLaunch, hBtnTabDl, hBtnTabInst, hBtnTabUser, hBtnTabSettings };
-    for (int i = 0; i < 5; ++i) {
-        RECT r = TabRect(i);
-        MoveWindow(tabBtns[i], r.left, r.top, r.right - r.left, r.bottom - r.top, TRUE);
-    }
-
-    // 启动页
-    {
-        RECT b = LaunchBtnRect();
-        MoveWindow(hBtnLaunch, b.left, b.top, b.right - b.left, b.bottom - b.top, TRUE);
-        MoveWindow(hBtnInstArrow, b.right + Scale(8), b.top, Scale(44), b.bottom - b.top, TRUE);
-
-        RECT ocr = OverlayCancelRect();
-        MoveWindow(hBtnOverlayCancel, ocr.left, ocr.top, ocr.right - ocr.left, ocr.bottom - ocr.top, TRUE);
-        RECT s0 = SmallBtnRect(0), s1 = SmallBtnRect(1);
-        MoveWindow(hBtnRefresh, g_ly.content.right - Scale(134), g_ly.content.top + Scale(12), Scale(110), Scale(32), TRUE);
-    }
-
-    // 用户页：居中面板
-    {
-        int panelW = Scale(620);
-        int x = g_ly.main.left + (g_ly.main.right - g_ly.main.left - panelW) / 2;
-        if (x < g_ly.main.left + Scale(20)) x = g_ly.main.left + Scale(20);
-        int y = g_ly.content.top + Scale(116);
-        int rowH = Scale(58);
-        int edW = Scale(380), edH = Scale(30);
-
-        {
-            int my = g_ly.content.top + Scale(18);
-            int mw = Scale(140), mg = Scale(10);
-            int mx = x;
-            MoveWindow(hBtnUserM0, mx, my, mw, Scale(36), TRUE); mx += mw + mg;
-            MoveWindow(hBtnUserM1, mx, my, mw, Scale(36), TRUE); mx += mw + mg;
-            MoveWindow(hBtnUserM2, mx, my, mw + Scale(70), Scale(36), TRUE);
-        }
-
-        MoveWindow(hEdServer, x + Scale(110), y, edW, edH, TRUE);
-        MoveWindow(hEdUser,   x + Scale(110), y + rowH, edW, edH, TRUE);
-        MoveWindow(hEdPass,   x + Scale(110), y + rowH * 2, edW, edH, TRUE);
-        MoveWindow(hBtnLogin, x + Scale(110), y + rowH * 3, Scale(120), Scale(36), TRUE);
-        MoveWindow(hBtnLogout, x + Scale(246), y + rowH * 3, Scale(140), Scale(36), TRUE);
-        MoveWindow(hEdName, x + Scale(110), y + rowH * 4 + Scale(16), Scale(240), edH, TRUE);
-        MoveWindow(hBtnOffline, x + Scale(366), y + rowH * 4 + Scale(14), Scale(110), Scale(34), TRUE);
-
-        RECT sb = g_ly.sidebar;
-        MoveWindow(hBtnSkin, sb.left + Scale(12), sb.bottom - Scale(92), (sb.right - sb.left) - Scale(24), Scale(36), TRUE);
-        MoveWindow(hBtnDelAcc, sb.left + Scale(12), sb.bottom - Scale(50), (sb.right - sb.left) - Scale(24), Scale(36), TRUE);
-    }
-
-    // 设置页
-    {
-        int x = g_ly.main.left + Scale(40);
-        int y = g_ly.content.top + Scale(50);
-        int rowH = Scale(62);
-        int edW = Scale(420), edH = Scale(30);
-        int bx = x + Scale(110) + edW + Scale(12);
-
-        RECT e0, d0, a0, b0, e1, d1, a1, b1;
-        SettingsGeom(0, e0, d0, a0, b0);
-        SettingsGeom(1, e1, d1, a1, b1);
-
-        MoveWindow(hEdDir,        e0.left, e0.top, e0.right - e0.left, e0.bottom - e0.top, TRUE);
-        MoveWindow(hBtnDirDrop,   d0.left, d0.top, d0.right - d0.left, d0.bottom - d0.top, TRUE);
-        MoveWindow(hBtnAutoDir,   a0.left, a0.top, a0.right - a0.left, a0.bottom - a0.top, TRUE);
-        MoveWindow(hBtnBrowseDir, b0.left, b0.top, b0.right - b0.left, b0.bottom - b0.top, TRUE);
-
-        MoveWindow(hEdJava,        e1.left, e1.top, e1.right - e1.left, e1.bottom - e1.top, TRUE);
-        MoveWindow(hBtnJavaDrop,   d1.left, d1.top, d1.right - d1.left, d1.bottom - d1.top, TRUE);
-        MoveWindow(hBtnAutoJava,   a1.left, a1.top, a1.right - a1.left, a1.bottom - a1.top, TRUE);
-        MoveWindow(hBtnBrowseJava, b1.left, b1.top, b1.right - b1.left, b1.bottom - b1.top, TRUE);
-
-        MoveWindow(hEdMem,  x + Scale(110), y + rowH * 2, Scale(110), edH, TRUE);
-
-        MoveWindow(hBtnSave, x + Scale(110), y + rowH * 7 + Scale(10), Scale(140), Scale(40), TRUE);
-        MoveWindow(hBtnIso,  x + Scale(270), y + rowH * 7 + Scale(10), Scale(240), Scale(40), TRUE);
-        {
-            int itx = g_ly.content.left + Scale(24);
-            int ity = g_ly.content.top + Scale(16);
-            MoveWindow(hBtnInstTabList, itx, ity, Scale(110), Scale(32), TRUE); itx += Scale(118);
-            MoveWindow(hBtnInstTabMod,  itx, ity, Scale(110), Scale(32), TRUE);
-        }
-
-        MoveWindow(hEdThreads, x + Scale(110), y + rowH * 3 + Scale(6), Scale(90), Scale(30), TRUE);
-        MoveWindow(hEdJvm,  x + Scale(110), y + rowH * 4 + Scale(6), Scale(560), Scale(30), TRUE);
-        MoveWindow(hEdGame, x + Scale(110), y + rowH * 5 + Scale(6), Scale(560), Scale(30), TRUE);
-        MoveWindow(hBtnSource, x + Scale(110), y + rowH * 6 + Scale(4), Scale(200), Scale(36), TRUE);
-        MoveWindow(hBtnFull,   x + Scale(322), y + rowH * 6 + Scale(4), Scale(230), Scale(36), TRUE);
-        MoveWindow(hBtnUpdate, g_ly.main.left + Scale(40), g_ly.content.bottom - Scale(70), Scale(140), Scale(38), TRUE);
-
-    }
-
-        {
-            int tx0 = g_ly.content.left + Scale(24);
-            int ty0 = g_ly.content.top + Scale(16);
-            MoveWindow(hBtnDlSecGame, tx0, ty0, Scale(110), Scale(32), TRUE); tx0 += Scale(118);
-            MoveWindow(hBtnDlSecMod,  tx0, ty0, Scale(110), Scale(32), TRUE); tx0 += Scale(126);
-            MoveWindow(hBtnDlFilterSel, tx0, ty0, Scale(150), Scale(32), TRUE);
-            MoveWindow(hEdSearch, g_ly.content.right - Scale(24) - Scale(240), ty0, Scale(240), Scale(30), TRUE);
-            MoveWindow(hBtnModSource,  tx0, ty0, Scale(160), Scale(32), TRUE);
-            MoveWindow(hEdModSearch,   tx0 + Scale(168), ty0, Scale(280), Scale(30), TRUE);
-            MoveWindow(hBtnModInstall, g_ly.content.right - Scale(24) - Scale(130),
-                       g_ly.content.bottom - Scale(58), Scale(130), Scale(38), TRUE);
-
-            int dby = g_ly.content.top + Scale(64);
-            int dbw = Scale(102), dbg = Scale(6);
-            int dbx = g_ly.content.left + Scale(24);
-            MoveWindow(hBtnDlVanilla, dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
-            MoveWindow(hBtnDlFabric,  dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
-            MoveWindow(hBtnDlQuilt,   dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
-            MoveWindow(hBtnDlForge,   dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
-            MoveWindow(hBtnDlNeo,     dbx, dby, dbw, Scale(32), TRUE); dbx += dbw + dbg;
-            MoveWindow(hBtnDlFapi,    dbx, dby, Scale(122), Scale(32), TRUE); dbx += Scale(128);
-            MoveWindow(hBtnDlQsl,     dbx, dby, Scale(70), Scale(32), TRUE);
-            MoveWindow(hBtnDlInstall, g_ly.content.right - Scale(24) - Scale(130),
-                       g_ly.content.bottom - Scale(58), Scale(130), Scale(38), TRUE);
-            MoveWindow(hBtnDlBack, g_ly.content.left + Scale(24), g_ly.content.bottom - Scale(58), Scale(100), Scale(32), TRUE);
-
-            {
-                int mx0 = g_ly.content.left + Scale(24);
-                int ty0 = g_ly.content.top + Scale(16);
-                MoveWindow(hBtnModTabDl, mx0, ty0, Scale(110), Scale(32), TRUE); mx0 += Scale(118);
-                MoveWindow(hBtnModTabIn, mx0, ty0, Scale(96),  Scale(32), TRUE); mx0 += Scale(104);
-                MoveWindow(hBtnModSource, mx0, ty0, Scale(150), Scale(32), TRUE); mx0 += Scale(158);
-                MoveWindow(hEdModSearch, mx0, ty0, Scale(240), Scale(30), TRUE);
-
-                int by2 = g_ly.content.bottom - Scale(58);
-                MoveWindow(hBtnModInstall, g_ly.content.right - Scale(24) - Scale(130), by2, Scale(130), Scale(38), TRUE);
-                MoveWindow(hBtnModToggle,  g_ly.content.right - Scale(24) - Scale(280), by2, Scale(130), Scale(38), TRUE);
-                MoveWindow(hBtnModDelete,  g_ly.content.right - Scale(24) - Scale(410), by2, Scale(110), Scale(38), TRUE);
-            }
-            {
-                RECT card2 = DlTaskCardRect();
-                MoveWindow(hBtnDlCancel, card2.right - Scale(24) - Scale(120),
-                           card2.bottom - Scale(20) - Scale(32), Scale(120), Scale(32), TRUE);
-            }
-    }
-}
-
-static void SyncSettingsVisibility();
-
-static void SyncUserMode() {
-    bool onUser = (g_page == PAGE_USER);
-    bool m0 = onUser && g_userMode == 0;
-    bool m1 = onUser && g_userMode == 1;
-
-    ShowWindow(hEdServer, m0); ShowWindow(hEdUser, m0); ShowWindow(hEdPass, m0);
-    ShowWindow(hBtnLogin, m0); ShowWindow(hBtnLogout, m0);
-    ShowWindow(hEdName, m1);   ShowWindow(hBtnOffline, m1);
-
-    ShowWindow(hBtnUserM0, onUser);
-    ShowWindow(hBtnUserM1, onUser);
-    ShowWindow(hBtnUserM2, onUser);
-}
-
-static void SyncDownloadControls() {
-    bool onDl   = (g_page == PAGE_DOWNLOAD);
-    int showDl  = (onDl && !g_dlDetail) ? SW_SHOW : SW_HIDE;
-    int showDet = (onDl &&  g_dlDetail) ? SW_SHOW : SW_HIDE;
-    ShowWindow(hBtnDlBack, showDet);
-    ShowWindow(hBtnDlInstall, showDet);
-    ShowWindow(hBtnDlFapi, showDet);
-    ShowWindow(hBtnDlQsl,  showDet);
-    ShowWindow(hBtnDlFilterSel, showDl);
-    ShowWindow(hBtnDlCancel, (g_dlBusy.load() && (g_page == PAGE_DOWNLOAD)) ? SW_SHOW : SW_HIDE);
-
-    {
-        bool onDl2  = onDl && !g_dlDetail;
-        bool modDet = onDl2 && g_dlSection == 1 && g_modDetail;
-        bool game   = onDl2 && g_dlSection == 0;
-        bool modDl  = onDl2 && g_dlSection == 1 && !g_modDetail;
-        ShowWindow(hBtnDlSecGame, (onDl2 && !g_modDetail) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnDlSecMod,  (onDl2 && !g_modDetail) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnDlFilterSel, game ? SW_SHOW : SW_HIDE);
-        ShowWindow(hEdSearch,       game ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnDlBack, (showDet || modDet) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModSource,   modDl ? SW_SHOW : SW_HIDE);
-        ShowWindow(hEdModSearch,    modDl ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModInstall,  (modDl || modDet) ? SW_SHOW : SW_HIDE);
-
-        bool onInst = (g_page == PAGE_INSTANCES);
-        ShowWindow(hBtnInstTabList, onInst ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnInstTabMod,  onInst ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModToggle, (onInst && g_instTab == 1) ? SW_SHOW : SW_HIDE);
-        ShowWindow(hBtnModDelete, (onInst && g_instTab == 1) ? SW_SHOW : SW_HIDE);
-
-        ShowWindow(hBtnModTabDl, SW_HIDE);
-        ShowWindow(hBtnModTabIn, SW_HIDE);
-    }
-    ShowWindow(hBtnDlF0, SW_HIDE);
-    ShowWindow(hBtnDlF1, SW_HIDE);
-    ShowWindow(hBtnDlF2, SW_HIDE);
-    ShowWindow(hBtnDlF3, SW_HIDE);
-    ShowWindow(hBtnDlVanilla, showDet);
-    ShowWindow(hBtnDlFabric,  showDet);
-    ShowWindow(hBtnDlQuilt,   showDet);
-    ShowWindow(hBtnDlForge,   showDet);
-    ShowWindow(hBtnDlNeo,     showDet);
-
-}
-
-static void ShowPage(Page p) {
-    g_page = p;
-    bool L = (p == PAGE_LAUNCH), U = (p == PAGE_USER), S = (p == PAGE_SETTINGS);
-    if (p != PAGE_SETTINGS) { g_showDirList = false; g_showJavaList = false; }
-    if (p == PAGE_DOWNLOAD && g_mcVersState.load() == 0)
-        std::thread(FetchManifestThread).detach();
-
-    // 顶部标签必须始终可见，否则切不到别的页
-    ShowWindow(hBtnTabLaunch, SW_SHOW);
-    ShowWindow(hBtnTabUser, SW_SHOW);
-    ShowWindow(hBtnTabSettings, SW_SHOW);
-    ShowWindow(hBtnTabInst, SW_SHOW);
-    ShowWindow(hBtnTabDl, SW_SHOW);
-    ShowWindow(hBtnTabMods, SW_HIDE);
-        SyncDownloadControls();
-
-
-
-    ApplyOverlayVisibility();
-
-    SyncUserMode();
-    ShowWindow(hEdServer, U); ShowWindow(hEdUser, U); ShowWindow(hEdPass, U);
-    ShowWindow(hBtnLogin, U); ShowWindow(hBtnLogout, U); ShowWindow(hEdName, U); ShowWindow(hBtnOffline, U); ShowWindow(hBtnSkin, U); ShowWindow(hBtnDelAcc, U);
-
-    ShowWindow(hEdDir, S); ShowWindow(hBtnAutoDir, S); ShowWindow(hBtnBrowseDir, S); ShowWindow(hBtnDirDrop, S);
-    ShowWindow(hEdJava, S); ShowWindow(hBtnAutoJava, S); ShowWindow(hBtnBrowseJava, S); ShowWindow(hBtnJavaDrop, S);
-    ShowWindow(hEdMem, S); ShowWindow(hBtnSave, S); ShowWindow(hBtnIso, S);
-
-    LayoutControls();
-    SyncSettingsVisibility();
-    SyncUserMode();
-    InvalidateRect(g_hwnd, nullptr, TRUE);
-}
-
-// ---------------- 绘制 ----------------
-// ============================ 皮肤 ============================
-static void LoadSkinBitmap() {
-    if (g_skinBmp) { DeleteObject(g_skinBmp); g_skinBmp = nullptr; }
-    if (!g_gpOk || g_cfg.skinPath.empty()) return;
-    std::wstring wp = U8ToW(g_cfg.skinPath);
-    Gdiplus::Bitmap bmp(wp.c_str());
-    if (bmp.GetLastStatus() != Gdiplus::Ok) return;
-    HBITMAP hb = nullptr;
-    if (bmp.GetHBITMAP(Gdiplus::Color(0, 0, 0, 0), &hb) == Gdiplus::Ok) g_skinBmp = hb;
-}
-
-// 画头像（取 64x64 皮肤的头部正面 8x8 区域）
-static void DrawAvatar(HDC dc, int x, int y, int size) {
-    if (g_skinBmp) {
-        HDC src = CreateCompatibleDC(dc);
-        HBITMAP old = (HBITMAP)SelectObject(src, g_skinBmp);
-        SetStretchBltMode(dc, HALFTONE);
-        SetBrushOrgEx(dc, 0, 0, nullptr);
-        StretchBlt(dc, x, y, size, size, src, 8, 8, 8, 8, SRCCOPY);
-        SelectObject(src, old);
-        DeleteDC(src);
-    } else {
-        RECT r = { x, y, x + size, y + size };
-        HBRUSH b = CreateSolidBrush(RGB(72, 76, 86));
-        FillRect(dc, &r, b);
-        DeleteObject(b);
-    }
-}
-
-static std::string CurrentPlayerName() {
-    return (g_cfg.authType == "thirdparty" && !g_cfg.authName.empty()) ? g_cfg.authName : g_cfg.playerName;
-}
-
-// 应用皮肤：校验尺寸 -> 存到配置目录 -> 写入 CustomSkinLoader 本地皮肤
-static bool ApplySkin(const std::string& srcPath, std::wstring& err) {
-    std::wstring wp = U8ToW(srcPath);
-    if (g_gpOk) {
-        Gdiplus::Bitmap bmp(wp.c_str());
-        if (bmp.GetLastStatus() != Gdiplus::Ok) { err = L"无法读取该图片"; return false; }
-        int w = (int)bmp.GetWidth(), h = (int)bmp.GetHeight();
-        if (!((w == 64 && h == 64) || (w == 64 && h == 32))) {
-            err = L"皮肤必须是 64x64 或 64x32 的 PNG";
-            return false;
-        }
-    }
-
-    wchar_t appdata[MAX_PATH] = { 0 };
-    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
-    fs::path skins = fs::path(appdata) / L"ReignLaunch" / L"skins";
-    std::error_code ec;
-    fs::create_directories(skins, ec);
-
-    std::string player = CurrentPlayerName();
-    if (player.empty()) player = "player";
-
-    fs::path local = skins / fs::u8path(player + ".png");
-    fs::copy_file(fs::u8path(srcPath), local, fs::copy_options::overwrite_existing, ec);
-    if (ec) { err = L"保存皮肤失败"; return false; }
-
-    // CustomSkinLoader 本地皮肤（装了 CSL 模组就能在游戏里看到）
-    if (!g_cfg.gameDir.empty()) {
-        fs::path csl = fs::u8path(g_cfg.gameDir) / L"CustomSkinLoader" / L"LocalSkin" / L"textures";
-        fs::create_directories(csl, ec);
-        fs::copy_file(local, csl / fs::u8path(player + ".png"), fs::copy_options::overwrite_existing, ec);
-    }
-
-    g_cfg.skinPath = WToU8(local.wstring());
-    SaveConfig();
-    LoadSkinBitmap();
-    return true;
-}
-// ---- 账户切换 ----
-static void ApplyActiveAccount() {
-    if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) return;
-    Account& a = g_cfg.accounts[g_cfg.activeAcc];
-    g_cfg.authType   = a.type;
-    g_cfg.authServer = a.server;
-    g_cfg.authToken  = a.token;
-    g_cfg.authUuid   = a.uuid;
-    if (a.type == "thirdparty") g_cfg.authName = a.name;
-    else                        g_cfg.playerName = a.name;
-    g_cfg.skinPath = a.skin;
-}
-
-static void CaptureActiveAccount() {
-    if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) return;
-    Account& a = g_cfg.accounts[g_cfg.activeAcc];
-    a.type   = g_cfg.authType;
-    a.server = g_cfg.authServer;
-    a.token  = g_cfg.authToken;
-    a.uuid   = g_cfg.authUuid;
-    a.skin   = g_cfg.skinPath;
-    if (a.type == "thirdparty") a.name = g_cfg.authName;
-    else                        a.name = g_cfg.playerName;
-}
-
-// 找一个同名账户，找不到就新建；返回下标
-static int UpsertAccount(const std::string& type, const std::string& name,
-                         const std::string& server = "", const std::string& token = "",
-                         const std::string& uuid = "") {
-    for (size_t i = 0; i < g_cfg.accounts.size(); ++i) {
-        if (g_cfg.accounts[i].name == name && g_cfg.accounts[i].type == type) {
-            g_cfg.accounts[i].server = server;
-            g_cfg.accounts[i].token  = token;
-            g_cfg.accounts[i].uuid   = uuid;
-            return (int)i;
-        }
-    }
-    Account a;
-    a.type = type; a.name = name; a.server = server; a.token = token; a.uuid = uuid;
-    g_cfg.accounts.push_back(a);
-    return (int)g_cfg.accounts.size() - 1;
-}
-// ---------------- 检测候选列表 ----------------
-struct Cand { std::string path; std::string label; };
-static std::vector<Cand> g_dirCands, g_javaCands;
-
-
-static void AddDirCand(const fs::path& p) {
-    std::error_code ec;
-    if (!fs::is_directory(p / L"versions", ec)) return;
-    std::string s = WToU8(p.wstring());
-    for (auto& c : g_dirCands) if (c.path == s) return;
-    g_dirCands.push_back({ s, s });
-}
-
-static void RefreshDirCands() {
-    g_dirCands.clear();
-    wchar_t appdata[MAX_PATH] = {0}, profile[MAX_PATH] = {0};
-    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
-    SHGetFolderPathW(nullptr, CSIDL_PROFILE, nullptr, 0, profile);
-
-    if (!g_cfg.gameDir.empty()) AddDirCand(fs::u8path(g_cfg.gameDir));
-    AddDirCand(fs::path(appdata) / L".minecraft");
-    AddDirCand(fs::path(profile) / L".minecraft");
-    for (const wchar_t* drv : { L"C:", L"D:", L"E:" }) {
-        AddDirCand(fs::path(std::wstring(drv) + L"\\MC\\.minecraft"));
-        AddDirCand(fs::path(std::wstring(drv) + L"\\Games\\.minecraft"));
-        AddDirCand(fs::path(std::wstring(drv) + L"\\.minecraft"));
-    }
-}
-
-// 从 JDK 的 release 文件读版本号，不用启动 java.exe
-static std::string JavaVersionOf(const fs::path& javaw) {
-    fs::path home = javaw.parent_path().parent_path();
-    std::ifstream f{ home / L"release" };
-    if (!f) return "";
-    std::string line;
-    while (std::getline(f, line)) {
-        size_t p = line.find("JAVA_VERSION=");
-        if (p == std::string::npos) continue;
-        std::string v = line.substr(p + 13);
-        if (!v.empty() && v.front() == '"') v.erase(v.begin());
-        if (!v.empty() && v.back() == '"') v.pop_back();
-        if (v.rfind("1.", 0) == 0 && v.size() > 2) return std::string(1, v[2]); // 1.8.0 -> 8
-        size_t dot = v.find('.');
-        return (dot == std::string::npos) ? v : v.substr(0, dot);
-    }
-    return "";
-}
-
-static void AddJavaCand(const fs::path& javaw) {
-    if (!FileExists(javaw)) return;
-    std::string s = WToU8(javaw.wstring());
-    for (auto& c : g_javaCands) if (c.path == s) return;
-    std::string v = JavaVersionOf(javaw);
-    g_javaCands.push_back({ s, v.empty() ? "版本未知" : ("Java " + v) });
-}
-
-static void RefreshJavaCands() {
-    g_javaCands.clear();
-
-    wchar_t buf[32767];
-    if (GetEnvironmentVariableW(L"JAVA_HOME", buf, 32767))
-        AddJavaCand(fs::path(buf) / L"bin" / L"javaw.exe");
-
-    wchar_t appdata[MAX_PATH] = {0};
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata))) {
-        fs::path hm = fs::path(appdata) / L".hmcl" / L"java" / L"windows-x86_64";
-        std::error_code ec;
-        if (DirExists(hm))
-            for (auto& e : fs::directory_iterator(hm, ec))
-                AddJavaCand(e.path() / L"bin" / L"javaw.exe");
-    }
-
-    for (const wchar_t* root : { L"C:\\Program Files\\Java", L"C:\\Program Files (x86)\\Java",
-                                 L"D:\\Program Files\\Java", L"D:\\Java" }) {
-        std::error_code ec;
-        if (!DirExists(root)) continue;
-        for (auto& e : fs::directory_iterator(root, ec))
-            AddJavaCand(e.path() / L"bin" / L"javaw.exe");
-    }
-
-    {
-        std::error_code ec;
-        fs::path ms = L"D:\\MC\\Microsoft";
-        if (DirExists(ms))
-            for (auto& e : fs::directory_iterator(ms, ec))
-                AddJavaCand(e.path() / L"bin" / L"javaw.exe");
-    }
-}
-
-// ============================ Java 版本匹配 ============================
-static int ReadJavaMajorFromJson(const fs::path& p) {
-    std::ifstream f{ p };
-    if (!f) return 0;
-    std::stringstream ss; ss << f.rdbuf();
-    std::string s = ss.str();
-    std::regex re("\"majorVersion\"\\s*:\\s*(\\d+)");
-    std::smatch m;
-    if (std::regex_search(s, m, re)) {
-        try { return std::stoi(m[1].str()); } catch (...) { return 0; }
-    }
-    return 0;
-}
-
-// 该版本需要哪个大版本 Java
-static int RequiredJavaMajor(const std::string& id) {
-    fs::path base = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id);
-    fs::path j1 = base / fs::u8path(id + ".json");
-
-    int m = ReadJavaMajorFromJson(j1);
-    if (m > 0) return m;
-
-    // 顺着 inheritsFrom 找一层
-    std::ifstream f{ j1 };
-    if (f) {
-        std::stringstream ss; ss << f.rdbuf();
-        std::string s = ss.str();
-        std::regex re("\"inheritsFrom\"\\s*:\\s*\"([^\"]+)\"");
-        std::smatch mm;
-        if (std::regex_search(s, mm, re)) {
-            std::string parent = mm[1].str();
-            int pm = ReadJavaMajorFromJson(base / fs::u8path(parent + ".json"));
-            if (pm > 0) return pm;
-        }
-    }
-
-    // 兜底：按版本号猜
-    std::regex vre("1\\.(\\d+)(?:\\.(\\d+))?");
-    std::smatch vm;
-    if (std::regex_search(id, vm, vre)) {
-        int minor = std::stoi(vm[1].str());
-        int patch = vm[2].matched ? std::stoi(vm[2].str()) : 0;
-        if (minor > 20 || (minor == 20 && patch >= 5)) return 21;
-        if (minor >= 18) return 17;
-        if (minor == 17) return 17;
-        return 8;
-    }
-    return 0;
-}
-
-// 在候选里挑一个满足要求的 Java，返回路径；找不到返回空
-static std::string PickJavaFor(int need) {
-    if (g_javaCands.empty()) RefreshJavaCands();
-    std::string best;
-    int bestVer = 9999;
-    for (auto& c : g_javaCands) {
-        std::string v = JavaVersionOf(fs::u8path(c.path));
-        if (v.empty()) continue;
-        int iv = 0;
-        try { iv = std::stoi(v); } catch (...) { continue; }
-        if (iv >= need && iv < bestVer) { bestVer = iv; best = c.path; }
-    }
-    return best;
-}
-// ---------------- 设置页几何 ----------------
-static void SettingsGeom(int row, RECT& ed, RECT& drop, RECT& autoB, RECT& browse) {
-    int x  = g_ly.main.left + Scale(40);
-    int y  = g_ly.content.top + Scale(50) + row * Scale(62);
-    int ew = Scale(330), eh = Scale(30);
-    ed = { x + Scale(110), y, x + Scale(110) + ew, y + eh };
-    int bx = ed.right + Scale(10);
-    drop   = { bx, y - Scale(2), bx + Scale(34), y + Scale(32) };
-    autoB  = { bx + Scale(40), y - Scale(2), bx + Scale(40) + Scale(90), y + Scale(32) };
-    browse = { bx + Scale(136), y - Scale(2), bx + Scale(136) + Scale(70), y + Scale(32) };
-}
-
-static RECT CandListRect(int row, int count) {
-    RECT ed, drop, a, b;
-    SettingsGeom(row, ed, drop, a, b);
-    int h = Scale(28) * count + Scale(8);
-    RECT r = { ed.left, ed.bottom + Scale(4), b.right, ed.bottom + Scale(4) + h };
-    return r;
-}
-
-// 下拉打开时，把会被列表盖住的控件先藏起来（子控件永远画在父窗口绘制之上）
-static void SyncSettingsVisibility() {
-    bool onSettings = (g_page == PAGE_SETTINGS) && (g_settingsTab == 0);
-    if (!hEdMem) return;
-
-    ShowWindow(hEdDir,        onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnDirDrop,   onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnAutoDir,   onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnBrowseDir, onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hEdJava,        onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnJavaDrop,   onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnAutoJava,   onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnBrowseJava, onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hEdMem,   onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnSave, onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnIso,  onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hEdThreads, onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hEdJvm,  onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hEdGame, onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnSource, onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnFull,   onSettings ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnUpdate, (g_page == PAGE_SETTINGS && g_settingsTab == 1) ? SW_SHOW : SW_HIDE);
-}
-static void DrawCandList(HDC dc, bool isDir) {
-    const std::vector<Cand>& list = isDir ? g_dirCands : g_javaCands;
-    if (list.empty()) return;
-
-    int row = isDir ? 0 : 1;
-    RECT r = CandListRect(row, (int)list.size());
-    FillRoundRect(dc, r, 6, C_CARD_SEL);
-
-    int itemH = Scale(28);
-    int y = r.top + Scale(4);
-    for (size_t i = 0; i < list.size(); ++i) {
-        RECT it = { r.left + Scale(8), y, r.right - Scale(8), y + itemH };
-        std::wstring txt = isDir
-            ? U8ToW(list[i].path)
-            : (U8ToW(list[i].label) + L"    " + U8ToW(list[i].path));
-        DrawTextIn(dc, txt, it, C_TEXT, g_fSmall);
-        y += itemH;
-    }
-}
-
-// 关于信息块（关于页和设置页共用）
-static void DrawAboutBlock(HDC dc) {
-    int x  = g_ly.main.left + Scale(40);
-    int y  = g_ly.content.top + Scale(50);
-    int lw = Scale(110);
-
-    RECT k1 = { x, y, x + lw, y + Scale(34) };
-    DrawTextIn(dc, L"关于", k1, C_DIM, g_fUi);
-
-    int iconSz = Scale(64);
-    HICON ic = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, iconSz, iconSz, LR_DEFAULTCOLOR);
-    if (ic) {
-        DrawIconEx(dc, x + lw, y - Scale(12), ic, iconSz, iconSz, 0, nullptr, DI_NORMAL);
-        DestroyIcon(ic);
-    }
-
-    int tx = x + lw + iconSz + Scale(14);
-    RECT t1 = { tx, y - Scale(6), g_ly.main.right - Scale(40), y + Scale(30) };
-    DrawTextIn(dc, L"ReignLaunch", t1, C_TEXT, g_fTitle);
-
-    RECT t2 = { tx, y + Scale(30), g_ly.main.right - Scale(40), y + Scale(54) };
-    DrawTextIn(dc, L"Minecraft 启动器", t2, C_DIM, g_fUi);
-
-    struct AboutRow { const wchar_t* k; const wchar_t* v; };
-    const AboutRow rows[] = {
-        { L"版本",   L"v1.0.0" },
-        { L"制作人", L"加纳Brightchaserove（抖音）" },
-        { L"技术栈", L"C++17 / Win32 GDI / nlohmann-json / WinHTTP" },
-        { L"登录",   L"离线模式、第三方 Yggdrasil（authlib-injector 已内置）" },
-        { L"下载",   L"Mojang 官方源 + BMCLAPI 镜像，SHA1 校验" },
-        { L"定位",   L"实例化管理、启动前自动补全、出错才弹日志窗口" },
-    };
-
-    int ry = y + Scale(84);
-    for (const auto& r : rows) {
-        RECT kk = { x, ry, x + lw, ry + Scale(28) };
-        RECT vv = { x + lw, ry, g_ly.main.right - Scale(40), ry + Scale(28) };
-        DrawTextIn(dc, r.k, kk, C_DIM, g_fUi);
-        DrawTextIn(dc, r.v, vv, C_TEXT, g_fUi);
-        ry += Scale(38);
-    }
-
-    RECT footer = { x + lw, ry + Scale(20), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(20) };
-    DrawTextIn(dc, L"本程序仅用于学习交流，与 Mojang Studios / 微软无关。",
-               footer, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
-}
-
-// 设置页左侧子菜单
-static void DrawSettingsMenu(HDC dc) {
-    RECT sb = g_ly.sidebar;
-    HBRUSH sbb = CreateSolidBrush(RGB(30, 31, 35));
-    FillRect(dc, &sb, sbb);
-    DeleteObject(sbb);
-
-    RECT lbl = { sb.left + Scale(20), sb.top + Scale(14), sb.right, sb.top + Scale(44) };
-    DrawTextIn(dc, L"设置", lbl, C_DIM, g_fSmall);
-
-    const wchar_t* items[] = { L"设置", L"关于" };
-    int itemH = Scale(46);
-    int y = sb.top + Scale(50);
-    for (int i = 0; i < 2; ++i) {
-        RECT it = { sb.left + Scale(12), y, sb.right - Scale(12), y + itemH - Scale(8) };
-        bool sel = (g_settingsTab == i);
-        FillRoundRect(dc, it, 8, sel ? C_CARD_SEL : C_CARD);
-        RECT tx = it; tx.left += Scale(14);
-        DrawTextIn(dc, items[i], tx, sel ? C_TEXT : C_DIM, g_fUi);
-        if (sel) {
-            RECT bar = { it.left, it.top + Scale(8), it.left + Scale(3), it.bottom - Scale(8) };
-            HBRUSH b = CreateSolidBrush(C_ACCENT2);
-            FillRect(dc, &bar, b);
-            DeleteObject(b);
-        }
-        y += itemH;
-    }
-}
-
-// ============================ 原版下载 ============================
-
-
-static void FetchManifestThread() {
-    g_mcVersState = 1;
-    std::vector<unsigned char> data;
-    std::string err;
-    bool ok = HttpRequest("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
-                          "GET", "", "", data, err);
-    if (ok && !data.empty()) {
-        std::string body(data.begin(), data.end());
-        json j = json::parse(body, nullptr, false);
-        if (j.is_object() && j.contains("versions") && j["versions"].is_array()) {
-            std::vector<McVer> list;
-            for (auto& v : j["versions"]) {
-                McVer m;
-                m.id   = v.value("id", std::string());
-                m.type = v.value("type", std::string());
-                m.url  = v.value("url", std::string());
-                std::string rt = v.value("releaseTime", std::string());
-                if (rt.size() >= 10) m.date = rt.substr(0, 10);
-                if (!m.id.empty() && !m.url.empty()) list.push_back(m);
-            }
-            g_mcVers = list;
-            g_mcVersState = 2;
-        } else g_mcVersState = 3;
-    } else g_mcVersState = 3;
-    RebuildDlView();
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-}
-
-// 安装：下载版本 json → 自动补全客户端/依赖/资源
-static void InstallVersionThread(std::string id, std::string url) {
+// ---------------- InstallVersionThread ----------------
+void InstallVersionThread(std::string id, std::string url) {
     g_dlBusy = true;
     g_progState = 1;
     g_progCur = 0;
@@ -2353,7 +3325,7 @@ static void InstallVersionThread(std::string id, std::string url) {
     g_progTotal = 1;
     g_progCur = 0;
 
-    fs::path dir = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id);
+    fs::path dir = GameDirPath() / L"versions" / fs::u8path(id);
     std::error_code ec;
     fs::create_directories(dir, ec);
     fs::path jf = dir / fs::u8path(id + ".json");
@@ -2369,17 +3341,14 @@ static void InstallVersionThread(std::string id, std::string url) {
     DownloadStats st;
     DownloadMissing(id, st);
     g_progState = 0;
-
-    if (g_hwnd) {
-    g_dlBusy = false;
-    g_progState = 0;
-        g_status = L"安装完成：" + U8ToW(id) + L"（下载 " + std::to_wstring(st.downloaded) + L" 个文件）";
-        ScanVersions();
-        PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-    }
+    g_dlBusy = false;                      // ★ 移出 if (g_hwnd)
+    g_status = L"安装完成：" + U8ToW(id) + L"（下载 " + std::to_wstring(st.downloaded) + L" 个文件）";
+    g_needScanVersions = true;             // ★ 交给 UI 线程扫描
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
-// ---------------- 详情页：加载器版本列表 ----------------
-static void FetchLoaderVersThread(int kind, int gen) {
+
+// ---------------- FetchLoaderVersThread ----------------
+void FetchLoaderVersThread(int kind, int gen) {
     if (gen != g_ldGen.load()) return;
     g_ldVersState = 1;
     g_ldSel = -1;
@@ -2429,57 +3398,8 @@ static void FetchLoaderVersThread(int kind, int gen) {
     g_ldVersState = 2;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
-// ---------------- 详情页：加载器可用性 ----------------
-static void FetchLoadersThread() {
-    std::string mc = g_dlDetailMc;
-    for (int i = 0; i < 4; ++i) { g_ldState[i] = 0; g_ldVer[i].clear(); }
 
-    auto getJson = [](const std::string& url) {
-        std::vector<unsigned char> d;
-        std::string e;
-        if (!HttpRequest(url, "GET", "", "", d, e)) return json();
-        return json::parse(std::string(d.begin(), d.end()), nullptr, false);
-    };
-
-    // 0=Fabric 1=Quilt 2=Forge 3=NeoForge
-    {
-        json j = getJson("https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/" + mc);
-        if (j.is_array() && !j.empty()) {
-            std::string v = j[0]["loader"].value("version", std::string());
-            if (!v.empty()) { g_ldVer[0] = U8ToW(v); g_ldState[0] = 1; } else g_ldState[0] = 2;
-        } else g_ldState[0] = 2;
-    }
-    {
-        json j = getJson("https://meta.quiltmc.org/v3/versions/loader/" + mc);
-        if (j.is_array() && !j.empty()) {
-            std::string v = j[0]["loader"].value("version", std::string());
-            if (!v.empty()) { g_ldVer[1] = U8ToW(v); g_ldState[1] = 1; } else g_ldState[1] = 2;
-        } else g_ldState[1] = 2;
-    }
-    {
-        json j = getJson("https://bmclapi2.bangbang93.com/forge/minecraft/" + mc);
-        if (j.is_array() && !j.empty()) {
-            std::string v;
-            for (auto& x : j) {
-                std::string vv = x.value("version", std::string());
-                if (vv.empty()) continue;
-                v = vv;
-                if (x.value("branch", std::string()) == "recommended") break;
-            }
-            if (!v.empty()) { g_ldVer[2] = U8ToW(v); g_ldState[2] = 1; } else g_ldState[2] = 2;
-        } else g_ldState[2] = 2;
-    }
-    {
-        json j = getJson("https://bmclapi2.bangbang93.com/neoforge/list/" + mc);
-        if (j.is_array() && !j.empty()) {
-            std::string v = j[0].value("version", std::string());
-            if (!v.empty()) { g_ldVer[3] = U8ToW(v); g_ldState[3] = 1; } else g_ldState[3] = 2;
-        } else g_ldState[3] = 2;
-    }
-
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-}
-// ---------------- 下载页过滤 ----------------
+// ---------------- IsAprilFools ----------------
 static bool IsAprilFools(const McVer& v) {
     if (v.type == "release") return false;   // 正式版不算愚人节
     if (v.date.size() >= 10 && v.date.substr(5, 2) == "04" && v.date.substr(8, 2) == "01") return true;
@@ -2489,18 +3409,26 @@ static bool IsAprilFools(const McVer& v) {
     return false;
 }
 
+// ---------------- RebuildDlView ----------------
 static void RebuildDlView() {
+    // 锁内拷贝快照，锁外遍历
+    std::vector<McVer> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(g_mcVersMutex);
+        snapshot = g_mcVers;
+    }
+
     g_dlView.clear();
     std::wstring kw;
     {
         wchar_t buf[256] = { 0 };
-        if (hEdSearch) GetWindowTextW(hEdSearch, buf, 256);
+        if (g_hEdSearch) GetWindowTextW(g_hEdSearch, buf, 256);
         kw = buf;
         for (auto& c : kw) c = (wchar_t)towlower(c);
     }
 
-    for (size_t i = 0; i < g_mcVers.size(); ++i) {
-        const McVer& v = g_mcVers[i];
+    for (size_t i = 0; i < snapshot.size(); ++i) {
+        const McVer& v = snapshot[i];
         bool april = IsAprilFools(v);
         bool isRelease = (v.type == "release");
         bool isSnap    = (v.type == "snapshot");
@@ -2526,17 +3454,16 @@ static void RebuildDlView() {
     g_listScroll = 0;
     if (g_dlSel >= (int)g_dlView.size()) g_dlSel = -1;
 }
-// ---------------- 模组加载器安装 ----------------
 
-
+// ---------------- HttpGetString ----------------
 static std::string HttpGetString(const std::string& url, std::string& err) {
     std::vector<unsigned char> data;
     if (!HttpRequest(url, "GET", "", "", data, err)) return std::string();
     return std::string(data.begin(), data.end());
 }
 
-// Fabric / Quilt：拿 loader 列表 -> profile json -> 落到 versions/<id>
-static void InstallMetaLoaderThread(std::string mc, bool quilt, std::string wantVer = "") {
+// ---------------- InstallMetaLoaderThread ----------------
+void InstallMetaLoaderThread(std::string mc, bool quilt, std::string wantVer) {
     g_status = L"正在获取 " + std::wstring(quilt ? L"Quilt" : L"Fabric") + L" 加载器列表…";
 
     std::string url = quilt
@@ -2565,7 +3492,7 @@ static void InstallMetaLoaderThread(std::string mc, bool quilt, std::string want
     std::string vid = pj.value("id", std::string());
     if (vid.empty()) { g_status = L"profile 内容异常"; if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0); return; }
 
-    fs::path dir = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(vid);
+    fs::path dir = GameDirPath() / L"versions" / fs::u8path(vid);
     std::error_code ec;
     fs::create_directories(dir, ec);
     std::ofstream f{ dir / fs::u8path(vid + ".json"), std::ios::binary | std::ios::trunc };
@@ -2576,17 +3503,13 @@ static void InstallMetaLoaderThread(std::string mc, bool quilt, std::string want
     DownloadStats st;
     DownloadMissing(vid, st);
     g_progState = 0;
-    if (g_hwnd) {
-        ScanVersions();
-    g_dlBusy = false;
-    g_progState = 0;
-        g_status = L"安装完成：" + U8ToW(vid) + L"（下载 " + std::to_wstring(st.downloaded) + L" 个文件）";
-        PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-    }
+    g_dlBusy = false;                      // ★ 移出 if (g_hwnd)
+    g_needScanVersions = true;             // ★ 交给 UI 线程扫描
+    g_status = L"安装完成：" + U8ToW(vid) + L"（下载 " + std::to_wstring(st.downloaded) + L" 个文件）";
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
-
-// Forge / NeoForge：下载 installer 并执行 --installClient
-static void InstallInstallerThread(std::string mc, bool neo, std::string wantVer = "") {
+// ---------------- InstallInstallerThread ----------------
+void InstallInstallerThread(std::string mc, bool neo, std::string wantVer) {
     std::string listUrl = neo
         ? "https://bmclapi2.bangbang93.com/neoforge/list/" + mc
         : "https://bmclapi2.bangbang93.com/forge/minecraft/" + mc;
@@ -2660,25 +3583,109 @@ static void InstallInstallerThread(std::string mc, bool neo, std::string wantVer
     CloseHandle(pi.hProcess);
     { std::error_code ecr; fs::remove(jar, ecr); }
 
-    if (g_hwnd) {
-        ScanVersions();
-    g_dlBusy = false;
+    g_dlBusy = false;                      // ★ 移出 if (g_hwnd)
     g_progState = 0;
-        g_status = (code == 0) ? (L"安装完成：" + U8ToW(ver))
-                               : (L"安装器退出码 " + std::to_wstring(code) + L"，请查看日志");
-        PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-    }
+    g_needScanVersions = true;             // ★ 交给 UI 线程扫描
+    g_status = (code == 0) ? (L"安装完成：" + U8ToW(ver))
+                           : (L"安装器退出码 " + std::to_wstring(code) + L"，请查看日志");
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
-// ============================ 自动更新 ============================
-#define APP_TAG L"v1.0.0"
 
-static std::wstring    g_newTag;
-static std::string     g_newUrl;
-static std::atomic<int> g_updateState{ 0 };   // 0未查 1查中 2有新版 3已最新 4失败
-static std::atomic<bool> g_updating{ false };
+// ---------------- InstallModrinthModThread ----------------
+// 从 Modrinth 下载一个前置模组（Fabric API / QSL）到指定实例的 mods 目录。
+//   slug        Modrinth 项目 slug（"fabric-api" / "qsl"）
+//   mcVer       Minecraft 版本（用于筛选适配版本）
+//   loaderTag   "fabric" / "quilt"（用于筛选加载器）
+//   targetVer   目标实例版本名（决定 mods 目录）
+void InstallModrinthModThread(std::string slug, std::string mcVer,
+                              std::string loaderTag, std::string targetVer) {
+    std::string dispName = (slug == "qsl") ? "QSL" : "Fabric API";
+    g_dlBusy = true;
+    g_dlCancel = false;
+    g_status = L"正在查找 " + U8ToW(dispName) + L" 的适配版本…";
 
-// a 是否比 b 新
-// UTC 时间 -> Unix 秒（不依赖 timegm）
+    std::string err;
+    std::string url = "https://api.modrinth.com/v2/project/" + slug +
+                      "/version?game_versions=[%22" + mcVer + "%22]&loaders=[%22" +
+                      loaderTag + "%22]";
+
+    std::vector<unsigned char> d;
+    if (!HttpRequest(url, "GET", "", "", d, err) || d.empty()) {
+        g_status = L"没有适配此版本（" + U8ToW(mcVer) + L"）的 " + U8ToW(dispName);
+        g_dlBusy = false;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+    if (!j.is_array() || j.empty()) {
+        g_status = L"没有适配此版本（" + U8ToW(mcVer) + L"）的 " + U8ToW(dispName);
+        g_dlBusy = false;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    // 取第一个（Modrinth 按发布时间倒序）
+    const json& v0 = j[0];
+    std::string fileUrl, fileName;
+    if (v0.contains("files") && v0["files"].is_array() && !v0["files"].empty()) {
+        fileUrl  = v0["files"][0].value("url", std::string());
+        fileName = v0["files"][0].value("filename", std::string());
+    }
+    std::string verNum = v0.value("version_number", v0.value("name", std::string()));
+
+    if (fileUrl.empty() || fileName.empty()) {
+        g_status = L"没有适配此版本（" + U8ToW(mcVer) + L"）的 " + U8ToW(dispName);
+        g_dlBusy = false;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    // 确保 mods 目录存在
+    fs::path modsDir = ModsDirOf(targetVer);
+    std::error_code ec;
+    fs::create_directories(modsDir, ec);
+
+    fs::path dest = modsDir / fs::u8path(fileName);
+    if (FileExists(dest)) {
+        g_status = U8ToW(dispName) + L" 已存在：" + U8ToW(fileName);
+        g_dlBusy = false;
+        if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+        return;
+    }
+
+    g_status = L"正在下载 " + U8ToW(dispName) + L" " + U8ToW(verNum) + L"…";
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+
+    std::string dlErr;
+    if (DownloadFile(fileUrl, dest, dlErr)) {
+        g_status = U8ToW(dispName) + L" 安装完成：" + U8ToW(fileName);
+        g_needScanVersions = true;
+    } else {
+        g_status = U8ToW(dispName) + L" 下载失败：" + U8ToW(dlErr);
+    }
+    g_dlBusy = false;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+}
+
+// ---------------- CheckModrinthModAvailable ----------------
+// 只查询是否有适配版本，不下载（用于详情页显示状态）
+bool CheckModrinthModAvailable(const std::string& slug, const std::string& mcVer,
+                               const std::string& loaderTag, std::string& outVer) {
+    outVer.clear();
+    std::string url = "https://api.modrinth.com/v2/project/" + slug +
+                      "/version?game_versions=[%22" + mcVer + "%22]&loaders=[%22" +
+                      loaderTag + "%22]";
+    std::vector<unsigned char> d;
+    std::string err;
+    if (!HttpRequest(url, "GET", "", "", d, err) || d.empty()) return false;
+    json j = json::parse(std::string(d.begin(), d.end()), nullptr, false);
+    if (!j.is_array() || j.empty()) return false;
+    outVer = j[0].value("version_number", j[0].value("name", std::string()));
+    return true;
+}
+
+// ---------------- UtcEpoch ----------------
 static long long UtcEpoch(int y, int mo, int d, int h, int mi, int se) {
     y -= (mo <= 2);
     long long era = (y >= 0 ? y : y - 399) / 400;
@@ -2689,7 +3696,7 @@ static long long UtcEpoch(int y, int mo, int d, int h, int mi, int se) {
     return days * 86400LL + h * 3600LL + mi * 60LL + se;
 }
 
-// 编译时刻（UTC 秒），作为「本机版本发布时间」
+// ---------------- BuildEpoch ----------------
 static long long BuildEpoch() {
     static long long v = -2;
     if (v != -2) return v;
@@ -2701,7 +3708,7 @@ static long long BuildEpoch() {
     return v;
 }
 
-// GitHub 的 "2026-11-03T12:34:56Z"
+// ---------------- ParseIsoTime ----------------
 static long long ParseIsoTime(const std::string& s) {
     std::tm tm{};
     std::istringstream ss(s);
@@ -2711,6 +3718,7 @@ static long long ParseIsoTime(const std::string& s) {
                     tm.tm_hour, tm.tm_min, tm.tm_sec);
 }
 
+// ---------------- TagNewer ----------------
 static bool TagNewer(const std::wstring& a, const std::wstring& b) {
     auto parse = [](std::string s) {
         if (!s.empty() && (s[0] == 'v' || s[0] == 'V')) s.erase(s.begin());
@@ -2739,6 +3747,7 @@ static bool TagNewer(const std::wstring& a, const std::wstring& b) {
     return A.second > B.second;
 }
 
+// ---------------- UpdateThread ----------------
 static void UpdateThread(bool interactive) {
     g_updateState = 1;
     std::vector<unsigned char> data;
@@ -2785,7 +3794,7 @@ static void UpdateThread(bool interactive) {
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UPD, interactive ? 1 : 0, 0);
 }
 
-// 下载新版并写一个批处理：等本进程退出 -> 覆盖 exe -> 启动新版
+// ---------------- StartUpdate ----------------
 static void StartUpdate() {
     if (g_updating.load()) return;
     g_updating = true;
@@ -2838,21 +3847,8 @@ static void StartUpdate() {
     MessageBoxW(g_hwnd, L"新版本已下载，启动器会关闭并自动替换为最新版。", L"更新", MB_OK | MB_ICONINFORMATION);
     DestroyWindow(g_hwnd);
 }
-// ============================ 启动浮层 ============================
-static void ApplyOverlayVisibility() {
-    bool L = (g_page == PAGE_LAUNCH) && !g_overlay;
-    ShowWindow(hBtnLaunch, L ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnInstArrow, L ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnRefresh, (g_page == PAGE_INSTANCES && !g_overlay) ? SW_SHOW : SW_HIDE);
-    ShowWindow(hBtnOverlayCancel, g_overlay ? SW_SHOW : SW_HIDE);
-}
-static RECT OverlayCancelRect() {
-    RECT c = g_ly.content;
-    int w = Scale(96), h = Scale(34);
-    return { c.right - Scale(28) - w, c.bottom - Scale(62), c.right - Scale(28), c.bottom - Scale(28) };
-}
 
-// 颜色线性插值
+// ---------------- MixColor ----------------
 static COLORREF MixColor(COLORREF a, COLORREF b, double t) {
     if (t < 0) t = 0;
     if (t > 1) t = 1;
@@ -2862,70 +3858,8 @@ static COLORREF MixColor(COLORREF a, COLORREF b, double t) {
     return RGB(r, g, bl);
 }
 
-static void FillLine(HDC dc, int left, int right, int y, COLORREF col) {
-    RECT line = { left, y, right, y + 1 };
-    HBRUSH b = CreateSolidBrush(col);
-    FillRect(dc, &line, b);
-    DeleteObject(b);
-}
-
-// 沉浸式启动画面：背景图/深灰渐变 + 底部 200px 渐变压暗 + 左下角状态 + 贴底进度条
-// 下载任务面板（下载页中央卡片）
-static RECT DlTaskCardRect() {
-    RECT c = g_ly.content;
-    int w = Scale(560), h = Scale(190);
-    int cx = (c.left + c.right) / 2, cy = (c.top + c.bottom) / 2;
-    return { cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2 };
-}
-
-static void DrawDlTaskPanel(HDC dc) {
-    if (!g_dlBusy.load()) return;
-
-    RECT c = g_ly.content;
-    RECT card = DlTaskCardRect();
-    // 遮罩
-    HBRUSH dim = CreateSolidBrush(RGB(18, 19, 22));
-    FillRect(dc, &c, dim);
-    DeleteObject(dim);
-
-    FillRoundRect(dc, card, 12, C_CARD);
-
-    int x = card.left + Scale(24);
-    RECT ttl = { x, card.top + Scale(18), card.right - Scale(24), card.top + Scale(46) };
-    std::wstring title = L"正在下载中：" + (g_dlTarget.empty() ? std::wstring(L"…") : g_dlTarget);
-    DrawTextIn(dc, title, ttl, C_TEXT, g_fUi);
-
-    int total = g_progTotal.load(), cur = g_progCur.load();
-    double ratio = (total > 0) ? ((double)cur / total) : 0.0;
-    if (ratio > 1) ratio = 1;
-
-    RECT bar = { x, card.top + Scale(56), card.right - Scale(24), card.top + Scale(72) };
-    FillRoundRect(dc, bar, 6, RGB(40, 42, 48));
-    if (ratio > 0) {
-        RECT fg = bar;
-        fg.right = bar.left + (int)((bar.right - bar.left) * ratio);
-        if (fg.right < fg.left + 2) fg.right = fg.left + 2;
-        FillRoundRect(dc, fg, 6, C_ACCENT2);
-    }
-
-    // 已完成 / 剩余
-    std::wstring s1 = L"已完成 " + std::to_wstring(cur) + L" 个文件";
-    if (total > 0) s1 += L"    剩余 " + std::to_wstring(total - cur) + L" 个";
-    RECT r1 = { x, card.top + Scale(82), card.right - Scale(24), card.top + Scale(108) };
-    DrawTextIn(dc, s1, r1, C_TEXT, g_fSmall);
-
-    // 百分比 + 速度
-    std::wstring sp;
-    if (g_dlSpeed > 1024.0 * 1024.0) sp = std::to_wstring(g_dlSpeed / 1024.0 / 1024.0).substr(0, 4) + L" MB/s";
-    else if (g_dlSpeed > 0)          sp = std::to_wstring((int)(g_dlSpeed / 1024.0)) + L" KB/s";
-    else                             sp = L"— KB/s";
-
-    std::wstring s2 = (total > 0 ? (std::to_wstring((int)(ratio * 100)) + L"%") : L"…") + L"    " + sp;
-    RECT r2 = { x, card.top + Scale(112), card.right - Scale(24), card.top + Scale(140) };
-    DrawTextIn(dc, s2, r2, C_DIM, g_fSmall);
-}
-// ============================ 模组 ============================
-static std::string CurrentLoaderTag() {
+// ---------------- CurrentLoaderTag ----------------
+std::string CurrentLoaderTag() {
     if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size()) return "fabric";
     std::string id = g_versions[g_selVersion];
     for (auto& c : id) c = (char)tolower((unsigned char)c);
@@ -2935,14 +3869,14 @@ static std::string CurrentLoaderTag() {
     return "fabric";
 }
 
-// 实例对应的原版 MC 版本（Forge/Fabric 实例名不是版本号，读 inheritsFrom）
-static std::string CurrentMcVersion() {
+// ---------------- CurrentMcVersion ----------------
+std::string CurrentMcVersion() {
     if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size()) return "";
     std::string id = g_versions[g_selVersion];
 
     // 1) 版本 JSON 里的 inheritsFrom 最准
     {
-        fs::path jp = fs::u8path(g_cfg.gameDir) / L"versions" / fs::u8path(id) / fs::u8path(id + ".json");
+        fs::path jp = GameDirPath() / L"versions" / fs::u8path(id) / fs::u8path(id + ".json");
         std::ifstream f{ jp };
         if (f) {
             std::stringstream ss; ss << f.rdbuf();
@@ -2954,15 +3888,18 @@ static std::string CurrentMcVersion() {
     }
 
     // 2) 用官方版本清单做最长前缀匹配（"26.3-Fabric" -> "26.3"）
-    if (!g_mcVers.empty()) {
-        std::string best;
-        for (auto& v : g_mcVers) {
-            const std::string& cand = v.id;
-            if (cand.size() > id.size()) continue;
-            if (id.compare(0, cand.size(), cand) != 0) continue;
-            if (cand.size() > best.size()) best = cand;
+    {
+        std::lock_guard<std::mutex> lk(g_mcVersMutex);
+        if (!g_mcVers.empty()) {
+            std::string best;
+            for (auto& v : g_mcVers) {
+                const std::string& cand = v.id;
+                if (cand.size() > id.size()) continue;
+                if (id.compare(0, cand.size(), cand) != 0) continue;
+                if (cand.size() > best.size()) best = cand;
+            }
+            if (!best.empty()) return best;
         }
-        if (!best.empty()) return best;
     }
 
     // 3) 兜底：砍掉 -fabric / -forge / -neoforge / -quilt 及其后内容
@@ -2975,15 +3912,18 @@ static std::string CurrentMcVersion() {
     }
     return id;
 }
-static fs::path InstanceModsDir() {
-    fs::path mcDir = fs::u8path(g_cfg.gameDir);
+
+// ---------------- InstanceModsDir ----------------
+fs::path InstanceModsDir() {
+    fs::path mcDir = GameDirPath();
     if (g_selVersion >= 0 && g_selVersion < (int)g_versions.size() &&
         ShouldIsolate(g_versions[g_selVersion], mcDir))
         return mcDir / L"versions" / fs::u8path(g_versions[g_selVersion]) / L"mods";
     return mcDir / L"mods";
 }
 
-static void RefreshInstalledMods() {
+// ---------------- RefreshInstalledMods ----------------
+void RefreshInstalledMods() {
     g_modFiles.clear();
     std::error_code ec;
     fs::path d = InstanceModsDir();
@@ -2999,7 +3939,50 @@ static void RefreshInstalledMods() {
     }
 }
 
-// ============================ CurseForge（免 Key 公共代理） ============================
+// ---------------- 按指定实例枚举模组 ----------------
+fs::path ModsDirOf(const std::string& versionId) {
+    fs::path mcDir = GameDirPath();
+    if (ShouldIsolate(versionId, mcDir))
+        return mcDir / L"versions" / fs::u8path(versionId) / L"mods";
+    return mcDir / L"mods";
+}
+
+std::vector<std::string> ListModsOf(const std::string& versionId) {
+    std::vector<std::string> out;
+    std::error_code ec;
+    fs::path d = ModsDirOf(versionId);
+    if (!fs::exists(d, ec)) return out;
+    for (auto& e : fs::directory_iterator(d, ec)) {
+        if (!e.is_regular_file()) continue;
+        std::string n = WToU8(e.path().filename().wstring());
+        if (n.size() > 4 && (n.substr(n.size() - 4) == ".jar" ||
+                             (n.size() > 13 && n.substr(n.size() - 13) == ".jar.disabled")))
+            out.push_back(n);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+void ToggleModIn(const std::string& versionId, const std::string& fileName, std::string& err) {
+    fs::path dir = ModsDirOf(versionId);
+    std::error_code ec;
+    bool disabled = (fileName.size() > 13 && fileName.substr(fileName.size() - 13) == ".jar.disabled");
+    std::string target = disabled ? fileName.substr(0, fileName.size() - 9) : (fileName + ".disabled");
+    fs::rename(dir / fs::u8path(fileName), dir / fs::u8path(target), ec);
+    if (ec) { err = "重命名失败：" + ec.message(); return; }
+    err.clear();
+}
+
+bool DeleteModIn(const std::string& versionId, const std::string& fileName, std::string& err) {
+    fs::path dir = ModsDirOf(versionId);
+    std::error_code ec;
+    fs::remove(dir / fs::u8path(fileName), ec);
+    if (ec) { err = "删除失败：" + ec.message(); return false; }
+    err.clear();
+    return true;
+}
+
+// ---------------- UrlEncode ----------------
 static std::string UrlEncode(const std::string& s) {
     static const char* hex = "0123456789ABCDEF";
     std::string out; out.reserve(s.size() * 3);
@@ -3011,14 +3994,23 @@ static std::string UrlEncode(const std::string& s) {
     return out;
 }
 
-// 通过公共镜像搜索 CurseForge（无需 API Key）
-// 成功返回 true 并填充 g_modHits；镜像不可用或解析失败返回 false
+// ---------------- FetchCurseForgeViaProxy ----------------
 static bool FetchCurseForgeViaProxy(std::string query, std::string mcVersion) {
-    // 依次尝试：配置里的中转站 -> 内置默认中转站 -> 官方 API（需 Key）
+    // 依次尝试：配置的中转站 → 内置多个中转站（自动检测可用性） → 官方 API（需 Key）
+    // 说明：CurseForge 官方 API 需要申请 Key；这里用公开中转站兜底
+    static const char* kCfMirrors[] = {
+        "https://api.curse.tools/v1/cf",     // curse.tools 公共中转（无需 Key）
+        "https://cf.mcim.moe/v1/cf",         // MCIM 中转站
+        "https://mcim.bangbang93.com/v1/cf", // BMCLAPI 生态的中转
+    };
+
     std::vector<std::pair<std::string, bool>> mirrors;   // (base, 是否需要 key)
     if (!g_cfg.cfProxy.empty()) mirrors.push_back({ g_cfg.cfProxy, false });
-    if (g_cfg.cfProxy != "https://api.curse.tools/v1/cf")
-        mirrors.push_back({ "https://api.curse.tools/v1/cf", false });
+    for (const char* m : kCfMirrors) {
+        bool dup = false;
+        for (auto& e2 : mirrors) if (e2.first == m) { dup = true; break; }
+        if (!dup) mirrors.push_back({ m, false });
+    }
     if (!g_cfg.cfApiKey.empty())
         mirrors.push_back({ "https://api.curseforge.com/v1", true });
 
@@ -3057,11 +4049,13 @@ static bool FetchCurseForgeViaProxy(std::string query, std::string mcVersion) {
     }
     return false;
 }
-static void FetchModSearchThread(std::string q) {
-    g_modState = 1;
-    g_modHits.clear();
-    g_modSel = -1;
 
+// ---------------- FetchModSearchThread ----------------
+static void FetchModSearchThread(std::string q, int gen) {
+    if (gen != g_modGen.load()) return;
+    { std::lock_guard<std::mutex> lk(g_modHitsMutex); g_modHits.clear(); }
+    g_modSel = -1;
+    std::vector<ModHit> hits;   // 先收本地，最后一次性写入
     std::string mc = CurrentMcVersion();
     std::string loader = CurrentLoaderTag();
 
@@ -3076,17 +4070,40 @@ static void FetchModSearchThread(std::string q) {
         g_modSource = 0;
     }
 
+    // 分类：Modrinth 用 project_type 过滤
+    // 0=mod 1=modpack 2=datapack 3=resourcepack 4=shader
+    static const char* kModTypes[5] = { "mod", "modpack", "datapack", "resourcepack", "shader" };
+
+    // ---------- 拼 URL ----------
+    // 注意：facets 只能出现一次，多个条件要合并在一个 facets 数组里
+    // 结构：[[project_type:X],[versions:Y],[categories:Z]]  这是「与」关系
     std::string base = "https://api.modrinth.com/v2/search?limit=20";
-    if (q.empty()) base += "&index=downloads";
-    else          base += "&query=" + q;
 
-    // 依次放宽条件：版本+加载器 -> 仅加载器 -> 不过滤
+    std::string queryPart;
+    if (!q.empty()) queryPart = "&query=" + UrlEncode(q);   // ★ 必须编码，中文/空格才能搜
+    else            queryPart = "&index=downloads";          // 空搜索按下载量排
+
+    bool isMod = (g_modCat == 0);
     std::vector<std::string> urls;
-    if (!mc.empty())
-        urls.push_back(base + "&facets=%5B%5B%22versions%3A" + mc + "%22%5D%2C%5B%22categories%3A" + loader + "%22%5D%5D");
-    urls.push_back(base + "&facets=%5B%5B%22categories%3A" + loader + "%22%5D%5D");
-    urls.push_back(base);
 
+    // 1) 最精确：类型 + MC 版本 + 加载器（仅 mod 类有加载器概念）
+    if (isMod && !mc.empty()) {
+        urls.push_back(base + queryPart +
+            "&facets=%5B%5B%22project_type%3A" + std::string(kModTypes[g_modCat]) + "%22%5D%2C" +
+            "%5B%22versions%3A" + mc + "%22%5D%2C" +
+            "%5B%22categories%3A" + loader + "%22%5D%5D");
+    }
+    // 2) 退一步：类型 + 加载器
+    if (isMod) {
+        urls.push_back(base + queryPart +
+            "&facets=%5B%5B%22project_type%3A" + std::string(kModTypes[g_modCat]) + "%22%5D%2C" +
+            "%5B%22categories%3A" + loader + "%22%5D%5D");
+    }
+    // 3) 再退一步：只要类型
+    urls.push_back(base + queryPart +
+        "&facets=%5B%5B%22project_type%3A" + std::string(kModTypes[g_modCat]) + "%22%5D%5D");
+    // 4) 兜底：完全不过滤（有搜索词时才有意义）
+    if (!q.empty()) urls.push_back(base + queryPart);
     bool anyOk = false;
     for (auto& url : urls) {
         std::vector<unsigned char> d; std::string e;
@@ -3100,25 +4117,44 @@ static void FetchModSearchThread(std::string q) {
             m.title     = h.value("title", std::string());
             m.desc      = h.value("description", std::string());
             m.downloads = h.value("downloads", 0LL);
-            if (!m.slug.empty()) g_modHits.push_back(m);
+            if (!m.slug.empty()) hits.push_back(m);
         }
-        if (!g_modHits.empty()) break;   // 有结果就停
+        if (!hits.empty()) break;   // 有结果就停
     }
+    if (gen != g_modGen.load()) return;      // 已有更新的搜索，丢弃本次
+    { std::lock_guard<std::mutex> lk(g_modHitsMutex); g_modHits = std::move(hits); }
     g_modState = anyOk ? 2 : 3;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
-
-// 拉某个模组的可用版本（按当前实例过滤）
-static void FetchModVersThread(std::string slug) {
+// ---------------- FetchModVersThread ----------------
+static void FetchModVersThread(std::string slug, int gen) {
+    std::vector<std::string> vNames, vFiles;   // 先收在本地，最后一次性加锁写入
     g_modVerState = 1;
-    g_modVerNames.clear(); g_modVerFiles.clear(); g_modVerSel = -1;
-
+    g_modVerSel = -1;
     std::string mc = CurrentMcVersion();
     std::string loader = CurrentLoaderTag();
     // CurseForge 来源（slug = cf:<id>）：走镜像取文件列表
     if (slug.rfind("cf:", 0) == 0) {
         std::string id = slug.substr(3);
-        std::string curl = "https://api.curse.tools/v1/cf/mods/" + id + "/files?pageSize=50";
+        // 同样自动检测中转站
+        std::string curl;
+        {
+            static const char* kMirrors[] = {
+                "https://api.curse.tools/v1/cf",
+                "https://cf.mcim.moe/v1/cf",
+                "https://mcim.bangbang93.com/v1/cf",
+            };
+            for (const char* m : kMirrors) {
+                std::string probe = std::string(m) + "/mods/" + id + "/files?pageSize=1";
+                std::vector<unsigned char> pd; std::string pe;
+                if (HttpRequest(probe, "GET", "", "", pd, pe) && !pd.empty()) {
+                    curl = std::string(m) + "/mods/" + id + "/files?pageSize=50";
+                    break;
+                }
+            }
+            if (curl.empty()) curl = std::string("https://api.curse.tools/v1/cf/mods/") + id + "/files?pageSize=50";
+        }
         if (!mc.empty()) curl += "&gameVersion=" + UrlEncode(mc);
         std::vector<unsigned char> cd; std::string ce;
         if (HttpRequest(curl, "GET", "", "", cd, ce)) {
@@ -3128,9 +4164,10 @@ static void FetchModVersThread(std::string slug) {
                     std::string fn = f.value("fileName", std::string());
                     std::string dl = f.value("downloadUrl", std::string());
                     std::string dn = f.value("displayName", fn);
-                    if (!dl.empty()) { g_modVerNames.push_back(dn); g_modVerFiles.push_back(dl + "\n" + fn); }
+                    if (!dl.empty()) { vNames.push_back(dn); vFiles.push_back(dl + "\n" + fn); }
                 }
-                g_modVerState = g_modVerNames.empty() ? 3 : 2;
+                { std::lock_guard<std::mutex> lk(g_modVerMutex); g_modVerNames = vNames; g_modVerFiles = vFiles; }
+                g_modVerState = vNames.empty() ? 3 : 2;
                 if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
                 return;
             }
@@ -3163,15 +4200,17 @@ static void FetchModVersThread(std::string slug) {
                 fu  = v["files"][0].value("url", std::string());
                 fnn = v["files"][0].value("filename", std::string());
             }
-            if (!fu.empty()) { g_modVerNames.push_back(name); g_modVerFiles.push_back(fu + "\n" + fnn); }
+            if (!fu.empty()) { vNames.push_back(name); vFiles.push_back(fu + "\n" + fnn); }
         }
-        if (!g_modVerNames.empty()) break;   // 有结果就停
+        if (!vNames.empty()) break;   // 有结果就停
     }
-    g_modVerState = anyOk ? 2 : 3;
+    if (gen != g_modVerGen.load()) return;   // 期间又点了别的模组，丢弃
+    { std::lock_guard<std::mutex> lk(g_modVerMutex); g_modVerNames = vNames; g_modVerFiles = vFiles; }
+    g_modVerState = (anyOk && !vNames.empty()) ? 2 : 3;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
 
-// 下载详情页里选中的那个模组版本
+// ---------------- InstallModVersionThread ----------------
 static void InstallModVersionThread(std::string url, std::string fname) {
     g_dlBusy = true; g_dlCancel = false; g_dlBytes = 0;
     g_dlTarget = U8ToW(g_modDetailTitle);
@@ -3192,7 +4231,8 @@ static void InstallModVersionThread(std::string url, std::string fname) {
     g_dlBusy = false; g_progState = 0;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
-// 下载某个模组（最新适配版本）到 mods
+
+// ---------------- InstallModThread ----------------
 static void InstallModThread(std::string slug) {
     g_dlBusy = true; g_dlCancel = false; g_dlBytes = 0;
     g_dlTarget = U8ToW(slug);
@@ -3242,677 +4282,8 @@ static void InstallModThread(std::string slug) {
     g_dlBusy = false; g_progState = 0;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
 }
-// 下载进度条（下载页底部）
-static void DrawDlProgress(HDC dc) {
-    if (g_progState.load() != 1 && !g_dlBusy.load()) return;
-    RECT c = g_ly.content;
-    int total = g_progTotal.load(), cur = g_progCur.load();
-    double ratio = 0;
-    if (total > 0) ratio = (double)cur / total;
-    else if (g_dlBusy.load()) ratio = 0.15;
-    if (ratio > 1) ratio = 1;
 
-    int barH = Scale(6);
-    RECT bg = { c.left, c.bottom - barH, c.right, c.bottom };
-    HBRUSH b1 = CreateSolidBrush(RGB(40, 42, 48));
-    FillRect(dc, &bg, b1);
-    DeleteObject(b1);
-    if (ratio > 0) {
-        RECT fg = bg;
-        fg.right = bg.left + (int)((bg.right - bg.left) * ratio);
-        if (fg.right < fg.left + 1) fg.right = fg.left + 1;
-        HBRUSH b2 = CreateSolidBrush(C_ACCENT2);
-        FillRect(dc, &fg, b2);
-        DeleteObject(b2);
-    }
-
-    std::wstring s;
-    if (total > 0)
-        s = L"正在下载 " + std::to_wstring(cur) + L" / " + std::to_wstring(total) +
-            L"   " + std::to_wstring((int)(ratio * 100)) + L"%";
-    else
-        s = L"正在准备下载…";
-    RECT tr = { c.left + Scale(24), c.bottom - Scale(34), c.right - Scale(24), c.bottom - Scale(10) };
-    DrawTextIn(dc, s, tr, C_TEXT, g_fSmall);
-}
-
-static void DrawOverlay(HDC dc) {
-    RECT c = g_ly.content;
-    int h = c.bottom - c.top;
-    if (h <= 0) return;
-
-    int done  = g_stepCur.load();
-    int total = g_progTotal.load(), cur = g_progCur.load();
-    bool downloading = (g_progState.load() == 1 && total > 0);
-    double ratio = downloading ? ((double)cur / total) : (done / 4.0);
-    if (ratio < 0) ratio = 0;
-    if (ratio > 1) ratio = 1;
-
-    // ---------- 1. 背景：优先用资源位图 102，没有就深灰渐变 ----------
-    bool painted = false;
-    {
-        HINSTANCE hi = GetModuleHandleW(nullptr);
-        HBITMAP bg = (HBITMAP)LoadImageA(hi, MAKEINTRESOURCEA(102), IMAGE_BITMAP, 0, 0, LR_CREATEDIBSECTION);
-        if (bg) {
-            BITMAP bm{};
-            GetObject(bg, sizeof(bm), &bm);
-            HDC src = CreateCompatibleDC(dc);
-            HBITMAP oldb = (HBITMAP)SelectObject(src, bg);
-            SetStretchBltMode(dc, HALFTONE);
-            SetBrushOrgEx(dc, 0, 0, nullptr);
-            StretchBlt(dc, c.left, c.top, c.right - c.left, h, src, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
-            SelectObject(src, oldb);
-            DeleteDC(src);
-            DeleteObject(bg);
-            painted = true;
-        }
-    }
-    if (!painted) {
-        const COLORREF cTop = RGB(30, 32, 38), cBottom = RGB(10, 11, 14);
-        for (int y = c.top; y < c.bottom; ++y) {
-            double t = (double)(y - c.top) / h;
-            FillLine(dc, c.left, c.right, y, MixColor(cTop, cBottom, t));
-        }
-    }
-
-    // ---------- 2. 底部 200px 渐变压暗（透明 -> 近黑）----------
-    int gH = Scale(200);
-    if (gH > h) gH = h;
-    for (int i = 0; i < gH; ++i) {
-        int y = c.bottom - gH + i;
-        double t = (double)(y - c.top) / h;
-        double a = (double)i / gH * 0.95;
-        COLORREF base = MixColor(RGB(30, 32, 38), RGB(10, 11, 14), t);
-        FillLine(dc, c.left, c.right, y, MixColor(base, RGB(0, 0, 0), a));
-    }
-
-    // ---------- 3. 左下角状态 ----------
-    std::wstring ver = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
-                     ? U8ToW(g_versions[g_selVersion]) : std::wstring(L"");
-    std::wstring st;
-    if (downloading)
-        st = L"正在补全文件  " + std::to_wstring(cur) + L" / " + std::to_wstring(total);
-    else if (done >= 4)
-        st = ver.empty() ? std::wstring(L"游戏已启动") : (L"游戏已启动 · " + ver);
-    else if (!ver.empty())
-        st = L"正在启动  " + ver + L" …";
-    else
-        st = L"正在启动 …";
-
-    RECT sr = { c.left + Scale(32), c.bottom - Scale(90), c.right - Scale(180), c.bottom - Scale(56) };
-    DrawTextIn(dc, st, sr, RGB(228, 231, 236), g_fUi);
-
-    const wchar_t* stage = (done == 0) ? L"检测 Java 版本"
-                        : (done == 1) ? L"处理游戏依赖"
-                        : (done == 2) ? L"登录"
-                        : (done == 3) ? L"等待游戏窗口"
-                                      : L"完成";
-    RECT sr2 = { c.left + Scale(32), c.bottom - Scale(54), c.right - Scale(180), c.bottom - Scale(26) };
-    DrawTextIn(dc, stage, sr2, RGB(138, 144, 156), g_fSmall);
-
-    // ---------- 4. 贴底进度条 ----------
-    int barH = Scale(4);
-    RECT barBg = { c.left, c.bottom - barH, c.right, c.bottom };
-    HBRUSH bgB = CreateSolidBrush(RGB(38, 40, 46));
-    FillRect(dc, &barBg, bgB);
-    DeleteObject(bgB);
-
-    if (ratio > 0) {
-        RECT fill = barBg;
-        fill.right = barBg.left + (int)((barBg.right - barBg.left) * ratio);
-        if (fill.right < fill.left + 1) fill.right = fill.left + 1;
-        HBRUSH fb = CreateSolidBrush(C_ACCENT2);
-        FillRect(dc, &fill, fb);
-        DeleteObject(fb);
-    }
-}
-
-static void PaintMain(HDC dc, int w, int h) {
-    HBRUSH bg = CreateSolidBrush(C_BG);
-    RECT all = { 0, 0, w, h };
-    FillRect(dc, &all, bg);
-    DeleteObject(bg);
-
-    // 顶栏
-    HBRUSH hb = CreateSolidBrush(C_HEADER);
-    FillRect(dc, &g_ly.header, hb);
-    DeleteObject(hb);
-
-    RECT t = g_ly.header; t.left += Scale(24); t.right = t.left + Scale(190);
-    DrawTextIn(dc, L"ReignLaunch", t, C_TEXT, g_fTitle);
-
-    // 当前页标题
-    RECT pt = { g_ly.main.left + Scale(40), g_ly.content.top + Scale(12), g_ly.main.right, g_ly.content.top + Scale(44) };
-    const wchar_t* titles[] = { L"", L"用户", L"设置", L"关于", L"", L"", L"" };
-    if (g_page != PAGE_LAUNCH && g_page != PAGE_ABOUT && g_page != PAGE_USER) DrawTextIn(dc, titles[g_page], pt, C_DIM, g_fSmall);
-
-    if (g_page == PAGE_LAUNCH) {
-        // 主区信息
-        int x = g_ly.content.left + Scale(40);
-        RECT l1 = { x, g_ly.content.top + Scale(40), g_ly.main.right, g_ly.content.top + Scale(66) };
-        DrawTextIn(dc, L"启动设置", l1, C_DIM, g_fSmall);
-
-        std::wstring acct = (g_cfg.authType == "thirdparty")
-            ? (L"账号: " + U8ToW(g_cfg.authName) + L"（第三方）")
-            : (L"账号: " + U8ToW(g_cfg.playerName) + L"（离线）");
-
-        RECT l3 = { x, g_ly.content.top + Scale(76), g_ly.main.right, g_ly.content.top + Scale(102) };
-        RECT l4 = { x, g_ly.content.top + Scale(102), g_ly.main.right, g_ly.content.top + Scale(128) };
-        RECT l5 = { x, g_ly.content.top + Scale(128), g_ly.main.right, g_ly.content.top + Scale(154) };
-        DrawTextIn(dc, acct, l3, C_DIM, g_fUi);
-        DrawTextIn(dc, L"内存: " + std::to_wstring(g_cfg.maxMemMB) + L" MB", l4, C_DIM, g_fUi);
-        std::wstring verSel = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
-            ? U8ToW(g_versions[g_selVersion]) : std::wstring(L"（未选择）");
-        DrawTextIn(dc, L"版本: " + verSel, l5, C_DIM, g_fUi);
-
-        int pst = g_progState.load();
-        if (pst != 0) {
-            RECT lb2 = LaunchBtnRect();
-            int total = g_progTotal.load(), cur = g_progCur.load();
-            float p = (pst == 1 && total > 0) ? ((float)cur / (float)total) : 1.0f;
-            if (p > 1.0f) p = 1.0f;
-            if (p < 0.0f) p = 0.0f;
-
-            RECT txt = { lb2.left - Scale(20), lb2.top - Scale(96), lb2.right, lb2.top - Scale(72) };
-            std::wstring s2 = (pst == 1)
-                ? (L"正在补全文件  " + std::to_wstring(cur) + L" / " + std::to_wstring(total))
-                : L"正在启动游戏…";
-            DrawTextIn(dc, s2, txt, C_DIM, g_fSmall);
-
-            RECT bar = { lb2.left - Scale(20), lb2.top - Scale(64), lb2.right, lb2.top - Scale(48) };
-            FillRoundRect(dc, bar, 8, C_CARD);
-            RECT fill = bar;
-            fill.right = bar.left + (int)((bar.right - bar.left) * p);
-            if (fill.right > fill.left + 2) FillRoundRect(dc, fill, 8, C_ACCENT2);
-        }
-
-        if (!g_status.empty()) {
-            RECT st = { x, g_ly.content.top + Scale(212), g_ly.main.right - Scale(20), g_ly.content.top + Scale(240) };
-            DrawTextIn(dc, g_status, st, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
-        }
-    }
-    else if (g_page == PAGE_USER) {
-        // 左侧账户列表
-        {
-            RECT sb = g_ly.sidebar;
-            HBRUSH bg = CreateSolidBrush(RGB(30, 31, 35));
-            FillRect(dc, &sb, bg);
-            DeleteObject(bg);
-
-            RECT lb = { sb.left + Scale(20), sb.top + Scale(10), sb.right, sb.top + Scale(34) };
-            DrawTextIn(dc, L"账户 (" + std::to_wstring(g_cfg.accounts.size()) + L")", lb, C_DIM, g_fSmall);
-
-            int itemH = Scale(64);
-            int y = sb.top + Scale(38);
-            for (size_t i = 0; i < g_cfg.accounts.size(); ++i) {
-                RECT card = { sb.left + Scale(10), y, sb.right - Scale(10), y + itemH - Scale(6) };
-                bool sel = ((int)i == g_cfg.activeAcc);
-                FillRoundRect(dc, card, 8, sel ? C_CARD_SEL : C_CARD);
-
-                DrawAvatar(dc, card.left + Scale(10), card.top + Scale(8), Scale(42));
-
-                RECT n1 = { card.left + Scale(60), card.top + Scale(10), card.right - Scale(8), card.top + Scale(34) };
-                DrawTextIn(dc, U8ToW(g_cfg.accounts[i].name), n1, sel ? C_TEXT : C_DIM, g_fUi);
-
-                std::wstring ty = (g_cfg.accounts[i].type == "thirdparty")
-                    ? (L"外置登录 · " + U8ToW(g_cfg.accounts[i].server))
-                    : L"离线模式";
-                RECT n2 = { card.left + Scale(60), card.top + Scale(34), card.right - Scale(8), card.top + Scale(54) };
-                DrawTextIn(dc, ty, n2, C_DIM, g_fSmall);
-
-                if (sel) {
-                    RECT bar = { card.left + Scale(2), card.top + Scale(10), card.left + Scale(5), card.bottom - Scale(10) };
-                    HBRUSH b = CreateSolidBrush(C_ACCENT2);
-                    FillRect(dc, &bar, b);
-                    DeleteObject(b);
-                }
-                y += itemH;
-            }
-
-            if (g_cfg.accounts.empty()) {
-                RECT e = { sb.left + Scale(16), sb.top + Scale(44), sb.right - Scale(16), sb.top + Scale(120) };
-                DrawTextIn(dc, L"还没有账户\n在右边填名字后点「使用离线」", e, C_DIM, g_fSmall,
-                           DT_LEFT | DT_TOP | DT_WORDBREAK);
-            }
-        }
-
-        int panelW = Scale(620);
-        int x = g_ly.main.left + (g_ly.main.right - g_ly.main.left - panelW) / 2;
-        if (x < g_ly.main.left + Scale(20)) x = g_ly.main.left + Scale(20);
-        int y = g_ly.content.top + Scale(116);
-        int rowH = Scale(58);
-
-        if (g_userMode == 0) {
-            DrawTextIn(dc, L"认证服务器", { x, y, x + Scale(100), y + Scale(30) }, C_DIM, g_fUi);
-            DrawTextIn(dc, L"用户名 / 邮箱", { x, y + rowH, x + Scale(100), y + rowH + Scale(30) }, C_DIM, g_fUi);
-            DrawTextIn(dc, L"密码", { x, y + rowH * 2, x + Scale(100), y + rowH * 2 + Scale(30) }, C_DIM, g_fUi);
-        }
-        if (g_userMode == 1) {
-            DrawTextIn(dc, L"离线玩家名", { x, y + rowH * 4 + Scale(16), x + Scale(100), y + rowH * 4 + Scale(46) }, C_DIM, g_fUi);
-        }
-
-        RECT cur = { x, y + rowH * 5 + Scale(12), g_ly.main.right - Scale(20), y + rowH * 5 + Scale(42) };
-        std::wstring s = (g_cfg.authType == "thirdparty")
-            ? (L"当前账号: " + U8ToW(g_cfg.authName) + L"  (" + U8ToW(g_cfg.authServer) + L")")
-            : (L"当前账号: 离线模式 (" + U8ToW(g_cfg.playerName) + L")");
-        DrawTextIn(dc, s, cur, C_TEXT, g_fUi);
-
-        if (!g_status.empty()) {
-            RECT st = { x, y + rowH * 5 + Scale(46), g_ly.main.right - Scale(20), y + rowH * 5 + Scale(82) };
-            DrawTextIn(dc, g_status, st,
-                       (g_loginState == 3) ? C_ERR : C_OK, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
-        }
-
-        if (g_userMode == 2) {
-            RECT e2 = { x, y, g_ly.main.right - Scale(20), y + Scale(140) };
-            DrawTextIn(dc, L"微软正版登录正在开发中，暂不可用。\n\n目前请使用「第三方登录」（LittleSkin 等）或「离线登录」。",
-                       e2, C_DIM, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
-        }
-    }
-    else if (g_page == PAGE_INSTANCES) {
-        int x   = g_ly.content.left + Scale(24);
-        int top = g_ly.content.top + Scale(72);
-
-        if (g_instTab == 1) {
-            int mBot = g_ly.content.bottom - Scale(24);
-            if (g_modFiles.empty()) {
-                RECT e = { x, top + Scale(10), g_ly.content.right - Scale(24), top + Scale(40) };
-                DrawTextIn(dc, L"当前实例没有安装模组", e, C_DIM, g_fSmall);
-            } else {
-                int ih = Scale(44);
-                int yy = top - g_listScroll;
-                for (size_t i = 0; i < g_modFiles.size(); ++i) {
-                    RECT item = { x, yy, g_ly.content.right - Scale(24), yy + ih - Scale(6) };
-                    if (item.bottom > top && item.top < mBot) {
-                        if (item.bottom > mBot) item.bottom = mBot;
-                        bool sel = ((int)i == g_modFileSel);
-                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                        std::string n = g_modFiles[i];
-                        bool dis = (n.size() > 13 && n.substr(n.size() - 13) == ".jar.disabled");
-                        RECT tx = item; tx.left += Scale(16);
-                        DrawTextIn(dc, U8ToW(n), tx, dis ? C_DIM : (sel ? C_TEXT : C_DIM), g_fUi);
-                        if (dis) {
-                            RECT tr = { item.right - Scale(120), item.top, item.right - Scale(16), item.bottom };
-                            DrawTextIn(dc, L"已禁用", tr, C_ERR, g_fSmall);
-                        }
-                    }
-                    yy += ih;
-                }
-            }
-            return;
-        }
-
-        RECT lbl = { x, top, g_ly.content.right - Scale(160), top + Scale(26) };
-        DrawTextIn(dc, L"实例 (" + std::to_wstring(g_versions.size()) + L")", lbl, C_DIM, g_fSmall);
-
-        int itemH = Scale(48);
-        int y = top + Scale(34) - g_listScroll;
-        for (size_t i = 0; i < g_versions.size(); ++i) {
-            RECT item = { x, y, g_ly.content.right - Scale(24), y + itemH - Scale(8) };
-                int listBottom = g_ly.content.bottom - Scale(72);
-                if (item.bottom > listBottom) item.bottom = listBottom;
-                if (item.bottom > top + Scale(34) && item.top < listBottom) {
-                bool sel = ((int)i == g_selVersion);
-                FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                RECT tx = item; tx.left += Scale(16); tx.right -= Scale(12);
-                DrawTextIn(dc, U8ToW(g_versions[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
-                if (sel) {
-                    RECT bar = { item.left, item.top + Scale(8), item.left + Scale(3), item.bottom - Scale(8) };
-                    HBRUSH b = CreateSolidBrush(C_ACCENT2);
-                    FillRect(dc, &bar, b);
-                    DeleteObject(b);
-                }
-            }
-            y += itemH;
-        }
-        if (g_versions.empty()) {
-            RECT e = { x, top + Scale(50), g_ly.content.right - Scale(24), top + Scale(140) };
-            DrawTextIn(dc, L"没有找到实例\n请到【设置】里指定 .minecraft 目录", e, C_DIM, g_fSmall,
-                       DT_LEFT | DT_TOP | DT_WORDBREAK);
-        }
-    }
-    else if (g_page == PAGE_DOWNLOAD) {
-        int cx = g_ly.content.left + Scale(24);
-        int cyTop = g_ly.content.top + Scale(16);
-
-        if (g_dlDetail) {
-            // ---------------- 详情页 ----------------
-            if (g_dlSel >= 0 && g_dlSel < (int)g_dlView.size()) {
-                const McVer& v = g_mcVers[g_dlView[g_dlSel]];
-
-                int hx = g_ly.content.left + Scale(140);
-                RECT t1 = { hx, g_ly.content.top + Scale(8), g_ly.content.right - Scale(24), g_ly.content.top + Scale(40) };
-                DrawTextIn(dc, U8ToW(v.id), t1, C_TEXT, g_fTitle);
-
-                std::wstring sub = U8ToW(v.date);
-                if (!sub.empty()) sub += L"   ";
-                sub += (v.type == "release") ? L"正式版" : (v.type == "snapshot") ? L"快照" :
-                       (v.type == "old_beta") ? L"远古 Beta" : L"远古 Alpha";
-                RECT t2 = { hx, g_ly.content.top + Scale(38), g_ly.content.right - Scale(24), g_ly.content.top + Scale(58) };
-                DrawTextIn(dc, sub, t2, C_DIM, g_fSmall);
-
-                const wchar_t* hint = (g_dlLoader == 0) ? L"原版：不安装任何加载器，直接点右下角「安装」"
-                    : (g_dlLoader == 1) ? L"Fabric：请在下方选择加载器版本"
-                    : (g_dlLoader == 2) ? L"Quilt：请在下方选择加载器版本"
-                    : (g_dlLoader == 3) ? L"Forge：请在下方选择加载器版本"
-                    : (g_dlLoader == 4) ? L"NeoForge：请在下方选择加载器版本"
-                    : (g_dlLoader == 5) ? L"Fabric API：选择版本后下载到 mods 目录"
-                                        : L"QSL：选择版本后下载到 mods 目录";
-                RECT hr = { cx, g_ly.content.top + Scale(100), g_ly.content.right - Scale(24), g_ly.content.top + Scale(124) };
-                DrawTextIn(dc, hint, hr, C_DIM, g_fSmall);
-
-                int listTop = g_ly.content.top + Scale(132);
-                int listBot = g_ly.content.bottom - Scale(72);
-
-                if (g_dlLoader == 0) {
-                    RECT e = { cx, listTop + Scale(8), g_ly.content.right - Scale(24), listTop + Scale(40) };
-                    DrawTextIn(dc, L"（原版无需选择加载器版本）", e, C_DIM, g_fSmall);
-                } else if (g_ldVersState.load() == 0 || g_ldVersState.load() == 1) {
-                    RECT e = { cx, listTop + Scale(8), g_ly.content.right - Scale(24), listTop + Scale(40) };
-                    DrawTextIn(dc, L"正在获取版本列表…", e, C_DIM, g_fSmall);
-                } else if (g_ldVers.empty()) {
-                    RECT e = { cx, listTop + Scale(8), g_ly.content.right - Scale(24), listTop + Scale(40) };
-                    DrawTextIn(dc, L"没有可下载的版本", e, C_ERR, g_fSmall);
-                } else {
-                    int itemH = Scale(44);
-                    int yy = listTop - g_listScroll;
-                    for (size_t i = 0; i < g_ldVers.size(); ++i) {
-                        RECT item = { cx, yy, g_ly.content.right - Scale(24), yy + itemH - Scale(6) };
-                        if (item.bottom > listTop && item.top < listBot) {
-                            if (item.bottom > listBot) item.bottom = listBot;
-                            bool sel = ((int)i == g_ldSel);
-                            FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                            RECT tx = item; tx.left += Scale(16);
-                            DrawTextIn(dc, U8ToW(g_ldVers[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
-                            if (sel) {
-                                RECT bar = { item.left, item.top + Scale(6), item.left + Scale(3), item.bottom - Scale(6) };
-                                HBRUSH b = CreateSolidBrush(C_ACCENT2);
-                                FillRect(dc, &bar, b);
-                                DeleteObject(b);
-                            }
-                        }
-                        yy += itemH;
-                    }
-                }
-            } else {
-                RECT e = { cx, g_ly.content.top + Scale(60), g_ly.content.right - Scale(24), g_ly.content.top + Scale(100) };
-                DrawTextIn(dc, L"未选中版本，点「返回」重新选择", e, C_DIM, g_fSmall);
-            }
-
-            DrawDlProgress(dc);
-            DrawDlTaskPanel(dc);
-            return;
-        }
-
-        // ---------------- Mod 下载 ----------------
-        if (g_dlSection == 1) {
-            int mx0 = g_ly.content.left + Scale(24);
-            int mTop = g_ly.content.top + Scale(72);
-            int mBot = g_ly.content.bottom - Scale(24);
-            if (g_modDetail) {
-                int hx = g_ly.content.left + Scale(140);
-                RECT d1 = { hx, g_ly.content.top + Scale(8), g_ly.content.right - Scale(24), g_ly.content.top + Scale(40) };
-                DrawTextIn(dc, U8ToW(g_modDetailTitle), d1, C_TEXT, g_fTitle);
-                RECT d2 = { hx, g_ly.content.top + Scale(38), g_ly.content.right - Scale(24), g_ly.content.top + Scale(62) };
-                DrawTextIn(dc, U8ToW(g_modDetailDesc), d2, C_DIM, g_fSmall);
-
-                int vTop = g_ly.content.top + Scale(84);
-                if (g_modVerState.load() == 0 || g_modVerState.load() == 1) {
-                    RECT e = { mx0, vTop + Scale(8), g_ly.content.right - Scale(24), vTop + Scale(38) };
-                    DrawTextIn(dc, L"正在获取版本列表…", e, C_DIM, g_fSmall);
-                } else if (g_modVerState.load() == 3) {
-                    RECT e = { mx0, vTop + Scale(8), g_ly.content.right - Scale(24), vTop + Scale(38) };
-                    DrawTextIn(dc, L"获取版本失败，检查网络后重试", e, C_ERR, g_fSmall);
-                } else if (g_modVerNames.empty()) {
-                    RECT e = { mx0, vTop + Scale(8), g_ly.content.right - Scale(24), vTop + Scale(38) };
-                    DrawTextIn(dc, L"没有适配当前实例的版本文件", e, C_ERR, g_fSmall);
-                } else {
-                    int ih = Scale(44);
-                    int yy = vTop - g_listScroll;
-                    for (size_t i = 0; i < g_modVerNames.size(); ++i) {
-                        RECT item = { mx0, yy, g_ly.content.right - Scale(24), yy + ih - Scale(6) };
-                        if (item.bottom > vTop && item.top < mBot) {
-                            if (item.bottom > mBot) item.bottom = mBot;
-                            bool sel = ((int)i == g_modVerSel);
-                            FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                            RECT tx = item; tx.left += Scale(16);
-                            DrawTextIn(dc, U8ToW(g_modVerNames[i]), tx, sel ? C_TEXT : C_DIM, g_fUi);
-                        }
-                        yy += ih;
-                    }
-                }
-                DrawDlProgress(dc);
-                DrawDlTaskPanel(dc);
-                return;
-            }
-
-
-            if (g_modState.load() == 1) {
-                RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
-                DrawTextIn(dc, L"搜索中…", e, C_DIM, g_fSmall);
-            } else if (g_modState.load() == 3) {
-                RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
-                DrawTextIn(dc, L"搜索失败，检查网络后重试", e, C_ERR, g_fSmall);
-            } else if (g_modHits.empty()) {
-                RECT e = { mx0, mTop + Scale(10), g_ly.content.right - Scale(24), mTop + Scale(40) };
-                DrawTextIn(dc, g_modState.load() == 0
-                               ? L"正在加载模组列表…"
-                               : L"没有找到匹配的模组，换个关键词试试", e, C_DIM, g_fSmall);
-            } else {
-                int ih = Scale(56);
-                int yy = mTop - g_listScroll;
-                for (size_t i = 0; i < g_modHits.size(); ++i) {
-                    RECT item = { mx0, yy, g_ly.content.right - Scale(24), yy + ih - Scale(8) };
-                    if (item.bottom > mTop && item.top < mBot) {
-                        if (item.bottom > mBot) item.bottom = mBot;
-                        bool sel = ((int)i == g_modSel);
-                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                        RECT t1 = { item.left + Scale(16), item.top + Scale(8), item.right - Scale(16), item.top + Scale(32) };
-                        DrawTextIn(dc, U8ToW(g_modHits[i].title), t1, sel ? C_TEXT : C_DIM, g_fUi);
-                        RECT t2 = { item.left + Scale(16), item.top + Scale(32), item.right - Scale(16), item.bottom - Scale(4) };
-                        DrawTextIn(dc, U8ToW(g_modHits[i].desc), t2, C_DIM, g_fSmall);
-                    }
-                    yy += ih;
-                }
-            }
-            DrawDlProgress(dc);
-            DrawDlTaskPanel(dc);
-            return;
-        }
-
-        // ---------------- 列表页 ----------------
-        int listTop = g_ly.content.top + Scale(58);
-        int listBot = g_ly.content.bottom - Scale(16);
-
-        if (g_mcVersState.load() == 0 || g_mcVersState.load() == 1) {
-            RECT e = { cx, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
-            DrawTextIn(dc, L"正在获取版本清单…", e, C_DIM, g_fSmall);
-        } else if (g_mcVersState.load() == 3) {
-            RECT e = { cx, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
-            DrawTextIn(dc, L"获取版本清单失败，检查网络后重进本页", e, C_ERR, g_fSmall);
-        } else if (g_dlView.empty()) {
-            RECT e = { cx, listTop + Scale(20), g_ly.content.right - Scale(24), listTop + Scale(60) };
-            DrawTextIn(dc, L"没有符合条件的版本", e, C_DIM, g_fSmall);
-        } else {
-            int itemH = Scale(52);
-            int yy = listTop - g_listScroll;
-            for (size_t i = 0; i < g_dlView.size(); ++i) {
-                const McVer& v = g_mcVers[g_dlView[i]];
-                RECT item = { cx, yy, g_ly.content.right - Scale(24), yy + itemH - Scale(8) };
-                if (item.bottom > listTop && item.top < listBot) {
-                    if (item.bottom > listBot) item.bottom = listBot;
-                    bool sel = ((int)i == g_dlSel);
-                    FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-
-                    RECT tx = item; tx.left += Scale(16);
-                    DrawTextIn(dc, U8ToW(v.id), tx, sel ? C_TEXT : C_DIM, g_fUi);
-
-                    if (!v.date.empty()) {
-                        RECT td = { item.right - Scale(300), item.top, item.right - Scale(180), item.bottom };
-                        DrawTextIn(dc, U8ToW(v.date), td, C_DIM, g_fSmall);
-                    }
-
-                    bool april = IsAprilFools(v);
-                    std::wstring ty = april ? L"愚人节"
-                                    : (v.type == "release") ? L"正式版"
-                                    : (v.type == "snapshot") ? L"快照"
-                                    : (v.type == "old_beta") ? L"远古 Beta"
-                                                             : L"远古 Alpha";
-                    RECT tr2 = { item.right - Scale(160), item.top, item.right - Scale(16), item.bottom };
-                    DrawTextIn(dc, ty, tr2, april ? C_ERR : C_DIM, g_fSmall);
-
-                    if (sel) {
-                        RECT bar = { item.left, item.top + Scale(8), item.left + Scale(3), item.bottom - Scale(8) };
-                        HBRUSH b = CreateSolidBrush(C_ACCENT2);
-                        FillRect(dc, &bar, b);
-                        DeleteObject(b);
-                    }
-                }
-                yy += itemH;
-            }
-        }
-
-        DrawDlProgress(dc);
-        DrawDlTaskPanel(dc);
-    }
-    else if (g_page == PAGE_MODS) {
-        int x = g_ly.content.left + Scale(24);
-        int top = g_ly.content.top + Scale(58);
-        int listBot = g_ly.content.bottom - Scale(72);
-
-        if (g_modTab == 0) {
-            if (g_modState.load() == 1) {
-                RECT e = { x, top + Scale(10), g_ly.content.right - Scale(24), top + Scale(40) };
-                DrawTextIn(dc, L"搜索中…", e, C_DIM, g_fSmall);
-            } else if (g_modState.load() == 3) {
-                RECT e = { x, top + Scale(10), g_ly.content.right - Scale(24), top + Scale(40) };
-                DrawTextIn(dc, L"搜索失败，检查网络后重试", e, C_ERR, g_fSmall);
-            } else if (g_modHits.empty()) {
-                RECT e = { x, top + Scale(10), g_ly.content.right - Scale(24), top + Scale(40) };
-                DrawTextIn(dc, g_modState.load() == 0 ? L"输入关键词搜索模组" : L"没有找到匹配的模组", e, C_DIM, g_fSmall);
-            } else {
-                int itemH = Scale(56);
-                int yy = top - g_listScroll;
-                for (size_t i = 0; i < g_modHits.size(); ++i) {
-                    RECT item = { x, yy, g_ly.content.right - Scale(24), yy + itemH - Scale(8) };
-                    if (item.bottom > top && item.top < listBot) {
-                        if (item.bottom > listBot) item.bottom = listBot;
-                        bool sel = ((int)i == g_modSel);
-                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                        RECT t1 = { item.left + Scale(16), item.top + Scale(8), item.right - Scale(16), item.top + Scale(32) };
-                        DrawTextIn(dc, U8ToW(g_modHits[i].title), t1, sel ? C_TEXT : C_DIM, g_fUi);
-                        RECT t2 = { item.left + Scale(16), item.top + Scale(32), item.right - Scale(16), item.bottom - Scale(4) };
-                        std::wstring sub = U8ToW(g_modHits[i].desc);
-                        DrawTextIn(dc, sub, t2, C_DIM, g_fSmall);
-                    }
-                    yy += itemH;
-                }
-            }
-        } else {
-            if (g_modFiles.empty()) {
-                RECT e = { x, top + Scale(10), g_ly.content.right - Scale(24), top + Scale(40) };
-                DrawTextIn(dc, L"当前实例没有安装模组", e, C_DIM, g_fSmall);
-            } else {
-                int itemH = Scale(44);
-                int yy = top - g_listScroll;
-                for (size_t i = 0; i < g_modFiles.size(); ++i) {
-                    RECT item = { x, yy, g_ly.content.right - Scale(24), yy + itemH - Scale(6) };
-                    if (item.bottom > top && item.top < listBot) {
-                        if (item.bottom > listBot) item.bottom = listBot;
-                        bool sel = ((int)i == g_modFileSel);
-                        FillRoundRect(dc, item, 8, sel ? C_CARD_SEL : C_CARD);
-                        RECT tx = item; tx.left += Scale(16);
-                        std::string n = g_modFiles[i];
-                        bool disabled = (n.size() > 13 && n.substr(n.size() - 13) == ".jar.disabled");
-                        std::wstring shown = U8ToW(n);
-                        DrawTextIn(dc, shown, tx, disabled ? C_DIM : (sel ? C_TEXT : C_DIM), g_fUi);
-                        if (disabled) {
-                            RECT tr = { item.right - Scale(120), item.top, item.right - Scale(16), item.bottom };
-                            DrawTextIn(dc, L"已禁用", tr, C_ERR, g_fSmall);
-                        }
-                    }
-                    yy += itemH;
-                }
-            }
-        }
-        DrawDlProgress(dc);
-        DrawDlTaskPanel(dc);
-    }    else if (g_page == PAGE_ABOUT) {
-        DrawAboutBlock(dc);
-    }
-    else {
-        DrawSettingsMenu(dc);
-        if (g_settingsTab == 1) {
-            DrawAboutBlock(dc);
-        } else {
-        int x = g_ly.main.left + Scale(40);
-        int y = g_ly.content.top + Scale(50);
-        int rowH = Scale(62);
-
-        DrawTextIn(dc, L"游戏目录", { x, y, x + Scale(100), y + Scale(30) }, C_DIM, g_fUi);
-        DrawTextIn(dc, L"Java 路径", { x, y + rowH, x + Scale(100), y + rowH + Scale(30) }, C_DIM, g_fUi);
-        DrawTextIn(dc, L"最大内存", { x, y + rowH * 2, x + Scale(100), y + rowH * 2 + Scale(30) }, C_DIM, g_fUi);
-        DrawTextIn(dc, L"", { x, y + rowH * 3, x + Scale(100), y + rowH * 3 + Scale(30) }, C_DIM, g_fUi);
-
-        DrawTextIn(dc, L"MB", { x + Scale(230), y + rowH * 2, x + Scale(300), y + rowH * 2 + Scale(30) }, C_DIM, g_fUi);
-        DrawTextIn(dc, L"", { x + Scale(360), y + rowH * 3, x + Scale(600), y + rowH * 3 + Scale(30) },
-                   C_DIM, g_fSmall);
-
-        {
-            RECT tl = { x, y + rowH * 3 + Scale(6), x + Scale(100), y + rowH * 3 + Scale(36) };
-            DrawTextIn(dc, L"下载线程", tl, C_DIM, g_fUi);
-            RECT th = { x + Scale(210), y + rowH * 3 + Scale(12), g_ly.main.right - Scale(40), y + rowH * 3 + Scale(34) };
-            DrawTextIn(dc, L"1 - 128（默认 4）", th, C_DIM, g_fSmall);
-        }
-
-        {
-            RECT a = { x, y + rowH * 4 + Scale(6), x + Scale(100), y + rowH * 4 + Scale(36) };
-            DrawTextIn(dc, L"JVM 参数", a, C_DIM, g_fUi);
-            RECT b2 = { x, y + rowH * 5 + Scale(6), x + Scale(100), y + rowH * 5 + Scale(36) };
-            DrawTextIn(dc, L"游戏参数", b2, C_DIM, g_fUi);
-            RECT c2 = { x + Scale(560), y + rowH * 6 + Scale(16), g_ly.main.right - Scale(40), y + rowH * 6 + Scale(36) };
-            DrawTextIn(dc, L"空格分隔，可留空", c2, C_DIM, g_fSmall);
-        }
-
-
-        if (!g_status.empty()) {
-            RECT st = { x, y + rowH * 8 + Scale(6), g_ly.main.right - Scale(40), g_ly.content.bottom - Scale(4) };
-            DrawTextIn(dc, g_status, st, C_OK, g_fSmall, DT_LEFT | DT_TOP | DT_WORDBREAK);
-        }
-        }
-    }
-
-
-}
-
-// ---------------- 错误窗口 ----------------
-static void ShowErrorWindow() {
-    if (g_hErrWnd) { SetForegroundWindow(g_hErrWnd); return; }
-
-    static bool reg = false;
-    if (!reg) {
-        WNDCLASSW wc{};
-        wc.lpfnWndProc = ErrProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"ReignLaunchError";
-        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
-        reg = true;
-    }
-    int w = Scale(700), h = Scale(500);
-    g_hErrWnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"ReignLaunchError", L"游戏出错",
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, w, h, g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!g_hErrWnd) return;
-
-    std::string tail = LogTail(400);
-    SetWindowTextW(g_hErrEdit, U8ToW(tail).c_str());
-    ShowWindow(g_hErrWnd, SW_SHOW);
-    SetForegroundWindow(g_hErrWnd);
-}
-
-// ---------------- 登录线程 ----------------
+// ---------------- LoginThread ----------------
 static void LoginThread(std::string srv, std::string user, std::string pass) {
     AuthResult r = YggdrasilLogin(srv, user, pass);
     if (r.ok) {
@@ -3944,7 +4315,7 @@ static void LoginThread(std::string srv, std::string user, std::string pass) {
     PostMessageW(g_hwnd, WM_APP_LOGIN, 0, 0);
 }
 
-// ---------------- 文件对话框 ----------------
+// ---------------- PickFolder ----------------
 static bool PickFolder(HWND owner, std::string& out) {
     BROWSEINFOW bi{};
     bi.hwndOwner = owner;
@@ -3958,6 +4329,8 @@ static bool PickFolder(HWND owner, std::string& out) {
     if (ok) out = WToU8(path);
     return ok;
 }
+
+// ---------------- PickJava ----------------
 static bool PickJava(HWND owner, std::string& out) {
     wchar_t file[MAX_PATH] = {0};
     OPENFILENAMEW ofn{};
@@ -3972,1388 +4345,3412 @@ static bool PickJava(HWND owner, std::string& out) {
     return true;
 }
 
-// ============================ 下拉浮层 ============================
-#define WM_DROP_PICK (WM_APP + 10)
 
-static HWND  g_dropWnd = nullptr;
-static int   g_dropMode = 0;   // 0=dir 1=java 2=instance
-static int   g_dropHot = -1;
-static DWORD g_dropBorn = 0;
-static std::vector<Cand> g_dropItems;
+// ============================================================================
+//  第八部分：账户与杂项封装
+// ============================================================================
+// ============================================================================
+//  core_extra.cpp — 为 UI 层补充的封装函数
+//  原 Win32 版这些逻辑散在 MainProc 里，这里收敛成可调用函数
+// ============================================================================
 
-static LRESULT CALLBACK DropProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        RECT rc; GetClientRect(hwnd, &rc);
-        HBRUSH bg = CreateSolidBrush(C_CARD);
-        FillRect(dc, &rc, bg);
-        DeleteObject(bg);
-
-        int itemH = Scale(28);
-        int y = Scale(4);
-        for (size_t i = 0; i < g_dropItems.size(); ++i) {
-            RECT it = { Scale(4), y, rc.right - Scale(4), y + itemH };
-            if ((int)i == g_dropHot) {
-                HBRUSH hb = CreateSolidBrush(C_CARD_SEL);
-                FillRect(dc, &it, hb);
-                DeleteObject(hb);
-            }
-            std::wstring txt = U8ToW(g_dropItems[i].path);
-            if (g_dropMode == 1) txt = U8ToW(g_dropItems[i].label) + L"    " + U8ToW(g_dropItems[i].path);
-            RECT tt = it; tt.left += Scale(8); tt.right -= Scale(4);
-            DrawTextIn(dc, txt, tt, C_TEXT, g_fSmall);
-            y += itemH;
-        }
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_MOUSEMOVE: {
-        int idx = (GET_Y_LPARAM(lp) - Scale(4)) / Scale(28);
-        if (idx < 0 || idx >= (int)g_dropItems.size()) idx = -1;
-        if (idx != g_dropHot) { g_dropHot = idx; InvalidateRect(hwnd, nullptr, FALSE); }
-        return 0;
-    }
-    case WM_LBUTTONDOWN: {
-        int idx = (GET_Y_LPARAM(lp) - Scale(4)) / Scale(28);
-        if (idx >= 0 && idx < (int)g_dropItems.size())
-            PostMessageW(g_hwnd, WM_DROP_PICK, (WPARAM)idx, (LPARAM)g_dropMode);
-        DestroyWindow(hwnd);
-        return 0;
-    }
-    case WM_KILLFOCUS:
-        // 刚弹出时焦点可能立刻被按钮抢回，忽略这一次
-        if (GetTickCount() - g_dropBorn > 250) DestroyWindow(hwnd);
-        return 0;
-
-    case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) DestroyWindow(hwnd);
-        return 0;
-    case WM_DESTROY:
-        g_dropWnd = nullptr;
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
+// ---------------- 启动游戏（在工作线程里调用）----------------
+void LaunchGame(std::string versionId) {
+    // 原 LaunchThread 直接可用
+    LaunchThread(versionId);
 }
 
-// 浮层只是一个小方块，无标题栏、不进任务栏，看起来仍是一个窗口
-static void ShowDropPopup(int mode) {
-    if (g_dropWnd) { DestroyWindow(g_dropWnd); return; }
-
-    g_dropItems.clear();
-    if (mode == 0)      g_dropItems = g_dirCands;
-    else if (mode == 1) g_dropItems = g_javaCands;
-    else if (mode == 2) { for (auto& v : g_versions) g_dropItems.push_back({ v, v }); }
-    else if (mode == 7) {
-        g_dropItems.push_back({ "正式版", "正式版" });
-        g_dropItems.push_back({ "快照版", "快照版" });
-        g_dropItems.push_back({ "远古版", "远古版" });
-        g_dropItems.push_back({ "愚人节", "愚人节" });
-        g_dropItems.push_back({ "所有版本", "所有版本" });
-    }
-    else {
-        g_dropItems.push_back({ "隔离所有实例", "隔离所有实例" });
-        g_dropItems.push_back({ "隔离模组实例", "隔离模组实例" });
-        g_dropItems.push_back({ "不隔离实例",   "不隔离实例" });
-    }
-    if (g_dropItems.empty()) return;
-
-    RECT er{};
-    if (mode == 0)      GetWindowRect(hEdDir, &er);
-    else if (mode == 1) GetWindowRect(hEdJava, &er);
-    else if (mode == 2) GetWindowRect(hBtnInstArrow, &er);
-    else if (mode == 3) GetWindowRect(hBtnIso, &er);
-    else                GetWindowRect(hBtnDlFilterSel, &er);
-
-    int itemH = Scale(28);
-    int w = Scale(mode == 2 ? 300 : (mode == 7 ? 180 : (mode == 3 ? 300 : 420)));
-    int h = itemH * (int)g_dropItems.size() + Scale(8);
-
-    static bool reg = false;
-    if (!reg) {
-        WNDCLASSW wc{};
-        wc.lpfnWndProc = DropProc;
-        wc.hInstance = GetModuleHandleW(nullptr);
-        wc.lpszClassName = L"ReignLaunchDrop";
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassW(&wc);
-        reg = true;
-    }
-
-    g_dropMode = mode;
-    g_dropHot = -1;
-    int px2 = er.left;
-    int py2 = (mode == 2) ? (er.top - h - Scale(2)) : (er.bottom + Scale(2));
-    g_dropWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"ReignLaunchDrop", L"",
-        WS_POPUP | WS_BORDER,
-        px2, py2, w, h,
-        g_hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
-    if (!g_dropWnd) return;
-    g_dropBorn = GetTickCount();
-    ShowWindow(g_dropWnd, SW_SHOW);
-    SetFocus(g_dropWnd);
+// ---------------- 微软登录（无参版本，给 UI 用）----------------
+void MicrosoftLoginSimple() {
+    MicrosoftLoginThread();
 }
 
-// ---------------- 主窗口 ----------------
-static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-    case WM_CREATE: {
-        g_hwnd = hwnd;
-
-        hBtnTabLaunch   = MakeBtn(hwnd, L"启动", ID_TAB_LAUNCH);
-        hBtnTabUser     = MakeBtn(hwnd, L"用户", ID_TAB_USER);
-        hBtnTabSettings = MakeBtn(hwnd, L"设置", ID_TAB_SET);
-        hBtnTabAbout    = MakeBtn(hwnd, L"关于", ID_TAB_ABOUT);
-        hBtnTabInst     = MakeBtn(hwnd, L"实例", ID_TAB_INST);
-        hBtnTabDl       = MakeBtn(hwnd, L"下载", ID_TAB_DL);
-        hBtnTabMods     = MakeBtn(hwnd, L"模组", ID_TAB_MODS);
-        hBtnDlVanilla = MakeBtn(hwnd, L"原版", ID_DL_VANILLA);
-        hBtnDlFabric  = MakeBtn(hwnd, L"Fabric",   ID_DL_FABRIC);
-        hBtnDlQuilt   = MakeBtn(hwnd, L"Quilt",    ID_DL_QUILT);
-        hBtnDlForge   = MakeBtn(hwnd, L"Forge",    ID_DL_FORGE);
-        hBtnDlNeo     = MakeBtn(hwnd, L"NeoForge", ID_DL_NEO);
-        hBtnDlF0      = MakeBtn(hwnd, L"正式版",   ID_DL_FILTER0);
-        hBtnDlF1      = MakeBtn(hwnd, L"快照版",   ID_DL_FILTER1);
-        hBtnDlF2      = MakeBtn(hwnd, L"远古版",   ID_DL_FILTER2);
-        hBtnDlF3      = MakeBtn(hwnd, L"愚人节",   ID_DL_FILTER3);
-        hEdSearch = CreateWindowExW(0, L"EDIT", L"",
-                        WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                        0, 0, 10, 10, hwnd, (HMENU)ID_ED_SEARCH, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(hEdSearch, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-        SendMessageW(hEdSearch, EM_SETCUEBANNER, 0, (LPARAM)L"搜索版本，如 1.20.1");
-        hBtnDlBack    = MakeBtn(hwnd, L"← 返回", ID_DL_BACK);
-        hBtnDlInstall = MakeBtn(hwnd, L"安装", ID_DL_INSTALL);
-        hBtnDlFapi    = MakeBtn(hwnd, L"Fabric API", ID_DL_FAPI);
-        hBtnDlQsl     = MakeBtn(hwnd, L"QSL", ID_DL_QSL);
-        hBtnDlFilterSel = MakeBtn(hwnd, L"正式版  ▾", ID_DL_FILTERSEL);
-        hBtnDlCancel    = MakeBtn(hwnd, L"取消下载", ID_DL_CANCEL);
-
-        hBtnLaunch  = MakeBtn(hwnd, L"启动游戏", ID_BTN_LAUNCH);
-        hBtnRefresh = MakeBtn(hwnd, L"刷新版本", ID_BTN_REFRESH);
-        hBtnInstArrow = MakeBtn(hwnd, L"", ID_BTN_INSTARROW);
-        hBtnOverlayCancel = MakeBtn(hwnd, L"取消", ID_BTN_OVCANCEL);
-
-        hEdServer = MakeEdit(hwnd, ID_ED_SERVER, U8ToW(g_cfg.authServer).c_str());
-        hEdUser   = MakeEdit(hwnd, ID_ED_USER, L"");
-        hEdPass   = MakeEdit(hwnd, ID_ED_PASS, L"", ES_PASSWORD);
-        hBtnLogin = MakeBtn(hwnd, L"登录", ID_BTN_LOGIN);
-        hBtnLogout= MakeBtn(hwnd, L"退出登录", ID_BTN_LOGOUT);
-        hBtnOffline = MakeBtn(hwnd, L"使用离线", ID_BTN_OFFLINE);
-        hBtnSkin    = MakeBtn(hwnd, L"更换皮肤", ID_BTN_SKIN);
-        hBtnDelAcc  = MakeBtn(hwnd, L"删除账户", ID_BTN_DELACC);
-        hBtnDlSecGame = MakeBtn(hwnd, L"原版游戏", ID_DL_SEC_GAME);
-        hBtnDlSecMod  = MakeBtn(hwnd, L"Mod下载",  ID_DL_SEC_MOD);
-        hBtnInstTabList = MakeBtn(hwnd, L"版本列表", ID_INST_TAB_LIST);
-        hBtnInstTabMod  = MakeBtn(hwnd, L"模组管理", ID_INST_TAB_MOD);
-
-        hBtnModTabDl  = MakeBtn(hwnd, L"模组下载", ID_MOD_TABDL);
-        hBtnModTabIn  = MakeBtn(hwnd, L"已安装",   ID_MOD_TABIN);
-        hBtnModSource = MakeBtn(hwnd, L"源：Modrinth", ID_MOD_SOURCE);
-        hBtnModInstall= MakeBtn(hwnd, L"下载并安装", ID_MOD_INSTALL);
-        hBtnModToggle = MakeBtn(hwnd, L"启用/禁用", ID_MOD_TOGGLE);
-        hBtnModDelete = MakeBtn(hwnd, L"删除", ID_MOD_DELETE);
-        hEdModSearch = CreateWindowExW(0, L"EDIT", L"",
-                        WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-                        0, 0, 10, 10, hwnd, (HMENU)ID_MOD_SEARCH, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(hEdModSearch, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-        SendMessageW(hEdModSearch, EM_SETCUEBANNER, 0, (LPARAM)L"搜索模组，如 JEI、Sodium");
-
-        hBtnUserM0 = MakeBtn(hwnd, L"第三方登录", ID_USER_M0);
-        hBtnUserM1 = MakeBtn(hwnd, L"离线登录",   ID_USER_M1);
-        hBtnUserM2 = MakeBtn(hwnd, L"微软登录（开发中）", ID_USER_M2);
-
-        hEdThreads = CreateWindowExW(0, L"EDIT", std::to_wstring(g_cfg.dlThreads).c_str(),
-                        WS_CHILD | WS_BORDER | ES_NUMBER | ES_CENTER,
-                        0, 0, 10, 10, hwnd, (HMENU)ID_ED_THREADS, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(hEdThreads, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-
-        if (hEdJvm) {} else {
-        hEdJvm = CreateWindowExW(0, L"EDIT", U8ToW(g_cfg.extraJvm).c_str(),
-                    WS_CHILD | WS_BORDER, 0, 0, 10, 10, hwnd, (HMENU)ID_ED_JVM, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(hEdJvm, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-
-        hEdGame = CreateWindowExW(0, L"EDIT", U8ToW(g_cfg.extraGame).c_str(),
-                    WS_CHILD | WS_BORDER, 0, 0, 10, 10, hwnd, (HMENU)ID_ED_GAME, GetModuleHandleW(nullptr), nullptr);
-        SendMessageW(hEdGame, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-
-        hBtnSource = MakeBtn(hwnd, g_cfg.dlSource == 1 ? L"下载源：仅官方"
-                                  : g_cfg.dlSource == 2 ? L"下载源：仅 BMCLAPI" : L"下载源：自动", ID_BTN_SOURCE);
-        hBtnFull   = MakeBtn(hwnd, (std::wstring(L"游戏窗口模式：") + WinModeLabel(g_cfg.winMode)).c_str(), ID_BTN_FULL);
-        hBtnUpdate = MakeBtn(hwnd, L"检查更新", ID_BTN_UPDATE);
-        }
-
-        hEdDir  = MakeEdit(hwnd, ID_ED_DIR, U8ToW(g_cfg.gameDir).c_str());
-        hEdJava = MakeEdit(hwnd, ID_ED_JAVA, U8ToW(g_cfg.javaPath).c_str());
-        hEdMem  = MakeEdit(hwnd, ID_ED_MEM, std::to_wstring(g_cfg.maxMemMB).c_str(), ES_NUMBER);
-        hEdName = MakeEdit(hwnd, ID_ED_NAME, U8ToW(g_cfg.playerName).c_str());
-        hBtnAutoDir    = MakeBtn(hwnd, L"自动检测", ID_BTN_AUTODIR);
-        hBtnBrowseDir  = MakeBtn(hwnd, L"浏览", ID_BTN_BROWSEDIR);
-        hBtnDirDrop    = MakeBtn(hwnd, L"▾", ID_BTN_DIRDROP);
-        hBtnAutoJava   = MakeBtn(hwnd, L"自动检测", ID_BTN_AUTOJAVA);
-        hBtnBrowseJava = MakeBtn(hwnd, L"浏览", ID_BTN_BROWSEJAVA);
-        hBtnJavaDrop   = MakeBtn(hwnd, L"▾", ID_BTN_JAVADROP);
-        hBtnSave       = MakeBtn(hwnd, L"保存设置", ID_BTN_SAVE);
-        hBtnIso        = MakeBtn(hwnd, (std::wstring(L"版本隔离：") + IsoLabel() + L"  ▾").c_str(), ID_BTN_ISO);
-
-        SetTimer(hwnd, 1, 300, nullptr);
-        return 0;
-    }
-
-    case WM_SIZE:
-        ComputeLayout(LOWORD(lp), HIWORD(lp));
-        ShowPage(g_page);
-        return 0;
-
-    case WM_ERASEBKGND:
-        return 1;
-
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        {   // 只在 UI 状态变化时异步同步一次，避免消息风暴
-            static int s_sig = -1;
-            int sig = g_page * 100000 + g_dlSection * 1000 + (g_dlDetail ? 1 : 0) * 100
-                    + (g_modDetail ? 2 : 0) * 10 + (g_instTab ? 3 : 0) + (g_userMode * 7);
-            if (sig != s_sig) { s_sig = sig; PostMessageW(hwnd, WM_APP_SYNCUI, 0, 0); }
-        }
-        RECT rc; GetClientRect(hwnd, &rc);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-        HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
-        PaintMain(mem, rc.right, rc.bottom);
-        if (g_overlay) DrawOverlay(mem);
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-
-    case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = (HDC)wp;
-        SetTextColor(dc, C_TEXT);
-        SetBkColor(dc, C_INPUTBG);
-        return (LRESULT)g_brInput;
-    }
-
-    case WM_DRAWITEM: {
-        LPDRAWITEMSTRUCT d = (LPDRAWITEMSTRUCT)lp;
-        RECT r = d->rcItem;
-        bool sel = (d->itemState & ODS_SELECTED) != 0;
-
-        int id = (int)d->CtlID;
-        bool accent = (id == ID_BTN_LAUNCH || id == ID_BTN_LOGIN || id == ID_BTN_SAVE);
-        bool tab = (id == ID_TAB_LAUNCH || id == ID_TAB_USER || id == ID_TAB_SET || id == ID_TAB_ABOUT || id == ID_TAB_INST || id == ID_TAB_DL || id == ID_TAB_MODS);
-        bool activeTab = tab && ((id == ID_TAB_LAUNCH && g_page == PAGE_LAUNCH) ||
-                                 (id == ID_TAB_USER && g_page == PAGE_USER) ||
-                                 (id == ID_TAB_SET && g_page == PAGE_SETTINGS) ||
-                                 (id == ID_TAB_ABOUT && g_page == PAGE_ABOUT) ||
-                                 (id == ID_TAB_INST && g_page == PAGE_INSTANCES) ||
-                                 (id == ID_TAB_DL && g_page == PAGE_DOWNLOAD) ||
-                                 (id == ID_TAB_MODS && g_page == PAGE_MODS));
-
-        COLORREF bg;
-        if (accent) bg = (g_launching && id == ID_BTN_LAUNCH) ? C_CARD : (sel ? RGB(29, 78, 216) : C_ACCENT);
-        else if (activeTab) bg = C_CARD_SEL;
-        else bg = sel ? C_CARD_SEL : C_CARD;
-
-        FillRoundRect(d->hDC, r, 8, bg);
-
-        if (id == ID_BTN_DIRDROP || id == ID_BTN_JAVADROP || id == ID_BTN_INSTARROW) {
-            int cx = (r.left + r.right) / 2;
-            int cy = (r.top + r.bottom) / 2;
-            POINT tri[3];
-            if (id == ID_BTN_INSTARROW) {
-                tri[0] = { cx - Scale(8), cy + Scale(4) };
-                tri[1] = { cx + Scale(8), cy + Scale(4) };
-                tri[2] = { cx,            cy - Scale(6) };
-            } else {
-                tri[0] = { cx - Scale(6), cy - Scale(3) };
-                tri[1] = { cx + Scale(6), cy - Scale(3) };
-                tri[2] = { cx,            cy + Scale(4) };
-            }
-            HBRUSH tb = CreateSolidBrush(C_TEXT);
-            HPEN   tp = CreatePen(PS_SOLID, 1, C_TEXT);
-            HBRUSH ob = (HBRUSH)SelectObject(d->hDC, tb);
-            HPEN   op = (HPEN)SelectObject(d->hDC, tp);
-            Polygon(d->hDC, tri, 3);
-            SelectObject(d->hDC, ob);
-            SelectObject(d->hDC, op);
-            DeleteObject(tb);
-            DeleteObject(tp);
-            return TRUE;
-        }
-
-        wchar_t text[128] = {0};
-        GetWindowTextW(d->hwndItem, text, 127);
-        SetBkMode(d->hDC, TRANSPARENT);
-        SetTextColor(d->hDC, (accent || activeTab) ? RGB(255, 255, 255) : C_TEXT);
-        SelectObject(d->hDC, g_fUi);
-        DrawTextW(d->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        return TRUE;
-    }
-
-    case WM_LBUTTONDOWN: {
-        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        if (g_dropWnd) { DestroyWindow(g_dropWnd); }
-        SetFocus(hwnd);   // 焦点收回主窗口，滚轮消息才送到这里
-
-        if (g_page == PAGE_SETTINGS) {
-            RECT sb = g_ly.sidebar;
-            int itemH = Scale(46);
-            int top = sb.top + Scale(50);
-            if (pt.x >= sb.left && pt.x <= sb.right && pt.y >= top && pt.y < top + itemH * 2) {
-                int idx = (pt.y - top) / itemH;
-                if (idx >= 0 && idx < 2 && idx != g_settingsTab) {
-                    g_settingsTab = idx;
-                    SyncSettingsVisibility();
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
-                return 0;
-            }
-        }
-
-        if (g_page == PAGE_DOWNLOAD) {
-            if (g_dlSection == 1) {
-                if (g_modDetail) {
-                    int vTop = g_ly.content.top + Scale(84);
-                    if (pt.y >= vTop) {
-                        int ih2 = Scale(44);
-                        int idx2 = (pt.y - vTop + g_listScroll) / ih2;
-                        if (idx2 >= 0 && idx2 < (int)g_modVerNames.size()) {
-                            g_modVerSel = idx2;
-                            InvalidateRect(hwnd, nullptr, TRUE);
-                        }
-                    }
-                    return 0;
-                }
-                int mTop = g_ly.content.top + Scale(72);
-                if (pt.y >= mTop) {
-                    int ih = Scale(56);
-                    int idx = (pt.y - mTop + g_listScroll) / ih;
-                    if (idx >= 0 && idx < (int)g_modHits.size()) {
-                        g_modSel = idx;
-                        g_modDetail = true;
-                        g_modDetailSlug  = g_modHits[idx].slug;
-                        g_modDetailTitle = g_modHits[idx].title;
-                        g_modDetailDesc  = g_modHits[idx].desc;
-                        g_modVerState = 0;
-                        g_listScroll = 0;
-                        std::thread(FetchModVersThread, g_modDetailSlug).detach();
-                        SyncDownloadControls();
-                        InvalidateRect(hwnd, nullptr, TRUE);
-                    }
-                }
-                return 0;
-            }
-            if (g_dlDetail) {
-                if (g_dlLoader > 0 && !g_ldVers.empty()) {
-                    int itemH0 = Scale(44);
-                    int top0 = g_ly.content.top + Scale(136);
-                    if (pt.y >= top0) {
-                        int idx0 = (pt.y - top0 + g_listScroll) / itemH0;
-                        if (idx0 >= 0 && idx0 < (int)g_ldVers.size()) {
-                            g_ldSel = idx0;
-                            g_status = L"已选择加载器版本：" + U8ToW(g_ldVers[idx0]);
-                            InvalidateRect(hwnd, nullptr, TRUE);
-                        }
-                    }
-                }
-                return 0;
-            }
-            if (g_mcVersState.load() == 0) {
-                std::thread(FetchManifestThread).detach();
-            } else if (g_mcVersState.load() == 2) {
-                int itemH = Scale(52);
-                int top = g_ly.content.top + Scale(16) + Scale(46);
-                if (pt.y >= top) {
-                                    int idx = (pt.y - top + g_listScroll) / itemH;
-                    if (idx >= 0 && idx < (int)g_dlView.size()) {
-                        std::string id = g_mcVers[g_dlView[idx]].id;
-                        std::string url = g_mcVers[g_dlView[idx]].url;
-                        g_dlSel = idx;
-                        g_dlDetail = true;
-                        g_dlDetailMc = id;
-                        for (int k = 0; k < 4; ++k) { g_ldState[k] = 0; g_ldVer[k].clear(); }
-                        std::thread(FetchLoadersThread).detach();
-                        LayoutControls();
-                        SyncDownloadControls();
-                        SetFocus(hwnd);
-                        g_status = L"已选择：" + U8ToW(id) + L"  → 点下方的按钮安装";
-                        InvalidateRect(hwnd, nullptr, TRUE);
-                    }
-                }
-            }
-            return 0;
-        }
-
-
-        if (g_page == PAGE_INSTANCES && g_instTab == 1) {
-            int mTop = g_ly.content.top + Scale(72);
-            if (pt.y >= mTop) {
-                int ih = Scale(44);
-                int idx = (pt.y - mTop + g_listScroll) / ih;
-                if (idx >= 0 && idx < (int)g_modFiles.size()) {
-                    g_modFileSel = idx;
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
-            }
-            return 0;
-        }
-
-        if (g_page == PAGE_MODS) {
-            int top = g_ly.content.top + Scale(58);
-            if (pt.y >= top) {
-                if (g_modTab == 0) {
-                    int itemH = Scale(56);
-                    int idx = (pt.y - top + g_listScroll) / itemH;
-                    if (idx >= 0 && idx < (int)g_modHits.size()) {
-                        g_modSel = idx;
-                        InvalidateRect(hwnd, nullptr, TRUE);
-                    }
-                } else {
-                    int itemH = Scale(44);
-                    int idx = (pt.y - top + g_listScroll) / itemH;
-                    if (idx >= 0 && idx < (int)g_modFiles.size()) {
-                        g_modFileSel = idx;
-                        InvalidateRect(hwnd, nullptr, TRUE);
-                    }
-                }
-            }
-            return 0;
-        }
-
-        if (g_page == PAGE_INSTANCES) {
-            int itemH = Scale(48);
-            int top = g_ly.content.top + Scale(72) + Scale(34);
-            if (pt.y >= top) {
-                int idx = (pt.y - top + g_listScroll) / itemH;
-                if (idx >= 0 && idx < (int)g_versions.size()) {
-                    g_selVersion = idx;
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
-            }
-            return 0;
-        }
-
-        if (g_page == PAGE_USER) {
-            RECT sb = g_ly.sidebar;
-            int itemH = Scale(64);
-            int top = sb.top + Scale(38);
-            if (pt.x >= sb.left && pt.x <= sb.right && pt.y >= top) {
-                int idx = (pt.y - top) / itemH;
-                if (idx >= 0 && idx < (int)g_cfg.accounts.size() && idx != g_cfg.activeAcc) {
-                    CaptureActiveAccount();
-                    g_cfg.activeAcc = idx;
-                    ApplyActiveAccount();
-    std::thread(UpdateThread, false).detach();
-                    LoadSkinBitmap();
-                    SaveConfig();
-                    g_status = L"已切换到账户：" + U8ToW(g_cfg.accounts[idx].name);
-                    InvalidateRect(hwnd, nullptr, TRUE);
-                }
-                return 0;
-            }
-        }
-
-        if (g_page != PAGE_LAUNCH) return 0;
-
-        // 版本列表点击
-        if (PtInRect(&g_ly.sidebar, pt) && pt.y > g_ly.sidebar.top + Scale(86)) {
-            int itemH = Scale(46);
-            int idx = (pt.y - (g_ly.sidebar.top + Scale(86)) + g_listScroll) / itemH;
-            if (idx >= 0 && idx < (int)g_versions.size()) {
-                g_selVersion = idx;
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-        }
-        return 0;
-    }
-
-    case WM_MOUSEWHEEL: {
-        if (g_page == PAGE_INSTANCES || g_page == PAGE_DOWNLOAD) {
-            int delta0 = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
-            int top0 = 0, bot0 = 0, itemH0 = Scale(52), cnt = 0;
-
-            if (g_page == PAGE_INSTANCES) {
-                if (g_instTab == 1) {
-                    top0 = g_ly.content.top + Scale(72);
-                    bot0 = g_ly.content.bottom - Scale(24);
-                    itemH0 = Scale(44); cnt = (int)g_modFiles.size();
-                } else {
-                    top0 = g_ly.content.top + Scale(106);
-                    bot0 = g_ly.content.bottom - Scale(16);
-                    itemH0 = Scale(48); cnt = (int)g_versions.size();
-                }
-            } else if (g_dlDetail) {
-                top0 = g_ly.content.top + Scale(132);
-                bot0 = g_ly.content.bottom - Scale(72);
-                itemH0 = Scale(44); cnt = (int)g_ldVers.size();
-            } else if (g_dlSection == 1) {
-                top0 = g_ly.content.top + Scale(72);
-                bot0 = g_ly.content.bottom - Scale(24);
-                itemH0 = Scale(56); cnt = (int)g_modHits.size();
-            } else {
-                top0 = g_ly.content.top + Scale(58);
-                bot0 = g_ly.content.bottom - Scale(16);
-                itemH0 = Scale(52); cnt = (int)g_dlView.size();
-            }
-
-            int listH0 = bot0 - top0;
-            int maxS = std::max(0, cnt * itemH0 - listH0);
-            g_listScroll -= delta0 * itemH0;
-            g_listScroll = std::max(0, std::min(maxS, g_listScroll));
-            InvalidateRect(hwnd, nullptr, FALSE);
-            return 0;
-        }
-        if (g_page != PAGE_LAUNCH) return 0;
-        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
-        ScreenToClient(hwnd, &pt);
-        if (!PtInRect(&g_ly.sidebar, pt)) return 0;
-
-        int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
-        int itemH = Scale(46);
-        int listH = (int)(g_ly.sidebar.bottom - g_ly.sidebar.top) - Scale(96);
-        int maxScroll = std::max(0, (int)g_versions.size() * itemH - listH);
-        g_listScroll -= delta * itemH;
-        g_listScroll = std::max(0, std::min(maxScroll, g_listScroll));
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-    }
-
-    case WM_COMMAND: {
-        int id = LOWORD(wp);
-        switch (id) {
-        case ID_TAB_LAUNCH: ShowPage(PAGE_LAUNCH); break;
-        case ID_TAB_USER:   ShowPage(PAGE_USER);   break;
-        case ID_TAB_SET:    ShowPage(PAGE_SETTINGS); break;
-        case ID_TAB_ABOUT:  ShowPage(PAGE_ABOUT);    break;
-        case ID_TAB_INST:   ShowPage(PAGE_INSTANCES); break;
-        case ID_TAB_DL:     ShowPage(PAGE_DOWNLOAD); break;
-        case ID_TAB_MODS:   ShowPage(PAGE_MODS); break;
-
-        case ID_BTN_REFRESH:
-            ScanVersions();
-            g_status = L"已刷新，共 " + std::to_wstring(g_versions.size()) + L" 个版本";
-            InvalidateRect(hwnd, nullptr, FALSE);
-            break;
-
-        case ID_BTN_FILL:
-            if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size()) {
-                g_status = L"请先选择版本";
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (g_downloading) { g_status = L"正在补全中…"; InvalidateRect(hwnd, nullptr, FALSE); return 0; }
-            {
-                std::string ver = g_versions[g_selVersion];
-                g_downloading = true;
-                g_status = L"正在补全文件…";
-                InvalidateRect(hwnd, nullptr, FALSE);
-                std::thread([ver]() {
-                    DownloadStats st;
-                    DownloadMissing(ver, st);
-                    g_downloading = false;
-                    {
-                        std::lock_guard<std::mutex> lk(g_logMutex);
-                        g_status = L"补全完成：已有 " + std::to_wstring(st.existed) +
-                                   L"，新下载 " + std::to_wstring(st.downloaded) +
-                                   L"，失败 " + std::to_wstring(st.failed);
-                    }
-                    RebuildDlView();
-    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_DONE, 0, 0);
-                }).detach();
-            }
-            break;
-
-        case ID_DL_BACK: {
-            if (g_modDetail) { g_modDetail = false; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break; }
-            g_dlDetail = false;
-            InvalidateRect(hwnd, nullptr, TRUE);
-            break;
-        }
-
-        case ID_DL_CANCEL:
-        g_dlCancel = true;
-        g_dlBusy = false;
-        g_progState = 0;
-        g_status = L"下载已取消";
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-
-    case ID_DL_FILTERSEL:
-        ShowDropPopup(7);
-        break;
-
-    case ID_DL_FILTER0: case ID_DL_FILTER1: case ID_DL_FILTER2: case ID_DL_FILTER3: {
-            g_dlFilter = (int)(wp & 0xFFFF) - ID_DL_FILTER0;
-            g_dlSel = -1;
-            RebuildDlView();
-            InvalidateRect(hwnd, nullptr, TRUE);
-            break;
-        }
-
-        case ID_DL_VANILLA: case ID_DL_FABRIC: case ID_DL_QUILT:
-        case ID_DL_FORGE:   case ID_DL_NEO:
-        case ID_DL_FAPI:    case ID_DL_QSL: {
-            int id = (int)(wp & 0xFFFF);
-            int kind = (id == ID_DL_VANILLA) ? 0 : (id == ID_DL_FABRIC) ? 1
-                     : (id == ID_DL_QUILT) ? 2 : (id == ID_DL_FORGE) ? 3
-                     : (id == ID_DL_NEO) ? 4 : (id == ID_DL_FAPI) ? 5 : 6;
-            if (kind >= 5) { g_ldFiles.clear(); }
-            g_dlLoader = kind;
-            g_ldSel = -1;
-            g_ldVers.clear();
-            g_ldVersState = 0;
-            g_listScroll = 0;
-                        if (kind > 0) {
-                int gen = ++g_ldGen;
-                std::thread(FetchLoaderVersThread, kind, gen).detach();
-            } else {
-                ++g_ldGen;
-            }
-            InvalidateRect(hwnd, nullptr, TRUE);
-            break;
-        }
-
-        case ID_DL_INSTALL: {
-            if (g_dlSel < 0 || g_dlSel >= (int)g_dlView.size()) {
-                MessageBoxW(hwnd, L"请先返回列表选择一个游戏版本。", L"下载", MB_OK | MB_ICONINFORMATION);
-                break;
-            }
-            int realIdx = g_dlView[g_dlSel];
-            std::string mc  = g_mcVers[realIdx].id;
-            std::string url = g_mcVers[realIdx].url;
-
-            g_dlCancel = false;
-            g_dlBytes = 0;
-            g_dlBusy = true;
-            {
-                const wchar_t* kn = (g_dlLoader == 1) ? L"Fabric"
-                                 : (g_dlLoader == 2) ? L"Quilt"
-                                 : (g_dlLoader == 3) ? L"Forge"
-                                 : (g_dlLoader == 4) ? L"NeoForge"
-                                 : (g_dlLoader == 5) ? L"Fabric API"
-                                 : (g_dlLoader == 6) ? L"QSL" : L"原版";
-                g_dlTarget = U8ToW(mc) + L" " + kn;
-            }
-            g_progState = 1;
-            g_progCur = 0;
-            g_progTotal = 0;
-            SyncDownloadControls();
-
-            if (g_dlLoader == 0) {
-                g_status = L"开始安装：" + U8ToW(mc);
-            g_dlCancel = false;
-            g_dlBytes = 0;
-                std::thread(InstallVersionThread, mc, url).detach();
-            } else if (g_dlLoader >= 5) {
-                if (g_ldSel < 0 || g_ldSel >= (int)g_ldFiles.size()) {
-                    MessageBoxW(hwnd, L"请先在列表里选择一个模组版本。", L"提示", MB_OK | MB_ICONINFORMATION);
-                    break;
-                }
-                {
-                    std::string info = g_ldFiles[g_ldSel];
-                    size_t nl = info.find((char)10);
-                    std::string surl = (nl == std::string::npos) ? info : info.substr(0, nl);
-                    std::string sfn  = (nl == std::string::npos) ? std::string("mod.jar") : info.substr(nl + 1);
-                    if (surl.empty()) {
-                        MessageBoxW(hwnd, L"该版本没有可下载的文件。", L"提示", MB_OK | MB_ICONINFORMATION);
-                        break;
-                    }
-                    fs::path mcDir2 = fs::u8path(g_cfg.gameDir);
-                    fs::path modDir = ShouldIsolate(mc, mcDir2)
-                                      ? (mcDir2 / L"versions" / fs::u8path(mc) / L"mods")
-                                      : (mcDir2 / L"mods");
-                    std::error_code ecm;
-                    fs::create_directories(modDir, ecm);
-                    fs::path dst = modDir / fs::u8path(sfn);
-                    std::string derr;
-                    if (DownloadFile(surl, dst, derr))
-                        g_status = L"已下载到 mods：" + U8ToW(sfn);
-                    else
-                        g_status = L"下载失败：" + U8ToW(derr);
-                }
-                InvalidateRect(hwnd, nullptr, TRUE);
-                break;
-            } else {
-                if (g_ldSel < 0 || g_ldSel >= (int)g_ldVers.size()) {
-                    MessageBoxW(hwnd, L"请先在列表里选择一个加载器版本。", L"提示", MB_OK | MB_ICONINFORMATION);
-                    break;
-                }
-                std::string lv = g_ldVers[g_ldSel];
-                g_dlCancel = false;
-                g_dlBytes = 0;
-                if (g_dlLoader == 1)      std::thread(InstallMetaLoaderThread, mc, false, lv).detach();
-                else if (g_dlLoader == 2) std::thread(InstallMetaLoaderThread, mc, true, lv).detach();
-                else if (g_dlLoader == 3) std::thread(InstallInstallerThread, mc, false, lv).detach();
-                else                      std::thread(InstallInstallerThread, mc, true, lv).detach();
-            }
-            InvalidateRect(hwnd, nullptr, TRUE);
-            break;
-        }
-
-    case ID_BTN_UPDATE:
-        g_status = L"正在检查更新…";
-        std::thread(UpdateThread, true).detach();
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-
-    case ID_BTN_SOURCE: {
-        g_cfg.dlSource = (g_cfg.dlSource + 1) % 3;
-        SetWindowTextW(hBtnSource,
-            g_cfg.dlSource == 1 ? L"下载源：仅官方"
-          : g_cfg.dlSource == 2 ? L"下载源：仅 BMCLAPI" : L"下载源：自动");
-        SaveConfig();
-        g_status = L"下载源已切换";
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    }
-
-    case ID_BTN_FULL: {
-        g_cfg.winMode = (g_cfg.winMode + 1) % 3;
-        SetWindowTextW(hBtnFull, (std::wstring(L"游戏窗口模式：") + WinModeLabel(g_cfg.winMode)).c_str());
-        SaveConfig();
-        g_status = (g_cfg.winMode == 0) ? L"窗口模式：854×480（不可调分辨率）"
-                 : (g_cfg.winMode == 1) ? L"最大化：按桌面工作区大小开窗"
-                                        : L"全屏模式";
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    }
-
-    case ID_BTN_OVCANCEL:
-        g_cancelLaunch = true;
-        // 立刻终止已经起来的游戏进程
-        {
-            DWORD pid = g_gamePid.load();
-            HANDLE hp = g_gameProc;
-            if (hp) {
-                TerminateProcess(hp, 0);
-                Log("[取消] 已强制结束游戏进程（句柄）");
-            } else if (pid != 0) {
-                HANDLE h2 = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
-                if (h2) {
-                    TerminateProcess(h2, 0);
-                    CloseHandle(h2);
-                    Log("[取消] 已强制结束游戏进程（PID " + std::to_string(pid) + "）");
-                }
-            }
-        }
-        g_overlay = false;
-        ApplyOverlayVisibility();
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-
-    case ID_BTN_LAUNCH:
-            if (g_launching) return 0;
-            if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size()) {
-                g_status = L"请先选择版本";
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            {
-                std::string ver = g_versions[g_selVersion];
-                g_overlay = true;
-                g_overlayDoneTick = 0;
-                g_stepCur = 0;
-                g_cancelLaunch = false;
-                g_launching = true;
-                SetWindowTextW(hBtnOverlayCancel, L"取消");
-                ApplyOverlayVisibility();
-                std::thread(LaunchThread, ver).detach();
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-            break;
-
-        case ID_BTN_DELACC: {
-        if (g_cfg.activeAcc < 0 || g_cfg.activeAcc >= (int)g_cfg.accounts.size()) {
-            g_status = L"没有可删除的账户";
-            InvalidateRect(hwnd, nullptr, TRUE);
-            break;
-        }
-        g_cfg.accounts.erase(g_cfg.accounts.begin() + g_cfg.activeAcc);
-        if (g_cfg.accounts.empty()) {
-            g_cfg.activeAcc = -1;
-            g_cfg.authType = "offline";
-            g_cfg.authToken.clear();
-            g_cfg.authUuid.clear();
-            g_cfg.skinPath.clear();
-            LoadSkinBitmap();
-        } else {
-            if (g_cfg.activeAcc >= (int)g_cfg.accounts.size()) g_cfg.activeAcc = (int)g_cfg.accounts.size() - 1;
-            ApplyActiveAccount();
-    std::thread(UpdateThread, false).detach();
-            LoadSkinBitmap();
-        }
-        SaveConfig();
-        g_status = L"账户已删除";
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    }
-
-    case ID_BTN_SKIN: {
-        OPENFILENAMEW ofn{};
-        wchar_t file[MAX_PATH] = L"";
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = hwnd;
-        ofn.lpstrFilter = L"皮肤 PNG (*.png)\0*.png\0所有文件\0*.*\0";
-        ofn.lpstrFile = file;
-        ofn.nMaxFile = MAX_PATH;
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-        if (!GetOpenFileNameW(&ofn)) break;
-
-        std::wstring err;
-        if (ApplySkin(WToU8(file), err)) {
-            g_status = L"皮肤已应用：" + fs::u8path(g_cfg.skinPath).filename().wstring();
-        } else {
-            g_status = L"更换皮肤失败：" + err;
-            MessageBoxW(hwnd, err.c_str(), L"更换皮肤", MB_OK | MB_ICONWARNING);
-        }
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    }
-
-    case ID_DL_SEC_GAME:
-        g_dlSection = 0; g_dlDetail = false; g_modDetail = false; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
-    case ID_DL_SEC_MOD:
-        g_dlSection = 1; g_modSel = -1; g_listScroll = 0; g_modDetail = false;
-        if (g_modState.load() == 0) std::thread(FetchModSearchThread, std::string()).detach();
-        SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
-    case ID_INST_TAB_LIST:
-        g_instTab = 0; g_listScroll = 0; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
-    case ID_INST_TAB_MOD:
-        g_instTab = 1; g_modFileSel = -1; g_listScroll = 0; RefreshInstalledMods();
-        SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
-
-    case ID_MOD_TABDL:
-        g_modTab = 0; g_modFileSel = -1; SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
-    case ID_MOD_TABIN:
-        g_modTab = 1; RefreshInstalledMods(); SyncDownloadControls(); InvalidateRect(hwnd, nullptr, TRUE); break;
-    case ID_MOD_SOURCE:
-        g_modSource = (g_modSource + 1) % 2;
-        SetWindowTextW(hBtnModSource, g_modSource == 0 ? L"源：Modrinth" : L"源：CurseForge");
-        g_modState = 0;
-        g_modSel = -1;
-        g_listScroll = 0;
-        {
-            std::string q = WToU8(CtlText(hEdModSearch));
-            std::thread(FetchModSearchThread, q).detach();
-        }
-        if (g_modSource == 1)
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    case ID_MOD_INSTALL: {
-        if (g_modDetail) {
-            if (g_modVerSel < 0 || g_modVerSel >= (int)g_modVerFiles.size()) {
-                MessageBoxW(hwnd, L"请先选择一个模组版本。", L"提示", MB_OK | MB_ICONINFORMATION);
-                break;
-            }
-            std::string info2 = g_modVerFiles[g_modVerSel];
-            size_t nl2 = info2.find((char)10);
-            std::string u2 = (nl2 == std::string::npos) ? info2 : info2.substr(0, nl2);
-            std::string f2 = (nl2 == std::string::npos) ? std::string("mod.jar") : info2.substr(nl2 + 1);
-            std::thread(InstallModVersionThread, u2, f2).detach();
-            break;
-        }
-        if (g_modTab != 0 || g_modSel < 0 || g_modSel >= (int)g_modHits.size()) {
-            MessageBoxW(hwnd, L"请先在列表里选择一个模组。", L"提示", MB_OK | MB_ICONINFORMATION);
-            break;
-        }
-        std::string slug = g_modHits[g_modSel].slug;
-        g_status = L"正在安装模组：" + U8ToW(slug);
-        std::thread(InstallModThread, slug).detach();
-        break;
-    }
-    case ID_MOD_TOGGLE: {
-        if (g_modTab != 1 || g_modFileSel < 0 || g_modFileSel >= (int)g_modFiles.size()) {
-            MessageBoxW(hwnd, L"请先选择一个模组文件。", L"提示", MB_OK | MB_ICONINFORMATION);
-            break;
-        }
-        fs::path dir = InstanceModsDir();
-        std::string n = g_modFiles[g_modFileSel];
-        std::error_code ec;
-        bool disabled = (n.size() > 13 && n.substr(n.size() - 13) == ".jar.disabled");
-        std::string target = disabled ? n.substr(0, n.size() - 9) : (n + ".disabled");
-        fs::rename(dir / fs::u8path(n), dir / fs::u8path(target), ec);
-        if (!ec) g_status = disabled ? L"已启用该模组" : L"已禁用该模组";
-        RefreshInstalledMods();
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    }
-    case ID_MOD_DELETE: {
-        if (g_modTab != 1 || g_modFileSel < 0 || g_modFileSel >= (int)g_modFiles.size()) {
-            MessageBoxW(hwnd, L"请先选择一个模组文件。", L"提示", MB_OK | MB_ICONINFORMATION);
-            break;
-        }
-        std::string n = g_modFiles[g_modFileSel];
-        if (MessageBoxW(hwnd, (L"确定删除 " + U8ToW(n) + L" ？").c_str(), L"删除模组",
-                        MB_YESNO | MB_ICONWARNING) != IDYES) break;
-        std::error_code ec;
-        fs::remove(InstanceModsDir() / fs::u8path(n), ec);
-        g_status = ec ? L"删除失败" : L"已删除该模组";
-        g_modFileSel = -1;
-        RefreshInstalledMods();
-        InvalidateRect(hwnd, nullptr, TRUE);
-        break;
-    }
-
-    case ID_USER_M0: g_userMode = 0; SyncUserMode(); InvalidateRect(hwnd, nullptr, TRUE); break;
-    case ID_USER_M1: g_userMode = 1; SyncUserMode(); InvalidateRect(hwnd, nullptr, TRUE); break;
-    case ID_USER_M2: g_userMode = 2; SyncUserMode(); InvalidateRect(hwnd, nullptr, TRUE); break;
-
-    case ID_BTN_LOGIN: {
-            if (g_loginState == 1) return 0;
-            std::string srv  = WToU8(CtlText(hEdServer));
-            std::string user = WToU8(CtlText(hEdUser));
-            std::string pass = WToU8(CtlText(hEdPass));
-            if (srv.empty() || user.empty()) {
-                g_status = L"请填写认证服务器和用户名";
-                g_loginState = 3;
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            g_loginState = 1;
-            g_status = L"正在登录…";
-            InvalidateRect(hwnd, nullptr, FALSE);
-            std::thread(LoginThread, srv, user, pass).detach();
-            break;
-        }
-
-        case ID_BTN_OFFLINE: {
-            std::string nm = WToU8(CtlText(hEdName));
-            if (nm.empty()) nm = "玩家" + std::to_string(g_cfg.accounts.size() + 1);
-            CaptureActiveAccount();
-            int idx = UpsertAccount("offline", nm);
-            g_cfg.activeAcc = idx;
-            ApplyActiveAccount();
-    std::thread(UpdateThread, false).detach();
-            SaveConfig();
-            g_loginState = 0;
-            g_status = L"已切换到离线账户：" + U8ToW(nm);
-            InvalidateRect(hwnd, nullptr, TRUE);
-            break;
-        }
-
-        case ID_BTN_LOGOUT:
-            g_cfg.authType = "offline";
-            g_cfg.authToken.clear();
-            g_cfg.authName.clear();
-            g_cfg.authUuid.clear();
-            SaveConfig();
-            g_loginState = 0;
-            g_status = L"已退出第三方账号，回到离线模式";
-            InvalidateRect(hwnd, nullptr, FALSE);
-            break;
-
-        case ID_BTN_INSTARROW:
-        if (g_versions.empty()) ScanVersions();
-        ShowDropPopup(2);
-        break;
-
-    case ID_BTN_DIRDROP:
-            if (g_dirCands.empty()) RefreshDirCands();
-            ShowDropPopup(0);
-            break;
-
-        case ID_BTN_JAVADROP:
-            if (g_javaCands.empty()) RefreshJavaCands();
-            ShowDropPopup(1);
-            break;
-
-        case ID_BTN_AUTODIR: {
-            std::string d = DetectGameDir();
-            if (d.empty()) { g_status = L"没找到 .minecraft，请手动浏览指定"; }
-            else { g_cfg.gameDir = d; SetWindowTextW(hEdDir, U8ToW(d).c_str()); SaveConfig(); ScanVersions(); g_status = L"已自动检测游戏目录"; }
-            InvalidateRect(hwnd, nullptr, FALSE);
-            break;
-        }
-        case ID_BTN_BROWSEDIR: {
-            std::string d;
-            if (PickFolder(hwnd, d)) {
-                g_cfg.gameDir = d;
-                SetWindowTextW(hEdDir, U8ToW(d).c_str());
-                SaveConfig(); ScanVersions();
-                g_status = L"游戏目录已设置";
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-            break;
-        }
-        case ID_BTN_AUTOJAVA: {
-            std::string j = DetectJava();
-            if (j.empty()) { g_status = L"没找到 Java，请手动浏览指定"; }
-            else { g_cfg.javaPath = j; SetWindowTextW(hEdJava, U8ToW(j).c_str()); SaveConfig(); g_status = L"已自动检测 Java"; }
-            InvalidateRect(hwnd, nullptr, FALSE);
-            break;
-        }
-        case ID_BTN_BROWSEJAVA: {
-            std::string j;
-            if (PickJava(hwnd, j)) {
-                g_cfg.javaPath = j;
-                SetWindowTextW(hEdJava, U8ToW(j).c_str());
-                SaveConfig();
-                g_status = L"Java 路径已设置";
-                InvalidateRect(hwnd, nullptr, FALSE);
-            }
-            break;
-        }
-        case ID_BTN_ISO:
-        ShowDropPopup(3);
-        break;
-
-        case ID_MOD_SEARCH:
-            if (HIWORD(wp) == EN_CHANGE) {
-                std::string q = WToU8(CtlText(hEdModSearch));
-                if (!q.empty()) std::thread(FetchModSearchThread, q).detach();
-            }
-            break;
-
-        case ID_ED_SEARCH:
-            if (HIWORD(wp) == EN_CHANGE) {
-                RebuildDlView();
-                InvalidateRect(hwnd, nullptr, TRUE);
-            }
-            break;
-
-    case ID_BTN_SAVE: {
-            g_cfg.gameDir = WToU8(CtlText(hEdDir));
-            g_cfg.javaPath = WToU8(CtlText(hEdJava));
-            g_cfg.playerName = WToU8(CtlText(hEdName));
-            int mem = _wtoi(CtlText(hEdMem).c_str());
-            if (mem < 512) mem = 512;
-            if (mem > 16384) mem = 16384;
-            g_cfg.maxMemMB = mem;
-    {
-        std::string ts = WToU8(CtlText(hEdThreads));
-        int n = ts.empty() ? 16 : atoi(ts.c_str());
-        if (n < 1) n = 1;
-        if (n > 128) n = 128;
-        g_cfg.dlThreads = n;
-        SetWindowTextW(hEdThreads, std::to_wstring(n).c_str());
-    }
-    g_cfg.extraJvm  = WToU8(CtlText(hEdJvm));
-    g_cfg.extraGame = WToU8(CtlText(hEdGame));
-            {
-        std::string emb = ExtractEmbeddedAuthlib();
-        if (!emb.empty()) {
-            g_cfg.authlibPath = emb;
-            Log("[内置] authlib-injector 已释放: " + emb);
-        } else if (g_cfg.authlibPath.empty()) {
-            g_cfg.authlibPath = DetectAuthlib();
-        }
-    }
-            SaveConfig();
-            ScanVersions();
-            g_status = L"设置已保存";
-            InvalidateRect(hwnd, nullptr, FALSE);
-            break;
-        }
-        }
-        return 0;
-    }
-
-    case WM_DROP_PICK: {
-        int idx = (int)wp;
-        int mode = (int)lp;
-        if (mode == 7) {
-            if (idx >= 0 && idx < 5) {
-                g_dlFilter = idx;
-                const wchar_t* names[] = { L"正式版", L"快照版", L"远古版", L"愚人节", L"所有版本" };
-                SetWindowTextW(hBtnDlFilterSel, (std::wstring(names[idx]) + L"  ▾").c_str());
-                g_dlSel = -1;
-                RebuildDlView();
-            }
-            InvalidateRect(hwnd, nullptr, TRUE);
-            return 0;
-        }
-
-        if (mode == 3) {
-            if (idx >= 0 && idx < 3) {
-                g_cfg.isoMode = idx;
-                SetWindowTextW(hBtnIso, (std::wstring(L"版本隔离：") + IsoLabel() + L"  ▾").c_str());
-                SaveConfig();
-                const wchar_t* tips[] = {
-                    L"已设为：隔离所有实例",
-                    L"已设为：隔离模组实例（带 mods 或 Forge/Fabric 的实例才隔离）",
-                    L"已设为：不隔离实例（模组读 .minecraft\\mods）"
-                };
-                g_status = tips[idx];
-            }
-            InvalidateRect(hwnd, nullptr, TRUE);
-            return 0;
-        }
-
-        if (mode == 2) {
-            if (idx >= 0 && idx < (int)g_versions.size()) {
-                g_selVersion = idx;
-                g_status = L"已切换到实例：" + U8ToW(g_versions[idx]);
-            }
-            InvalidateRect(hwnd, nullptr, TRUE);
-            return 0;
-        }
-        bool isDir = (mode == 0);
-        if (isDir && idx >= 0 && idx < (int)g_dirCands.size()) {
-            g_cfg.gameDir = g_dirCands[idx].path;
-            SetWindowTextW(hEdDir, U8ToW(g_cfg.gameDir).c_str());
-            SaveConfig();
-            ScanVersions();
-            g_status = L"已选择游戏目录";
-        } else if (!isDir && idx >= 0 && idx < (int)g_javaCands.size()) {
-            g_cfg.javaPath = g_javaCands[idx].path;
-            SetWindowTextW(hEdJava, U8ToW(g_cfg.javaPath).c_str());
-            SaveConfig();
-            g_status = L"已选择 Java：" + U8ToW(g_javaCands[idx].label);
-        }
-        InvalidateRect(hwnd, nullptr, TRUE);
-        return 0;
-    }
-
-    case WM_APP_LOGIN:
-        g_loginState = (g_loginState == 2) ? 2 : 3;
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-
-    case WM_APP_UPD: {
-        bool interactive = (wp != 0);
-        int st = g_updateState.load();
-        if (st == 2) {
-            std::wstring msg = std::wstring(L"发现新版本 ") + g_newTag + L"\n当前版本 " APP_TAG L"\n\n是否现在更新？";
-            if (MessageBoxW(hwnd, msg.c_str(), L"检查更新", MB_YESNO | MB_ICONQUESTION) == IDYES) {
-                StartUpdate();
-            }
-        } else if (st == 3 && interactive) {
-            MessageBoxW(hwnd, (std::wstring(L"已是最新版本（") + APP_TAG + L"）").c_str(), L"检查更新", MB_OK | MB_ICONINFORMATION);
-        } else if (st == 4 && interactive) {
-            MessageBoxW(hwnd, L"检查更新失败，请检查网络后重试。", L"检查更新", MB_OK | MB_ICONWARNING);
-        }
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-    }
-
-    case WM_APP_NEEDJAVA: {
-        int need = (int)wp;
-        if (g_dlBusy.load()) {
-            DWORD now = GetTickCount();
-            long long cb = g_dlBytes.load();
-            if (g_dlLastTick && now > g_dlLastTick) {
-                double dt = (now - g_dlLastTick) / 1000.0;
-                if (dt > 0.2) {
-                    g_dlSpeed = (cb - g_dlLastBytes) / dt;
-                    g_dlLastBytes = cb;
-                    g_dlLastTick = now;
-                }
-            } else {
-                g_dlLastTick = now;
-                g_dlLastBytes = cb;
-            }
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-
-        if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
-        std::wstring msg = L"当前版本需要 Java " + std::to_wstring(need) +
-                           L"，但本机没有检测到合适的 Java。\n\n是否打开 Adoptium 下载页面？";
-        if (MessageBoxW(hwnd, msg.c_str(), L"缺少 Java", MB_YESNO | MB_ICONWARNING) == IDYES) {
-            std::wstring url = L"https://adoptium.net/temurin/releases/?version=" + std::to_wstring(need);
-            ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-        }
-        InvalidateRect(hwnd, nullptr, TRUE);
-        return 0;
-    }
-
-    case WM_APP_ERROR:
-        if (g_dlBusy.load()) {
-            DWORD now = GetTickCount();
-            long long cb = g_dlBytes.load();
-            if (g_dlLastTick && now > g_dlLastTick) {
-                double dt = (now - g_dlLastTick) / 1000.0;
-                if (dt > 0.2) {
-                    g_dlSpeed = (cb - g_dlLastBytes) / dt;
-                    g_dlLastBytes = cb;
-                    g_dlLastTick = now;
-                }
-            } else {
-                g_dlLastTick = now;
-                g_dlLastBytes = cb;
-            }
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-
-        if (g_overlay) { g_overlay = false; ApplyOverlayVisibility(); }
-        ShowErrorWindow();
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-
-    case WM_APP_SYNCUI:
-        SyncDownloadControls();
-        return 0;
-
-    case WM_APP_DONE:
-        SyncDownloadControls();
-        if (g_cfFallback.exchange(false)) {
-            SetWindowTextW(hBtnModSource, L"源：Modrinth");
-            MessageBoxW(hwnd, L"CurseForge 镜像暂不可用，已切回 Modrinth。", L"提示", MB_OK | MB_ICONINFORMATION);
-        }
-        if (g_overlay && g_stepCur.load() >= 4 && g_overlayDoneTick == 0)
-            g_overlayDoneTick = GetTickCount();
-        InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-
-    case WM_TIMER:
-        {
-            static bool s_lastBusy = false;
-            bool nb = g_dlBusy.load();
-            if (nb != s_lastBusy) { s_lastBusy = nb; SyncDownloadControls(); }
-        }
-        if (g_dlBusy.load()) {
-            DWORD now = GetTickCount();
-            long long cb = g_dlBytes.load();
-            if (g_dlLastTick && now > g_dlLastTick) {
-                double dt = (now - g_dlLastTick) / 1000.0;
-                if (dt > 0.2) {
-                    g_dlSpeed = (cb - g_dlLastBytes) / dt;
-                    g_dlLastBytes = cb;
-                    g_dlLastTick = now;
-                }
-            } else {
-                g_dlLastTick = now;
-                g_dlLastBytes = cb;
-            }
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-
-        if (g_overlay) {
-            if (g_stepCur.load() >= 4) {
-                SetWindowTextW(hBtnOverlayCancel, L"关闭");
-                // 窗口已出现：1.5 秒后自动收起，让主界面可用
-                if (g_overlayDoneTick && GetTickCount() - g_overlayDoneTick > 1500) {
-                    g_overlay = false;
-                    g_overlayDoneTick = 0;
-                    ApplyOverlayVisibility();
-                }
-            }
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        else if (g_launching || g_downloading || g_progState != 0) InvalidateRect(hwnd, nullptr, FALSE);
-        return 0;
-
-    case WM_DESTROY:
-        KillTimer(hwnd, 1);
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-// ============================ 入口 ============================
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR lpCmdLine, int) {
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    typedef BOOL(WINAPI* SetCtx)(void*);
-    auto pSetCtx = (SetCtx)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
-    if (pSetCtx) pSetCtx((void*)(intptr_t)-4);
-
-    HDC screen = GetDC(nullptr);
-    g_dpi = GetDeviceCaps(screen, LOGPIXELSX);
-    ReleaseDC(nullptr, screen);
-    if (g_dpi <= 0) g_dpi = 96;
-
-    g_fTitle = CreateFontW(-Scale(22), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
-    g_fUi    = CreateFontW(-Scale(15), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
-    g_fSmall = CreateFontW(-Scale(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
-
-    g_brInput = CreateSolidBrush(C_INPUTBG);
-
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    wchar_t appdata[MAX_PATH];
-    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
+// ---------------- 模组启用 / 禁用 ----------------
+void ToggleMod(const std::string& fileName, std::string& err) {
+    fs::path dir = InstanceModsDir();
     std::error_code ec;
-    // 便携模式：exe 同目录有 config.json 就用它
-    fs::path portable = ExeDir() / L"config.json";
-    if (FileExists(portable)) {
-        g_cfgPath = WToU8(portable.wstring());
-    } else {
-        fs::path cfgDir = fs::path(appdata) / L"ReignLaunch";
-        fs::create_directories(cfgDir, ec);
-        g_cfgPath = WToU8((cfgDir / L"config.json").wstring());
 
-        // 从旧的 MCLite 目录迁移一次配置
-        if (!FileExists(fs::u8path(g_cfgPath))) {
-            fs::path oldCfg = fs::path(appdata) / L"MCLite" / L"config.json";
-            if (FileExists(oldCfg)) {
-                std::error_code e2;
-                fs::copy_file(oldCfg, fs::u8path(g_cfgPath), fs::copy_options::overwrite_existing, e2);
+    const bool disabled = (fileName.size() > 13 &&
+                           fileName.substr(fileName.size() - 13) == ".jar.disabled");
+    const std::string target = disabled
+        ? fileName.substr(0, fileName.size() - 9)      // 去掉 ".disabled"
+        : (fileName + ".disabled");
+
+    fs::rename(dir / fs::u8path(fileName), dir / fs::u8path(target), ec);
+    if (ec) { err = "重命名失败：" + ec.message(); return; }
+
+    RefreshInstalledMods();
+    err.clear();
+}
+
+// ---------------- 删除模组 ----------------
+bool DeleteMod(const std::string& fileName, std::string& err) {
+    fs::path dir = InstanceModsDir();
+    std::error_code ec;
+    fs::remove(dir / fs::u8path(fileName), ec);
+    if (ec) { err = "删除失败：" + ec.message(); return false; }
+    RefreshInstalledMods();
+    err.clear();
+    return true;
+}
+
+// ---------------- 离线账户：新建或切换 ----------------
+void CreateOfflineAccount(const std::string& name) {
+    if (name.empty()) return;
+    CaptureActiveAccount();
+
+    int idx = UpsertAccount("offline", name, "", "", OfflineUUID(name));
+    g_cfg.activeAcc = idx;
+    g_cfg.authType  = "offline";
+    g_cfg.playerName = name;
+    g_cfg.authName  = name;
+    g_cfg.authUuid  = OfflineUUID(name);
+    g_cfg.authToken.clear();
+    SaveConfig();
+    Log("[账户] 已创建离线账户：" + name);
+}
+
+// ---------------- 第三方登录 ----------------
+bool ThirdPartyLogin(const std::string& server, const std::string& user,
+                     const std::string& pass, std::string& err) {
+    AuthResult r = YggdrasilLogin(server, user, pass);
+    if (!r.ok) { err = r.err.empty() ? "登录失败" : r.err; return false; }
+
+    CaptureActiveAccount();
+    int idx = UpsertAccount("thirdparty", r.name, TrimSlash(server), r.accessToken, r.uuid);
+    g_cfg.activeAcc = idx;
+    g_cfg.authType  = "thirdparty";
+    g_cfg.authServer = TrimSlash(server);
+    g_cfg.authToken = r.accessToken;
+    g_cfg.authClientToken = r.clientToken;
+    g_cfg.authUuid  = r.uuid;
+    g_cfg.authName  = r.name;
+    SaveConfig();
+    err.clear();
+    Log("[账户] 第三方登录成功：" + r.name);
+    return true;
+}
+
+// ---------------- 切换激活账户 ----------------
+void SelectAccount(int idx) {
+    if (idx < 0 || idx >= (int)g_cfg.accounts.size()) return;
+    CaptureActiveAccount();
+
+    const Account& a = g_cfg.accounts[idx];
+    g_cfg.activeAcc = idx;
+    g_cfg.authType  = a.type;
+    g_cfg.authName  = a.name;
+    g_cfg.authUuid  = a.uuid;
+    g_cfg.authToken = a.token;
+    g_cfg.authServer = a.server;
+    if (a.type == "offline") g_cfg.playerName = a.name;
+    SaveConfig();
+    Log("[账户] 切换到：" + a.name);
+}
+
+// ---------------- 删除账户 ----------------
+void RemoveAccount(int idx) {
+    if (idx < 0 || idx >= (int)g_cfg.accounts.size()) return;
+    g_cfg.accounts.erase(g_cfg.accounts.begin() + idx);
+    if (g_cfg.activeAcc >= (int)g_cfg.accounts.size()) g_cfg.activeAcc = (int)g_cfg.accounts.size() - 1;
+    SaveConfig();
+}
+
+// ---------------- 刷新版本 + 选中默认 ----------------
+void ReloadVersions() {
+    g_versions.clear();
+    ScanVersions();
+    if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size())
+        g_selVersion = g_versions.empty() ? -1 : 0;
+}
+
+// ---------------- 设置 .minecraft 目录 ----------------
+void SetGameDir(const std::string& dir) {
+    if (dir.empty()) return;
+    g_cfg.gameDir = dir;
+    SaveConfig();
+    ReloadVersions();
+}
+
+
+// ============================================================================
+//  第九部分：界面实现与入口
+// ============================================================================
+// 布局要点：
+//   子控件坐标必须转成绝对坐标（页面 x/y + 相对偏移），否则会错位到顶栏。
+//   统一用 addTo(page, widget, relX, relY) 添加控件。
+// ============================================================================
+
+// ============================ 页面 ============================
+enum UiPage { P_LAUNCH = 0, P_DOWNLOAD, P_USER, P_SETTINGS, P_COUNT };
+
+static const char* kTabNames[P_COUNT] = { "启动", "下载", "用户", "设置" };
+
+static UiPage g_curPage = P_LAUNCH;
+static Fl_Double_Window* g_win = nullptr;
+static Overlay* g_overlay = nullptr;
+
+class PageBase;
+class PageUser;
+static PageBase* doSwitch(UiPage p);
+static void showAbout();
+static void backFromAbout();
+static void launchSelected();
+
+// ============================ 通用辅助 ============================
+static void addTo(Fl_Group* page, Fl_Widget* w, int relX, int relY) {
+    if (!page || !w) return;
+    // 页面创建时位于 (0,0)，子控件坐标即相对坐标
+    w->position(relX, relY);
+    page->add(w);
+}
+// 自绘圆角按钮
+class RoundButton : public Fl_Button {
+public:
+    bool accent_;
+    bool hidden_ = false;   // true 时不绘制、不响应
+    RoundButton(int X, int Y, int W, int H, const char* L, bool accent = false)
+        : Fl_Button(X, Y, W, H, L), accent_(accent) {
+        box(FL_NO_BOX);
+    }
+    void draw() override {
+        if (hidden_) return;
+        bool hot = (Fl::belowmouse() == this);
+        bool on  = active();
+        Fl_Color bg;
+        if (accent_) bg = hot ? clr_accent() : clr_accent2();
+        else         bg = hot ? clr_card_sel() : clr_card();
+        fill_round_rect(x(), y(), w(), h(), 8, bg);
+        draw_text_center(x(), y(), w(), h(), label() ? label() : "",
+                         on ? clr_text() : clr_dim(), 15);
+    }
+    int handle(int e) override {
+        if (hidden_) return 0;
+        if (e == FL_ENTER || e == FL_LEAVE) { redraw(); return 1; }
+        return Fl_Button::handle(e);
+    }
+};
+
+// 圆角输入框
+class RoundInput : public Fl_Input {
+public:
+    bool hidden_ = false;   // true 时不绘制、不响应（FLTK 的 hide() 会被 add()/show() 强行覆盖）
+
+    RoundInput(int X, int Y, int W, int H) : Fl_Input(X, Y, W, H, nullptr) {
+        box(FL_NO_BOX);
+        color(clr_inputbg());
+        textcolor(clr_text());
+        textfont(FL_HELVETICA);
+        textsize(14);
+        selection_color(clr_accent());
+    }
+    void draw() override {
+        if (hidden_) return;
+        fill_round_rect(x(), y(), w(), h(), 6, clr_inputbg());
+        Fl_Input::draw();
+    }
+    int handle(int e) override {
+        if (hidden_) return 0;
+        return Fl_Input::handle(e);
+    }
+};
+
+// 圆角下拉框
+class RoundChoice : public Fl_Choice {
+public:
+    RoundChoice(int X, int Y, int W, int H) : Fl_Choice(X, Y, W, H, nullptr) {
+        box(FL_NO_BOX);
+        color(clr_inputbg());
+        textcolor(clr_text());
+        textsize(14);
+    }
+    void draw() override {
+        fill_round_rect(x(), y(), w(), h(), 6, clr_inputbg());
+        // 画下拉箭头
+        int ax = x() + w() - 18, ay = y() + h() / 2 - 2;
+        fl_color(clr_dim());
+        fl_begin_polygon();
+        fl_vertex(ax - 5, ay);
+        fl_vertex(ax + 5, ay);
+        fl_vertex(ax, ay + 6);
+        fl_end_polygon();
+        // 文字
+        const char* t = (value() >= 0 && text()) ? text(value()) : "";
+        draw_text(x() + 10, y(), w() - 28, h(), t, clr_text(), 14);
+    }
+};
+
+// ============================ 启动打点 ============================
+static void TR(const char* s) {
+    FILE* f = nullptr;
+    fopen_s(&f, "C:\\tmp\\trace.txt", "a");
+    if (f) { std::fprintf(f, "%s\n", s); std::fflush(f); std::fclose(f); }
+}
+// ============================ 标签按钮 ============================
+class TabButton : public Fl_Button {
+public:
+    TabButton(int X, int Y, int W, int H, const char* L, int idx)
+        : Fl_Button(X, Y, W, H, L), idx_(idx) {
+        box(FL_NO_BOX);
+    }
+    void draw() override {
+        bool active = ((int)g_curPage == idx_);
+        bool hot = (Fl::belowmouse() == this);
+        fill_round_rect(x(), y(), w(), h(), 8,
+                        (active || hot) ? clr_card_sel() : clr_card());
+        draw_text_center(x(), y(), w(), h(), label() ? label() : "",
+                         active ? clr_text() : clr_dim(), 15);
+    }
+    int handle(int e) override {
+        if (e == FL_PUSH) { doSwitch((UiPage)idx_); return 1; }
+        if (e == FL_ENTER || e == FL_LEAVE) { redraw(); return 1; }
+        return Fl_Button::handle(e);
+    }
+private:
+    int idx_;
+};
+
+// ============================ 页面基类 ============================
+class PageBase : public Fl_Group {
+public:
+    // ---------- 统一滚动支持 ----------
+    // 每个页面声明自己的「内容总高度」；窗口比它矮时自动出现滚动条，
+    // 滚轮/拖动都走这里，子类只要重写 contentHeight() 和 drawContent()。
+    int pageScroll = 0;
+
+    explicit PageBase(int W, int H) : Fl_Group(0, 0, W, H) {
+        box(FL_NO_BOX);
+        color(clr_bg());
+    }
+    virtual void refresh() {}
+    virtual void onShown() {}
+    virtual void onHidden() {}
+
+    // 子类返回「内容需要多高」；返回 0 表示不需要滚动（自适应即可）
+    virtual int contentHeight() { return 0; }
+
+    int maxPageScroll() {
+        int ch = contentHeight();
+        if (ch <= 0) return 0;
+        int v = h() - contentHeight();
+        return v < 0 ? -v : 0;
+    }
+
+    void clampPageScroll() {
+        int m = maxPageScroll();
+        if (pageScroll < 0) pageScroll = 0;
+        if (pageScroll > m) pageScroll = m;
+    }
+
+    // 画右侧滚动条（各页面在 draw() 末尾调用）
+    void drawPageScrollbar() {
+        int m = maxPageScroll();
+        if (m <= 0) return;
+        int vis = h();
+        int ch = contentHeight();
+        int barH = vis * vis / ch;
+        if (barH < 30) barH = 30;
+        int barY = y() + (vis - barH) * pageScroll / m;
+        fill_round_rect(x() + w() - 10, barY, 6, barH, 3, clr_card_sel());
+    }
+
+    // 统一的滚轮处理（子类在 handle 里先调用它）
+    bool handlePageWheel(int e, int dy) {
+        if (e != FL_MOUSEWHEEL) return false;
+        if (maxPageScroll() <= 0) return false;
+        pageScroll += dy * 48;   // FLTK: 向下滚 dy>0
+        clampPageScroll();
+        redraw();
+        return true;
+    }
+};
+
+static PageBase* g_pages[P_COUNT] = { nullptr };
+static PageBase* g_aboutPage = nullptr;
+
+// 显示/隐藏页面时连子控件一起处理，否则隐藏页的输入框会浮在上面挡住标签
+static void setPageVisible(Fl_Group* pg, bool on) {
+    if (!pg) return;
+    if (on) {
+        for (int i = 0; i < pg->children(); ++i) pg->child(i)->show();
+        pg->show();
+        if (auto* pb = dynamic_cast<PageBase*>(pg)) pb->onShown();
+    } else {
+        for (int i = 0; i < pg->children(); ++i) pg->child(i)->hide();
+        pg->hide();
+        if (auto* pb = dynamic_cast<PageBase*>(pg)) pb->onHidden();
+    }
+    if (!pg) return;
+    if (on) {
+        for (int i = 0; i < pg->children(); ++i) pg->child(i)->show();
+        pg->show();
+    } else {
+        for (int i = 0; i < pg->children(); ++i) pg->child(i)->hide();
+        pg->hide();
+    }
+}
+
+class PageSettings;   // 前置声明
+static void (*g_resetSettings)() = nullptr;   // 切页后复位设置页状态
+
+static PageBase* doSwitch(UiPage p) {
+    if ((int)p >= P_COUNT) return nullptr;
+    g_curPage = p;
+    g_page = (Page)p;
+    for (int i = 0; i < P_COUNT; ++i) {
+        if (!g_pages[i]) continue;
+        if (i == (int)p) { setPageVisible(g_pages[i], true); g_pages[i]->refresh(); }
+        else             setPageVisible(g_pages[i], false);
+    }
+    if (g_aboutPage) setPageVisible(g_aboutPage, false);
+    if (g_win) { g_win->redraw(); }
+
+    return g_pages[p];
+}
+
+static void showAbout() {
+    for (int i = 0; i < P_COUNT; ++i) if (g_pages[i]) setPageVisible(g_pages[i], false);
+    if (g_aboutPage) { setPageVisible(g_aboutPage, true); g_aboutPage->refresh(); g_aboutPage->redraw(); }
+    if (g_win) g_win->redraw();
+}
+
+static void backFromAbout() {
+    if (g_aboutPage) setPageVisible(g_aboutPage, false);
+    doSwitch(P_SETTINGS);
+}
+static void launchSelected() {
+    if (g_launching) return;
+    if (g_selVersion < 0 || g_selVersion >= (int)g_versions.size()) {
+        g_status = L"请先选择一个实例";   // 不弹系统框，底部提示即可
+        if (g_win) g_win->redraw();
+        return;
+    }
+    const std::string ver = g_versions[g_selVersion];
+    g_launching = true;
+    g_overlayDoneTick = 0;
+    g_cancelLaunch = false;
+    if (g_overlay) g_overlay->show(ver);
+    std::thread([ver]() { LaunchThread(ver); }).detach();
+}
+
+static const int LP_LEFT = 300;
+
+//  布局仿原 Win32 版：
+//    左侧侧边栏（实例卡片列表）  中间信息区  右下角启动按钮 + 右侧向上箭头
+
+
+// ============================ 启动页 ============================
+//  左侧导航栏（仿设置页）：启动游戏 / 实例
+//  实例页里可以对每个实例管理模组（启用/禁用/删除）
+static const int LP_SIDEBAR = 300;
+
+// ============================ 启动页 ============================
+//  左侧导航栏（仿设置页）：启动游戏 / 实例
+//  实例页：每个实例是一张卡片，右侧有「设置」按钮
+//          点设置 → 该实例的设置面板，里面可以管理模组
+
+// ============================ 启动页 ============================
+//  左侧导航栏（仿设置页）：启动游戏 / 实例
+//  实例页：卡片直接由 PageLaunch::draw() 绘制，点击由 handle() 处理
+//         （不用 RowList 子控件，避免两层事件拦截导致点击失灵）
+
+class PageLaunch : public PageBase {
+public:
+    int subTab = 0;            // 0=启动游戏 1=实例
+    int detailIdx = -1;        // >=0 表示正在看某个实例的设置
+    int cardScroll = 0;        // 卡片列表滚动
+    std::vector<std::string> modsCache_;
+    std::vector<int> modCounts_;
+    RoundButton* btnRefresh = nullptr;
+
+    static const int CARD_H = 96;
+    static const int CARD_GAP = 6;
+
+    PageLaunch(int W, int H) : PageBase(W, H) {
+        // 纯自绘页面，不加任何子控件（除了刷新按钮）
+        btnRefresh = new RoundButton(0, 0, 90, 30, "刷新");
+        btnRefresh->callback([](Fl_Widget*, void* d) {
+            auto* self = (PageLaunch*)d;
+            ReloadVersions();
+            self->detailIdx = -1;
+            self->refresh();
+            g_status = L"已刷新";
+        }, this);
+        addTo(this, btnRefresh, LP_SIDEBAR + 20, 14);
+
+        end();
+        refresh();
+        subTab = 0;
+        syncVisibility();
+    }
+
+    void resize(int X, int Y, int W, int H) override {
+        PageBase::resize(X, Y, W, H);
+        if (btnRefresh) btnRefresh->resize(X + LP_SIDEBAR + 20, Y + 14, 90, 30);
+    }
+
+    void syncVisibility() {
+        if (btnRefresh) btnRefresh->hidden_ = (subTab != 1);
+        redraw();
+    }
+
+    void setTab(int i) {
+        if (subTab == i) return;
+        subTab = i;
+        if (subTab != 1) { detailIdx = -1; cardScroll = 0; }
+        syncVisibility();
+    }
+
+    std::string curVersionId() const {
+        if (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
+            return g_versions[g_selVersion];
+        return "";
+    }
+
+    void refresh() override {
+        modCounts_.clear();
+        for (auto& v : g_versions) modCounts_.push_back((int)ListModsOf(v).size());
+
+        if (detailIdx >= 0 && detailIdx < (int)g_versions.size())
+            modsCache_ = ListModsOf(g_versions[detailIdx]);
+        else
+            modsCache_.clear();
+
+        redraw();
+    }
+
+    // ---------- 布局 ----------
+    int cardX() const { return x() + LP_SIDEBAR + 20; }
+    int cardW() const { return w() - LP_SIDEBAR - 40; }
+    int cardY(int i) const { return y() + 56 + i * (CARD_H + CARD_GAP) - cardScroll; }
+
+    // 计算某张卡片的「设置」按钮矩形
+    void settingsBtnRect(int i, int& bx, int& by, int& bw, int& bh) const {
+        bw = 84; bh = 34;
+        int ry = cardY(i);
+        bx = cardX() + cardW() - bw - 16;
+        by = ry + (CARD_H - bh) / 2;
+    }
+
+    static bool inRect(int rx, int ry, int rw, int rh, int mx, int my) {
+        return mx >= rx && mx < rx + rw && my >= ry && my < ry + rh;
+    }
+
+    // ---------- 绘制 ----------
+    void draw() override {
+        fill_round_rect(x(), y(), w(), h(), 0, clr_bg());
+
+        // 左侧导航栏
+        fill_round_rect(x(), y(), LP_SIDEBAR, h(), 0, clr_sidebar());
+        draw_text(x() + 20, y() + 14, LP_SIDEBAR - 40, 30, "启动", clr_dim(), 12);
+
+        int iy = y() + 50;
+        for (int i = 0; i < 2; ++i) {
+            int ix = x() + 12, iw = LP_SIDEBAR - 24, ih = 38;
+            bool sel = (subTab == i);
+            bool hot = inRect(ix, iy, iw, ih, Fl::event_x(), Fl::event_y());
+            fill_round_rect(ix, iy, iw, ih, 8,
+                            sel ? clr_card_sel() : (hot ? clr_card_sel() : clr_card()));
+            draw_text(ix + 14, iy, iw - 28, ih, i == 0 ? "启动游戏" : "实例",
+                      sel ? clr_text() : clr_dim(), 15);
+            if (sel) fill_round_rect(ix, iy + 8, 3, ih - 16, 0, clr_accent2());
+            iy += 46;
+        }
+
+        if (subTab == 0) drawLaunchTab();
+        else              drawInstanceTab();
+
+        PageBase::draw();
+    }
+
+    void drawLaunchTab() {
+        int cx = x() + LP_SIDEBAR + 40;
+        int cw = w() - LP_SIDEBAR - 80;
+        if (cw < 120) cw = 120;
+
+        draw_text(cx, y() + 20, cw, 26, "启动设置", clr_dim(), 12);
+
+        std::string acct;
+        if (g_cfg.authType == "microsoft")        acct = "账号: " + g_cfg.authName + "（微软）";
+        else if (g_cfg.authType == "thirdparty")  acct = "账号: " + g_cfg.authName + "（第三方）";
+        else                                      acct = "账号: " + g_cfg.playerName + "（离线）";
+
+        draw_text(cx, y() + 56,  cw, 26, acct, clr_dim(), 15);
+        draw_text(cx, y() + 82,  cw, 26, "内存: " + std::to_string(g_cfg.maxMemMB) + " MB", clr_dim(), 15);
+
+        std::string ver = curVersionId().empty() ? "（未选择）" : curVersionId();
+        draw_text(cx, y() + 108, cw, 26, "版本: " + ver, clr_dim(), 15);
+
+        if (!g_cfg.javaPath.empty()) {
+            std::string jv = JavaVersionOf(fs::u8path(g_cfg.javaPath));
+            draw_text(cx, y() + 134, cw, 22,
+                      std::string("Java: ") + (jv.empty() ? std::string("未知版本") : jv),
+                      jv.empty() ? clr_err() : clr_ok(), 12);
+        }
+
+        // 右下角启动按钮
+        int bw = 220, bh = 64;
+        int bx = x() + w() - 24 - bw;
+        int by = y() + h() - 24 - bh;
+
+        int pst = g_progState.load();
+        if (pst != 0) {
+            int total = g_progTotal.load(), cur = g_progCur.load();
+            float p = (pst == 1 && total > 0) ? ((float)cur / (float)total) : 1.0f;
+            if (p > 1.0f) p = 1.0f;
+            if (p < 0.0f) p = 0.0f;
+            std::string s2 = (pst == 1)
+                ? ("正在补全文件  " + std::to_string(cur) + " / " + std::to_string(total))
+                : "正在启动游戏…";
+            draw_text(bx - 20, by - 96, bw + 20, 24, s2, clr_dim(), 12);
+            int barY = by - 64;
+            fill_round_rect(bx - 20, barY, bw + 20, 16, 8, clr_card());
+            int fw = (int)((bw + 20) * p);
+            if (fw > 4) fill_round_rect(bx - 20, barY, fw, 16, 8, clr_accent2());
+        }
+
+        bool hot = inRect(bx, by, bw, bh, Fl::event_x(), Fl::event_y());
+        fill_round_rect(bx, by, bw, bh, 10,
+                        g_launching ? clr_card() : (hot ? clr_accent() : clr_accent2()));
+        draw_text_center(bx, by, bw, bh, g_launching ? "启动中…" : "启动游戏",
+                         g_launching ? clr_dim() : FL_WHITE, 18);
+
+        if (!g_status.empty())
+            draw_text(cx, y() + 166, cw, 80, g_status, clr_dim(), 12);
+    }
+
+    void drawInstanceTab() {
+        int cx = cardX();
+        int cw = cardW();
+        if (cw < 120) cw = 120;
+
+        if (detailIdx >= 0 && detailIdx < (int)g_versions.size()) {
+            drawDetail(cx, cw);
+            return;
+        }
+
+        // ---------- 卡片列表 ----------
+        draw_text(cx, y() + 18, 240, 30,
+                  "实例 (" + std::to_string(g_versions.size()) + ")", clr_text(), 15);
+
+        if (g_versions.empty()) {
+            draw_text(cx, y() + 90, cw, 60,
+                      "没有找到实例，请检查游戏目录设置", clr_err(), 13);
+            return;
+        }
+
+        fl_push_clip(cx, y() + 52, cw, h() - 60);
+        for (int i = 0; i < (int)g_versions.size(); ++i) {
+            int ry = cardY(i);
+            if (ry + CARD_H < y() + 52 || ry > y() + h()) continue;
+            bool cur = (i == g_selVersion);
+
+            fill_round_rect(cx, ry + 4, cw, CARD_H - 10, 10,
+                            cur ? clr_card_sel() : clr_card());
+            if (cur) fill_round_rect(cx + 3, ry + 14, 3, CARD_H - 30, 0, clr_accent2());
+
+            std::string n = g_versions[i];
+            draw_text(cx + 20, ry + 12, cw - 160, 30, n, clr_text(), 17);
+
+            std::string tag = "原版";
+            if (n.find("Fabric") != std::string::npos) tag = "Fabric";
+            else if (n.find("Quilt") != std::string::npos) tag = "Quilt";
+            else if (n.find("NeoForge") != std::string::npos) tag = "NeoForge";
+            else if (n.find("Forge") != std::string::npos) tag = "Forge";
+            draw_text(cx + 20, ry + 42, cw - 160, 20, tag, clr_dim(), 12);
+
+            int nm = (i < (int)modCounts_.size()) ? modCounts_[i] : 0;
+            draw_text(cx + 20, ry + 62, cw - 160, 20,
+                      std::to_string(nm) + " 个模组", clr_dim(), 11);
+
+            if (cur) draw_text_right(cx + 20, ry + CARD_H - 26, cw - 130, 18, "当前", clr_ok(), 11);
+
+            // 设置按钮
+            int bx, by, bw, bh;
+            settingsBtnRect(i, bx, by, bw, bh);
+            bool hot = inRect(bx, by, bw, bh, Fl::event_x(), Fl::event_y());
+            fill_round_rect(bx, by, bw, bh, 7, hot ? clr_accent() : clr_accent2());
+            draw_text_center(bx, by, bw, bh, "设置", FL_WHITE, 14);
+        }
+        fl_pop_clip();
+
+        if (!g_status.empty())
+            draw_text(cx, y() + h() - 30, cw, 24, g_status, clr_dim(), 12);
+    }
+
+    void drawDetail(int cx, int cw) {
+        const std::string vid = g_versions[detailIdx];
+
+        // 标题
+        draw_text(cx, y() + 14, cw - 110, 34, vid, clr_text(), 20);
+
+        // 返回按钮
+        int bbx = cx + cw - 90, bby = y() + 16, bbw = 90, bbh = 30;
+        bool hotBack = inRect(bbx, bby, bbw, bbh, Fl::event_x(), Fl::event_y());
+        fill_round_rect(bbx, bby, bbw, bbh, 7, hotBack ? clr_card_sel() : clr_card());
+        draw_text_center(bbx, bby, bbw, bbh, "返回", clr_text(), 14);
+
+        // 模组数
+        draw_text(cx, y() + 56, cw, 22,
+                  "模组 (" + std::to_string(modsCache_.size()) + ")", clr_dim(), 12);
+
+        if (modsCache_.empty()) {
+            draw_text(cx, y() + 92, cw, 70,
+                      "这个实例没有安装模组\n把 .jar 放进该实例的 mods 文件夹后会显示在这里",
+                      clr_dim(), 12);
+        } else {
+            int my = y() + 84;
+            const int rowH = 36;
+            int maxRows = (h() - 160) / rowH;
+            if (maxRows < 1) maxRows = 1;
+
+            for (int i = 0; i < (int)modsCache_.size() && i < maxRows; ++i) {
+                const std::string& f = modsCache_[i];
+                bool dis = (f.size() > 13 && f.substr(f.size() - 13) == ".jar.disabled");
+
+                fill_round_rect(cx, my, cw, rowH - 4, 6, clr_card());
+
+                // 状态点
+                fl_color(dis ? clr_dim() : clr_ok());
+                fl_pie(cx + 8, my + rowH / 2 - 4, 8, 8, 0, 360);
+
+                draw_text(cx + 26, my, cw - 240, rowH - 4, f,   // 给右侧按钮留位
+                          dis ? clr_dim() : clr_text(), 12);
+
+                // 启用/禁用
+                int tb = cx + cw - 190, tw = 88;
+                bool hotT = inRect(tb, my + 3, tw, rowH - 10, Fl::event_x(), Fl::event_y());
+                fill_round_rect(tb, my + 3, tw, rowH - 10, 5,
+                                hotT ? clr_accent() : clr_accent2());
+                draw_text_center(tb, my + 3, tw, rowH - 10,
+                                 dis ? "启用" : "禁用", FL_WHITE, 11);
+
+                // 删除
+                int db = cx + cw - 96, dw = 88;
+                bool hotD = inRect(db, my + 3, dw, rowH - 10, Fl::event_x(), Fl::event_y());
+                fill_round_rect(db, my + 3, dw, rowH - 10, 5,
+                                hotD ? clr_card() : clr_card_sel());
+                draw_text_center(db, my + 3, dw, rowH - 10, "删除", clr_err(), 11);
+
+                my += rowH;
             }
         }
+
+        // 元信息
+        int my = y() + h() - 90;
+        std::string acct;
+        if (g_cfg.authType == "microsoft")        acct = g_cfg.authName + "（微软）";
+        else if (g_cfg.authType == "thirdparty")  acct = g_cfg.authName + "（外置）";
+        else                                      acct = g_cfg.playerName + "（离线）";
+
+        draw_text(cx, my, 80, 24, "账号", clr_dim(), 12);
+        draw_text(cx + 80, my, cw - 80, 24, acct, clr_text(), 12);
+        draw_text(cx, my + 26, 80, 24, "mods", clr_dim(), 12);
+        draw_text(cx + 80, my + 26, cw - 80, 24,
+                  WToU8(ModsDirOf(vid).wstring()), clr_dim(), 11);
+
+        if (!g_status.empty())
+            draw_text(cx, y() + h() - 32, cw - 200, 24, g_status, clr_dim(), 12);
     }
-    g_dataDir = WToU8(fs::path(g_cfgPath).parent_path().wstring());
-    LoadConfig();
-    ApplyActiveAccount();
-    std::thread(UpdateThread, false).detach();
+
+    // ---------- 事件 ----------
+    int handle(int e) override {
+        int mx = Fl::event_x(), my = Fl::event_y();
+
+        if (e == FL_PUSH && Fl::event_button() == FL_LEFT_MOUSE) {
+            // 左侧导航
+            if (mx >= x() && mx < x() + LP_SIDEBAR) {
+                int iy = y() + 50;
+                for (int i = 0; i < 2; ++i) {
+                    if (my >= iy && my < iy + 38) { setTab(i); return 1; }
+                    iy += 46;
+                }
+                return 1;
+            }
+
+            if (subTab == 0) {
+                // 启动按钮
+                int bw = 220, bh = 64;
+                int bx = x() + w() - 24 - bw;
+                int by = y() + h() - 24 - bh;
+                if (inRect(bx, by, bw, bh, mx, my)) { launchSelected(); return 1; }
+                return 1;
+            }
+
+            // ---------- 实例页 ----------
+            int cx = cardX(), cw = cardW();
+
+            if (detailIdx >= 0 && detailIdx < (int)g_versions.size()) {
+                // 返回
+                if (inRect(cx + cw - 90, y() + 16, 90, 30, mx, my)) {
+                    detailIdx = -1;
+                    modsCache_.clear();
+                    redraw();
+                    return 1;
+                }
+                // 模组按钮
+                const std::string vid = g_versions[detailIdx];
+                int rowH = 36;
+                int maxRows = (h() - 160) / rowH;
+                if (maxRows < 1) maxRows = 1;
+                for (int i = 0; i < (int)modsCache_.size() && i < maxRows; ++i) {
+                    int ry = y() + 84 + i * rowH;
+                    int tb = cx + cw - 190, tw = 88;
+                    int db = cx + cw - 96,  dw = 88;
+                    if (inRect(tb, ry + 3, tw, rowH - 10, mx, my)) {
+                        std::string fn = modsCache_[i];
+                        std::string err;
+                        ToggleModIn(vid, fn, err);
+                        g_status = err.empty() ? (L"已切换：" + U8ToW(fn))
+                                               : (L"失败：" + U8ToW(err));
+                        refresh();
+                        return 1;
+                    }
+                    if (inRect(db, ry + 3, dw, rowH - 10, mx, my)) {
+                        std::string fn = modsCache_[i];
+                        std::string err;
+                        if (DeleteModIn(vid, fn, err)) g_status = L"已删除：" + U8ToW(fn);
+                        else                           g_status = L"删除失败：" + U8ToW(err);
+                        refresh();
+                        return 1;
+                    }
+                }
+                return 1;
+            }
+
+            // 卡片点击：先判「设置」按钮，再判整卡
+            if (my >= y() + 52) {
+                for (int i = 0; i < (int)g_versions.size(); ++i) {
+                    int ry = cardY(i);
+                    if (ry + CARD_H < y() + 52 || ry > y() + h()) continue;
+                    if (my < ry || my >= ry + CARD_H) continue;
+
+                    int bx, by, bw, bh;
+                    settingsBtnRect(i, bx, by, bw, bh);
+                    if (inRect(bx, by, bw, bh, mx, my)) {
+                        detailIdx = i;
+                        g_selVersion = i;
+                        modsCache_ = ListModsOf(g_versions[i]);
+                        g_status = L"打开设置：" + U8ToW(g_versions[i]);
+                        redraw();
+                        return 1;
+                    }
+                    if (mx >= cx && mx < cx + cw) {
+                        g_selVersion = i;
+                        g_status = L"已选择实例：" + U8ToW(g_versions[i]);
+                        redraw();
+                        return 1;
+                    }
+                }
+            }
+            return 1;
+        }
+
+        if (e == FL_MOUSEWHEEL && subTab == 1 && detailIdx < 0) {
+            int maxS = (int)g_versions.size() * (CARD_H + CARD_GAP) - (h() - 60);
+            if (maxS < 0) maxS = 0;
+            cardScroll += Fl::event_dy() * 40;
+            if (cardScroll < 0) cardScroll = 0;
+            if (cardScroll > maxS) cardScroll = maxS;
+            redraw();
+            return 1;
+        }
+
+        if (e == FL_ENTER || e == FL_LEAVE || e == FL_MOVE) { redraw(); return 1; }
+        return PageBase::handle(e);
+    }
+};
+
+// ============================ 下载页 ============================
+//  纯自绘：版本列表 + 版本详情（点卡片进入）
+//  加载器下拉已移除（"原版"那栏），位置留给后面的 Mod 下载
+class PageDownload : public PageBase {
+public:
+    int filterType = 0;        // 0=正式版 1=快照版 2=远古版 3=所有
+    bool filterDropOpen = false;   // 版本类型下拉是否展开
+    int  syncTabCache = -1;   // 上次同步时的 dlTab/detailIdx（避免每帧 resize）
+    int  syncDetailCache = -2;
+    int selIdx = -1;           // 列表里选中的行（g_dlView 下标）
+    int detailIdx = -1;        // >=0 表示在版本详情（g_dlView 下标）
+    int scroll = 0;
+    std::string filter;        // 搜索词
+    std::string detailErr;     // 详情加载错误
+
+    // 详情缓存
+    std::string dId, dType, dDate, dUrl;
+    std::string dMcVer, dJavaVer, dLoader;
+    long long dSizeAssets = 0;
+    int dLibCount = 0, dFileCount = 0;
+    bool detailLoaded = false;
+    int loaderSel = 0;                       // 选中的加载器（0=原版）
+    bool loaderDropOpen = false;             // 加载器下拉是否展开
+    static const char* kLoaderNames[7];   // 原版/Fabric/Quilt/Forge/NeoForge/QSL/FabricAPI
+
+    // ---------- 加载器版本自选 ----------
+    std::vector<std::string> ldrVers;        // 该加载器的可用版本
+    int  ldrSel = -1;                        // 选中的版本下标（-1=自动最新）
+    bool ldrVerOpen = false;                 // 版本下拉是否展开
+    int  ldrVerScroll = 0;
+    bool ldrVersLoaded = false;              // 是否已拉取过
+    int  ldrVersFor = -1;                    // 已拉取的加载器种类
+    std::string ldrVersMc;                   // 已拉取对应的 MC 版本
+    std::string ldrVersErr;                  // 拉取失败原因
+
+    RoundInput* search = nullptr;
+    RoundInput* modSearch = nullptr;   // 模组页搜索框
+    RoundButton* btnInstall = nullptr;
+
+    static const int ITEM_H = 52;
+    static const int ITEM_GAP = 5;
+    static const int TYPE_W = 130;
+    static const int TOOLBAR_Y = 18;
+    static const int TAB_W = 72;
+    // ==================== 标签页：0=版本 1=模组 ====================
+    int dlTab = 0;
+
+    // ---------- 模组页状态 ----------
+    std::string modQuery;          // 搜索词
+    int  modScroll = 0;
+    int  modSel = -1;              // 选中的搜索结果
+    int  modDetail = -1;           // >=0 进入模组详情
+    std::string modDetailSlug, modDetailTitle, modDetailDesc;
+    int  modVerSel = -1;           // 选中的模组版本
+    int  modVerScroll = 0;
+    std::string modErr;
+    bool modAutoLoaded = false;    // 是否已自动拉过热门列表
+    int  modCat = 0;    // 0=Mod 1=整合包 2=数据包 3=资源包 4=光影包
 
 
-    Gdiplus::GdiplusStartupInput gpsi;
-    g_gpOk = (Gdiplus::GdiplusStartup(&g_gpToken, &gpsi, nullptr) == Gdiplus::Ok);
-    LoadSkinBitmap();
+    PageDownload(int W, int H) : PageBase(W, H) {
+        // 版本页的搜索框
+        search = new RoundInput(0, 0, 220, 32);
+        search->callback([](Fl_Widget* w, void* d) {
+            auto* self = (PageDownload*)d;
+            self->filter = ((Fl_Input*)w)->value();
+            self->rebuild();
+        }, this);
+        addTo(this, search, W - 240, TOOLBAR_Y);
 
-    if (g_cfg.gameDir.empty()) g_cfg.gameDir = DetectGameDir();
-    if (g_cfg.javaPath.empty()) g_cfg.javaPath = DetectJava();
-    {
-        std::string emb = ExtractEmbeddedAuthlib();
-        if (!emb.empty()) {
-            g_cfg.authlibPath = emb;
-            Log("[内置] authlib-injector 已释放: " + emb);
-        } else if (g_cfg.authlibPath.empty()) {
-            g_cfg.authlibPath = DetectAuthlib();
+        // 模组页的搜索框（真控件，可输入）
+        modSearch = new RoundInput(0, 0, 300, 32);
+        modSearch->callback([](Fl_Widget* w, void* d) {
+            auto* self = (PageDownload*)d;
+            self->modQuery = ((Fl_Input*)w)->value();
+        }, this);
+        addTo(this, modSearch, CAT_W + 16, TOOLBAR_Y);   // 与 modSearchRect 一致
+
+        btnInstall = new RoundButton(0, 0, 150, 42, "下载并安装", true);
+        btnInstall->callback([](Fl_Widget*, void* d) { ((PageDownload*)d)->install(); }, this);
+        addTo(this, btnInstall, W - 170, H - 60);
+
+        end();
+        rebuild();
+        syncSearchVisible();
+    }
+
+    // 切换标签时显示/隐藏对应的搜索框
+    void syncSearchVisible() {
+        if (!search || !modSearch || !btnInstall) return;
+        bool verTab = (dlTab == 0);
+        bool showInstall = (verTab && detailIdx >= 0);
+
+        search->hidden_ = !verTab;
+        modSearch->hidden_ = verTab;
+        btnInstall->hidden_ = !showInstall;
+
+        // 版本页搜索框：右上角（筛选框左边留空，不重叠）
+        if (verTab) {
+            search->resize(x() + w() - 250, y() + TOOLBAR_Y, 230, 32);
+            modSearch->resize(-9999, -9999, 240, 32);
+        } else {
+            // 模组页搜索框：和工具栏同一坐标
+            int tBtnX, tBoxX, tSrcX, tBoxW;
+            modToolbar(tBtnX, tBoxX, tSrcX, tBoxW);
+            modSearch->resize(tBoxX, y() + TOOLBAR_Y, tBoxW, 32);
+            search->resize(-9999, -9999, 230, 32);
+        }
+        if (showInstall) btnInstall->resize(x() + w() - 170, y() + h() - 60, 150, 42);
+        else             btnInstall->resize(-9999, -9999, 150, 42);
+
+        redraw();
+    }
+
+    void resize(int X, int Y, int W, int H) override {
+        PageBase::resize(X, Y, W, H);
+        syncSearchVisible();   // 拉伸时也按当前标签重新定位
+    }
+
+
+    // ---------- 数据 ----------
+    void snapshot(std::vector<McVer>& out) {
+        std::lock_guard<std::mutex> lk(g_mcVersMutex);
+        out = g_mcVers;
+    }
+
+    void rebuild() {
+        std::vector<McVer> all;
+        snapshot(all);
+
+        g_dlView.clear();
+        for (int i = 0; i < (int)all.size(); ++i) {
+            const McVer& v = all[i];
+            bool rel  = (v.type == "release");
+            bool snap = (v.type == "snapshot");
+            bool old  = (v.type == "old_beta" || v.type == "old_alpha");
+            bool pass = false;
+            switch (filterType) {
+                case 0: pass = rel;  break;
+                case 1: pass = snap; break;
+                case 2: pass = old;  break;
+                default: pass = true; break;
+            }
+            if (!pass) continue;
+            if (!filter.empty() && v.id.find(filter) == std::string::npos) continue;
+            g_dlView.push_back(i);
+        }
+        if (selIdx >= (int)g_dlView.size()) selIdx = -1;
+        if (detailIdx >= (int)g_dlView.size()) detailIdx = -1;
+        clampScroll();
+        redraw();
+    }
+
+    int maxScroll() const {
+        int contentH = (int)g_dlView.size() * (ITEM_H + ITEM_GAP);
+        int vis = h() - ITEM_TOP() - 70;
+        return contentH > vis ? contentH - vis : 0;
+    }
+    int ITEM_TOP() const { return 62; }
+
+    void clampScroll() {
+        int m = maxScroll();
+        if (scroll < 0) scroll = 0;
+        if (scroll > m) scroll = m;
+    }
+
+    void openDetail(int idx) {
+        detailIdx = idx;
+        selIdx = idx;
+        detailLoaded = false;
+        detailErr.clear();
+        dId = dType = dDate = dUrl = dMcVer = dJavaVer = dLoader = "";
+        dSizeAssets = 0; dLibCount = 0; dFileCount = 0;
+
+        if (idx >= 0 && idx < (int)g_dlView.size()) {
+            std::vector<McVer> all;
+            snapshot(all);
+            int gi = g_dlView[idx];
+            if (gi >= 0 && gi < (int)all.size()) {
+                dId = all[gi].id;
+                dType = all[gi].type;
+                dDate = all[gi].date;
+                dUrl = all[gi].url;
+                loadDetailMeta(all[gi]);
+                detailLoaded = true;
+            }
+        }
+        redraw();
+    }
+
+    // 从版本 JSON 里读大小 / Java 版本 / 依赖数
+    void loadDetailMeta(const McVer& v) {
+        dJavaVer.clear(); dLibCount = 0; dFileCount = 0; dSizeAssets = 0;
+
+        // 先用本地已安装的 version.json（如果有），省一次网络请求
+        fs::path local = GameDirPath() / L"versions"
+                       / fs::u8path(v.id) / fs::u8path(v.id + ".json");
+        std::string body;
+        if (FileExists(local)) {
+            std::ifstream f{ local, std::ios::binary };
+            if (f) { std::stringstream ss; ss << f.rdbuf(); body = ss.str(); }
+        } else {
+            std::vector<unsigned char> d; std::string e;
+            if (HttpRequest(v.url, "GET", "", "", d, e) && !d.empty())
+                body.assign(d.begin(), d.end());
+            else
+                detailErr = e.empty() ? "无法获取版本信息" : e;
+        }
+        if (body.empty()) return;
+
+        json j = json::parse(body, nullptr, false);
+        if (!j.is_object()) return;
+
+        if (j.contains("javaVersion") && j["javaVersion"].is_object()) {
+            if (j["javaVersion"].contains("majorVersion"))
+                dJavaVer = std::to_string(j["javaVersion"]["majorVersion"].get<int>());
+        }
+        if (j.contains("libraries") && j["libraries"].is_array())
+            dLibCount = (int)j["libraries"].size();
+        if (j.contains("downloads") && j["downloads"].is_object()
+            && j["downloads"].contains("client")
+            && j["downloads"]["client"].is_object()) {
+            const json& c = j["downloads"]["client"];
+            if (c.contains("size") && c["size"].is_number())
+                dSizeAssets = c["size"].get<long long>();
+            dFileCount++;
+        }
+        if (j.contains("assetIndex") && j["assetIndex"].is_object()
+            && j["assetIndex"].contains("size"))
+            dSizeAssets += j["assetIndex"]["size"].get<long long>();
+
+        if (j.contains("inheritsFrom") && j["inheritsFrom"].is_string())
+            dLoader = "基于 " + j["inheritsFrom"].get<std::string>();
+
+        // 加载器信息
+        std::string n = v.id;
+        if (n.find("NeoForge") != std::string::npos) dLoader = "NeoForge";
+        else if (n.find("Fabric") != std::string::npos) dLoader = "Fabric";
+        else if (n.find("Quilt") != std::string::npos)  dLoader = "Quilt";
+        else if (n.find("Forge") != std::string::npos)  dLoader = "Forge";
+        else dLoader = "原版";
+    }
+
+    // ---------- 拉取加载器可用版本 ----------
+    // 在 UI 线程同步调用（阻塞 1~2 秒），只在用户切换加载器时触发一次
+    void loadLoaderVersions() {
+        if (loaderSel <= 0) return;   // 原版没有版本可选
+        // 同一加载器 + 同一 MC 版本只用拉一次
+        if (ldrVersLoaded && ldrVersFor == loaderSel && ldrVersMc == dId) return;
+
+        ldrVers.clear();
+        ldrSel = -1;
+        ldrVerScroll = 0;
+        ldrVersErr.clear();
+        ldrVersLoaded = true;
+        ldrVersFor = loaderSel;
+        ldrVersMc = dId;
+
+        std::string err, body, url;
+        switch (loaderSel) {
+            case 1:   // Fabric
+                url = "https://bmclapi2.bangbang93.com/fabric-meta/v2/versions/loader/" + dId;
+                break;
+            case 2:   // Quilt
+                url = "https://meta.quiltmc.org/v3/versions/loader/" + dId;
+                break;
+            case 3:   // Forge
+                url = "https://bmclapi2.bangbang93.com/forge/minecraft/" + dId;
+                break;
+            case 4:   // NeoForge
+                url = "https://bmclapi2.bangbang93.com/neoforge/list/" + dId;
+                break;
+            case 5:   // QSL（Modrinth）
+                url = "https://api.modrinth.com/v2/project/qsl/version"
+                      "?game_versions=[%22" + dId + "%22]&loaders=[%22quilt%22]";
+                break;
+            case 6:   // Fabric API（Modrinth）
+                url = "https://api.modrinth.com/v2/project/fabric-api/version"
+                      "?game_versions=[%22" + dId + "%22]&loaders=[%22fabric%22]";
+                break;
+            default:
+                return;
+        }
+
+        body = HttpGetString(url, err);
+        if (body.empty()) {
+            ldrVersErr = err.empty() ? "无法获取版本列表" : err;
+            redraw();
+            return;
+        }
+
+        json j = json::parse(body, nullptr, false);
+        if (!j.is_array()) {
+            ldrVersErr = "版本列表格式异常";
+            redraw();
+            return;
+        }
+        if (j.empty()) {
+            ldrVersErr = "没有适配此版本的加载器";
+            redraw();
+            return;
+        }
+
+        for (auto& x : j) {
+            std::string v;
+            if (loaderSel == 5 || loaderSel == 6) {
+                // Modrinth 结构
+                v = x.value("version_number", x.value("name", std::string()));
+            } else if (loaderSel == 1 || loaderSel == 2) {
+                if (x.contains("loader") && x["loader"].is_object())
+                    v = x["loader"].value("version", std::string());
+            } else {
+                v = x.value("version", std::string());
+            }
+            if (!v.empty()) ldrVers.push_back(v);
+        }
+
+        if (ldrVers.empty()) ldrVersErr = "没有适配此版本的加载器";
+        // 默认选第一个（最新）
+        if (!ldrVers.empty()) ldrSel = 0;
+        redraw();
+    }
+
+    // 当前选中的加载器版本（空 = 让后端自动选最新）
+    std::string selectedLoaderVersion() const {
+        if (ldrSel >= 0 && ldrSel < (int)ldrVers.size()) return ldrVers[ldrSel];
+        return "";
+    }
+
+    void install() {
+        int use = (detailIdx >= 0) ? detailIdx : selIdx;
+        if (use < 0 || use >= (int)g_dlView.size()) {
+            g_status = L"请先选择一个版本";
+            redraw();
+            return;
+        }
+        std::string mcId, mcUrl;
+        {
+            std::lock_guard<std::mutex> lk(g_mcVersMutex);
+            int idx = g_dlView[use];
+            if (idx < 0 || idx >= (int)g_mcVers.size()) return;
+            mcId  = g_mcVers[idx].id;
+            mcUrl = g_mcVers[idx].url;
+        }
+
+        // 加载器（0=原版 1=Fabric 2=Quilt 3=Forge 4=NeoForge 5=QSL 6=FabricAPI）
+        const int loader = loaderSel;
+        const std::string lv = selectedLoaderVersion();   // 用户选的版本，空=自动最新
+        std::string label = mcId;
+        if (loader > 0) {
+            label += " + " + std::string(kLoaderNames[loader]);
+            if (!lv.empty()) label += " " + lv;
+        }
+
+        // 重置进度，让进度条从 0 开始
+        g_progCur = 0;
+        g_progTotal = 0;
+        g_dlBytes = 0;
+        g_dlTarget = U8ToW(label);
+        if (g_overlay) g_overlay->showDownload(label);   // 下载模式：显示速度/字节
+        g_launching = true;
+        g_launching = true;
+        g_cancelLaunch = false;
+
+        std::thread([mcId, mcUrl, loader, lv]() {
+            switch (loader) {
+            case 0: InstallVersionThread(mcId, mcUrl); break;              // 原版
+            case 1: InstallMetaLoaderThread(mcId, false, lv); break;       // Fabric
+            case 2: InstallMetaLoaderThread(mcId, true,  lv); break;       // Quilt
+            case 3: InstallInstallerThread(mcId, false, lv);  break;       // Forge
+            case 4: InstallInstallerThread(mcId, true,  lv);  break;       // NeoForge
+            case 5: InstallModrinthModThread("qsl", mcId, "quilt", mcId + "-Quilt"); break;
+            case 6: InstallModrinthModThread("fabric-api", mcId, "fabric", mcId + "-Fabric"); break;
+            }
+        }).detach();
+    }
+
+    void refresh() override {
+        if (g_mcVers.empty() && g_mcVersState.load() == 0) {
+            g_status = L"正在获取版本清单…";
+            std::thread([]() { FetchManifestThread(); }).detach();
+        }
+        rebuild();
+        redraw();
+    }
+
+    // ---------- 布局辅助 ----------
+    int listX() const { return x() + 20; }
+    int listW() const { return w() - 40; }
+
+    int itemY(int i) const {
+        return y() + ITEM_TOP() + i * (ITEM_H + ITEM_GAP) - scroll;
+    }
+
+    static bool inRect(int rx, int ry, int rw, int rh, int mx, int my) {
+        return mx >= rx && mx < rx + rw && my >= ry && my < ry + rh;
+    }
+
+    void toolbarRect(int which, int& bx, int& by, int& bw, int& bh) const {
+        if (which == 0) {
+            // 版本类型下拉：标签右侧，搜索框左边
+            bx = x() + 20 + 2 * (TAB_W + 6) + 8;
+            by = y() + TOOLBAR_Y;
+            bw = 130; bh = 32;
+        } else {
+            // 返回按钮：右上角
+            bx = x() + w() - 110;
+            by = y() + TOOLBAR_Y;
+            bw = 90; bh = 32;
         }
     }
 
-    ScanVersions();
-
-    // --dump 自检
-    std::string cmdline = lpCmdLine ? lpCmdLine : "";
-    auto trimCmd = [](std::string s) {
-        while (!s.empty() && (s.front() == ' ' || s.front() == '"' || s.front() == '\t')) s.erase(s.begin());
-        while (!s.empty() && (s.back() == ' ' || s.back() == '"' || s.back() == '\t')) s.pop_back();
-        return s;
-    };
-    cmdline = trimCmd(cmdline);
-    if (cmdline.rfind("--dump", 0) == 0) {
-        std::string ver = trimCmd(cmdline.substr(6));
-        if (ver.empty() && !g_versions.empty()) ver = g_versions[0];
-
-        LaunchPlan plan;
-        plan.maxMem = g_cfg.maxMemMB;
-        std::string err;
-        bool ok = BuildLaunchPlan(ver, plan, err);
-
-        std::ofstream f{ fs::path(ExeDir().wstring() + L"\\dump.txt") };
-        if (f) f << (ok ? WToU8(plan.commandLine) : ("FAILED: " + err));
-        return ok ? 0 : 1;
+    // ---------- 绘制 ----------
+    // 标签页矩形：0=版本 1=模组
+    void dlTabRect(int which, int& tx, int& ty, int& tw, int& th) const {
+        tw = 72; th = 30;
+        tx = x() + 20 + which * (tw + 6);
+        ty = y() + TOOLBAR_Y + 1;
     }
 
-    WNDCLASSW wc{};
-    wc.lpfnWndProc   = MainProc;
-    wc.hInstance     = hInst;
-    wc.lpszClassName = L"ReignLaunchMain";
-    wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = nullptr;
-    wc.hIcon         = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
-    RegisterClassW(&wc);
+    void draw() override {
+        // 每帧强制同步输入框可见性（防止 FLTK 的 show() 覆盖导致筛选框被挡）
+        // 每帧强制同步控件可见性 + 位置（防止 FLTK 的 show() 覆盖）
+        syncSearchVisible();
+        // 首次显示：清单已到但还没 rebuild 时补一次（修「要刷新才显示」）
+        if (g_dlView.empty() && g_mcVersState.load() == 2 && !g_mcVers.empty()) {
+            rebuild();
+        }
+        fill_round_rect(x(), y(), w(), h(), 0, clr_bg());
 
-    HWND hwnd = CreateWindowExW(0, L"ReignLaunchMain", L"ReignLaunch - Minecraft 启动器",
-                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                                CW_USEDEFAULT, CW_USEDEFAULT, Scale(1060), Scale(680),
-                                nullptr, nullptr, hInst, nullptr);
-    if (!hwnd) return 0;
+        // ---------- 顶部标签：版本 / 模组 ----------
+        for (int i = 0; i < 2; ++i) {
+            int tx, ty, tw, th;
+            dlTabRect(i, tx, ty, tw, th);
+            bool act = (dlTab == i);
+            bool hot = inRect(tx, ty, tw, th, Fl::event_x(), Fl::event_y());
+            fill_round_rect(tx, ty, tw, th, 6,
+                            act ? clr_accent2() : (hot ? clr_card_sel() : clr_card()));
+            draw_text_center(tx, ty, tw, th, i == 0 ? "版本" : "模组",
+                             act ? FL_WHITE : clr_dim(), 13);
+        }
 
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
-    ShowPage(PAGE_LAUNCH);
+        if (dlTab == 0) {
+            if (detailIdx >= 0) drawDetail();
+            else                drawList();
+        } else {
+            drawModTab();
+        }
 
-    MSG msg;
-    while (GetMessageW(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        PageBase::draw();
+    }
+
+    void drawList() {
+        int bx, by, bw, bh;
+        toolbarRect(0, bx, by, bw, bh);
+        bool hot = inRect(bx, by, bw, bh, Fl::event_x(), Fl::event_y());
+        fill_round_rect(bx, by, bw, bh, 6, hot ? clr_card_sel() : clr_card());
+        static const char* tn[] = { "正式版", "快照版", "远古版", "所有版本" };
+        draw_text(bx + 10, by, bw - 34, bh, tn[filterType], clr_text(), 13);
+        arrowDown(bx + bw - 16, by + bh / 2, clr_dim());
+
+        int st = g_mcVersState.load();
+        if (st == 1) {
+            draw_text(bx + bw + 20, by, 400, bh, "正在获取版本清单…", clr_dim(), 12);
+        }
+
+        if (g_dlView.empty()) {
+            std::string msg = (st == 1) ? "正在加载…"
+                            : (st == 3) ? "没有获取到版本数据（检查网络）"
+                                        : "没有匹配的版本";
+            draw_text(x() + 20, y() + 120, w() - 40, 60, msg, clr_dim(), 13);
+            return;
+        }
+
+        std::vector<McVer> all;
+        snapshot(all);
+
+        int top = y() + ITEM_TOP();
+        int bot = y() + h() - 70;
+        fl_push_clip(listX(), top, listW(), bot - top);
+
+        for (int i = 0; i < (int)g_dlView.size(); ++i) {
+            int iy = itemY(i);
+            if (iy + ITEM_H < top || iy > bot) continue;
+
+            int gi = g_dlView[i];
+            if (gi < 0 || gi >= (int)all.size()) continue;
+            const McVer& v = all[gi];
+
+            bool sel = (i == selIdx);
+            fill_round_rect(listX(), iy + 3, listW(), ITEM_H - 6, 8,
+                            sel ? clr_card_sel() : clr_card());
+            if (sel) fill_round_rect(listX() + 2, iy + 11, 3, ITEM_H - 22, 0, clr_accent2());
+
+            draw_text(listX() + 18, iy + 3, listW() - 260, ITEM_H - 6,
+                      v.id, sel ? clr_text() : clr_dim(), 15);
+            draw_text_right(listX() + listW() - 200, iy + 3, 180, ITEM_H - 6,
+                            v.date, clr_dim(), 12);
+        }
+        fl_pop_clip();
+
+        // 滚动条
+        if (maxScroll() > 0) {
+            int vis = h() - ITEM_TOP() - 70;
+            int contentH = (int)g_dlView.size() * (ITEM_H + ITEM_GAP);
+            int barH = vis * vis / contentH;
+            if (barH < 30) barH = 30;
+            int barY = top + (vis - barH) * scroll / maxScroll();
+            fill_round_rect(x() + w() - 12, barY, 6, barH, 3, clr_card_sel());
+        }
+
+        // ---------- 展开的筛选下拉（最后画，盖在列表上面） ----------
+        if (filterDropOpen) {
+            int bx2, by2, bw2, bh2;
+            toolbarRect(0, bx2, by2, bw2, bh2);
+            int ih = 30;
+            int ly = by2 + bh2;
+            static const char* tn2[] = { "正式版", "快照版", "远古版", "所有版本" };
+            fill_round_rect(bx2, ly, bw2, 4 * ih + 8, 8, clr_card_sel());
+            stroke_round_rect(bx2, ly, bw2, 4 * ih + 8, 8, clr_accent());
+            for (int k = 0; k < 4; ++k) {
+                int ky = ly + 4 + k * ih;
+                bool hotK = inRect(bx2 + 2, ky, bw2 - 4, ih - 2, Fl::event_x(), Fl::event_y());
+                if (hotK)                 fill_round_rect(bx2 + 2, ky, bw2 - 4, ih - 2, 5, clr_accent2());
+                else if (k == filterType) fill_round_rect(bx2 + 2, ky, bw2 - 4, ih - 2, 5, clr_card());
+                Fl_Color tc = hotK ? FL_WHITE : (k == filterType ? clr_ok() : clr_text());
+                draw_text(bx2 + 12, ky, bw2 - 24, ih - 2, tn2[k], tc, 12);
+            }
+        }
+
+        if (!g_status.empty())
+            draw_text(x() + 20, y() + h() - 40, w() - 200, 24, g_status, clr_dim(), 12);
+    }
+
+    void drawDetail() {
+        int bx, by, bw, bh;
+        toolbarRect(1, bx, by, bw, bh);
+        bool hotBack = inRect(bx, by, bw, bh, Fl::event_x(), Fl::event_y());
+        fill_round_rect(bx, by, bw, bh, 6, hotBack ? clr_card_sel() : clr_card());
+        draw_text_center(bx, by, bw, bh, "返回", clr_text(), 13);
+
+        int cx = x() + 20, cw = w() - 40;
+
+        // 标题
+        draw_text(cx, y() + 66, cw - 120, 40, dId, clr_text(), 24);
+
+        // 类型标签
+        std::string tn = (dType == "release") ? "正式版"
+                       : (dType == "snapshot") ? "快照版"
+                       : (dType == "old_beta") ? "旧 Beta"
+                       : (dType == "old_alpha") ? "旧 Alpha" : dType;
+        int tagW = 62;
+        fill_round_rect(cx, y() + 112, tagW, 22, 5,
+                        (dType == "release") ? clr_ok() : clr_card_sel());
+        draw_text_center(cx, y() + 112, tagW, 22, tn, FL_WHITE, 11);
+
+        // 信息卡片
+        int iy = y() + 150;
+        int rowH = 34;
+        struct KV { const char* k; std::string v; Fl_Color c; };
+        std::vector<KV> rows;
+        rows.push_back({ "发布日期", dDate, clr_text() });
+        rows.push_back({ "加载器",   dLoader, clr_text() });
+
+        if (!dJavaVer.empty())
+            rows.push_back({ "需要 Java", dJavaVer + " 及以上", clr_text() });
+        if (dLibCount > 0)
+            rows.push_back({ "依赖库", std::to_string(dLibCount) + " 个", clr_text() });
+        if (dSizeAssets > 0) {
+            double mb = dSizeAssets / 1048576.0;
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%.1f MB", mb);
+            rows.push_back({ "客户端大小", buf, clr_text() });
+        }
+
+        for (size_t k = 0; k < rows.size(); ++k) {
+            draw_text(cx, iy, 110, rowH, rows[k].k, clr_dim(), 13);
+            draw_text(cx + 110, iy, cw - 110, rowH, rows[k].v, rows[k].c, 13);
+            iy += rowH;
+        }
+
+        if (!detailErr.empty()) {
+            draw_text(cx, iy + 10, cw, 30, detailErr, clr_err(), 12);
+            iy += 40;
+        }
+
+        if (!detailLoaded && detailErr.empty())
+            draw_text(cx, iy + 10, cw, 30, "正在读取版本信息…", clr_dim(), 12);
+
+        // ---------- 加载器选择 ----------
+        {
+            int lx = cx, ly = y() + h() - 168;
+            draw_text(lx, ly, 90, 30, "加载器", clr_dim(), 13);
+
+            int bx2 = lx + 76, by2 = ly + 2, bw2 = 200, bh2 = 28;
+            bool hotL = inRect(bx2, by2, bw2, bh2, Fl::event_x(), Fl::event_y());
+            fill_round_rect(bx2, by2, bw2, bh2, 6, hotL ? clr_card_sel() : clr_card());
+            draw_text(bx2 + 10, by2, bw2 - 34, bh2, kLoaderNames[loaderSel], clr_text(), 13);
+            arrowSmall(bx2 + bw2 - 17, by2 + 14, clr_dim());
+
+            // ---------- 加载器版本下拉 ----------
+            int vx = bx2 + bw2 + 10, vw = 180;
+            bool hasVersion = (loaderSel >= 1 && loaderSel <= 4);   // 只有真加载器有版本可选
+            bool hasPre = (loaderSel == 5 || loaderSel == 6);        // QSL / FabricAPI 也有版本
+
+            if (hasVersion || hasPre) {
+                if (!ldrVersLoaded || ldrVersFor != loaderSel || ldrVersMc != dId) {
+                    // 还没拉过：显示「加载中」并在下面立即触发
+                    fill_round_rect(vx, by2, vw, bh2, 6, clr_card());
+                    draw_text(vx + 10, by2, vw - 34, bh2, "点此加载版本…", clr_dim(), 12);
+                    loadLoaderVersions();
+                }
+
+                std::string vtext;
+                if (ldrSel >= 0 && ldrSel < (int)ldrVers.size()) vtext = ldrVers[ldrSel];
+                else if (!ldrVersErr.empty())                   vtext = ldrVersErr;
+                else                                            vtext = "（无可用版本）";
+
+                bool hotV = inRect(vx, by2, vw, bh2, Fl::event_x(), Fl::event_y());
+                fill_round_rect(vx, by2, vw, bh2, 6, hotV ? clr_card_sel() : clr_card());
+                draw_text(vx + 10, by2, vw - 34, bh2, vtext,
+                          ldrVers.empty() ? clr_err() : clr_text(), 12);
+                arrowSmall(vx + vw - 17, by2 + 14, clr_dim());
+
+                // 版本下拉展开
+                if (ldrVerOpen && !ldrVers.empty()) {
+                    int showN = (int)ldrVers.size() > 8 ? 8 : (int)ldrVers.size();
+                    int lh = showN * 26 + 8;
+                    int ly3 = by2 + bh2 + 2;
+                    if (ly3 + lh > y() + h() - 10) ly3 = by2 - lh - 2;
+                    fill_round_rect(vx, ly3, vw, lh, 8, clr_card_sel());
+                    stroke_round_rect(vx, ly3, vw, lh, 8, clr_accent());
+                    for (int k = 0; k < showN; ++k) {
+                        int i2 = k + ldrVerScroll;
+                        if (i2 >= (int)ldrVers.size()) break;
+                        int ky2 = ly3 + 4 + k * 26;
+                        bool hotK2 = inRect(vx + 2, ky2, vw - 4, 24, Fl::event_x(), Fl::event_y());
+                        if (hotK2)               fill_round_rect(vx + 2, ky2, vw - 4, 24, 5, clr_accent2());
+                        else if (i2 == ldrSel)   fill_round_rect(vx + 2, ky2, vw - 4, 24, 5, clr_card());
+                        Fl_Color tc2 = hotK2 ? FL_WHITE : (i2 == ldrSel ? clr_ok() : clr_text());
+                        draw_text(vx + 12, ky2, vw - 24, 24, ldrVers[i2], tc2, 12);
+                    }
+                }
+            }
+
+            // 当前选择的说明
+            std::string hint;
+            if (loaderSel == 0)      hint = "只装原版，不加任何加载器";
+            else if (loaderSel == 1) hint = "Fabric 加载器";
+            else if (loaderSel == 2) hint = "Quilt 加载器";
+            else if (loaderSel == 3) hint = "Forge 加载器";
+            else if (loaderSel == 4) hint = "NeoForge 加载器";
+            else if (loaderSel == 5) hint = "QSL 前置库（装到 Quilt 实例）";
+            else                     hint = "Fabric API 前置库（装到 Fabric 实例）";
+            draw_text(vx + vw + 14, by2, cw - bw2 - vw - 108, bh2, hint, clr_dim(), 11);
+
+            // 展开的下拉列表
+            if (loaderDropOpen) {
+                int listH = 7 * 28 + 8;
+                int ly2 = by2 + bh2 + 2;
+                if (ly2 + listH > y() + h() - 10) ly2 = by2 - listH - 2;
+                fill_round_rect(bx2, ly2, bw2, listH, 8, clr_card_sel());
+                stroke_round_rect(bx2, ly2, bw2, listH, 8, clr_accent());
+                for (int k = 0; k < 7; ++k) {
+                    int ky = ly2 + 4 + k * 28;
+                    bool hotK = inRect(bx2 + 2, ky, bw2 - 4, 26, Fl::event_x(), Fl::event_y());
+                    if (hotK)          fill_round_rect(bx2 + 2, ky, bw2 - 4, 26, 5, clr_accent2());
+                    else if (k == loaderSel) fill_round_rect(bx2 + 2, ky, bw2 - 4, 26, 5, clr_card());
+                    Fl_Color tc = hotK ? FL_WHITE : (k == loaderSel ? clr_ok() : clr_text());
+                    draw_text(bx2 + 12, ky, bw2 - 24, 26, kLoaderNames[k], tc, 12);
+                }
+            }
+        }
+
+        draw_text(cx, y() + h() - 108, cw, 24,
+                  "点右下角「下载并安装」把这个版本安装到本地", clr_dim(), 12);
+
+        if (!g_status.empty())
+            draw_text(cx, y() + h() - 40, cw - 200, 24, g_status, clr_dim(), 12);
+    }
+    // ==================== 模组页 ====================
+    // 进入页面就按「当前实例的 MC 版本 + 加载器」自动拉热门模组
+
+    void enterModTab() {
+        if (!modAutoLoaded) {
+            modAutoLoaded = true;
+            doModSearch("");
+        }
+    }
+
+    // 左侧分类栏
+    static const int CAT_W = 148;
+
+    // ===== 模组页工具栏统一坐标（绘制 / 点击 / 控件三处共用） =====
+    void modToolbar(int& btnX, int& boxX, int& srcX, int& boxW) const {
+        // 工具栏要避开顶部「版本/模组」标签（x+20 .. x+176）
+        int cx = x() + 20 + 2 * (TAB_W + 6) + 8;   // = x + 184
+        btnX = cx;                 // 搜索按钮
+        boxX = cx + 84;            // 搜索框
+        boxW = 240;
+        srcX = boxX + boxW + 10;   // 来源切换
+    }
+    static const char* kCatNames[5];
+
+    void catRect(int i, int& rx, int& ry, int& rw, int& rh) const {
+        rw = CAT_W - 4;
+        rh = 44;
+        rx = x() + 16;
+        ry = y() + 76 + i * (rh + 6);
+    }
+
+    void drawModTab() {
+        bool inDetail = (modDetail >= 0 && modDetail < (int)g_modHits.size());
+
+        // ---------- 左侧分类栏（详情页隐藏） ----------
+        if (!inDetail) {
+            draw_text(x() + 16, y() + 52, CAT_W, 20, "分类", clr_dim(), 11);
+            for (int i = 0; i < 5; ++i) {
+                int rx, ry, rw, rh;
+                catRect(i, rx, ry, rw, rh);
+                bool act = (g_modCat == i);
+                bool hot = inRect(rx, ry, rw, rh, Fl::event_x(), Fl::event_y());
+                if (act) {
+                    fill_round_rect(rx, ry, rw, rh, 8, clr_accent2());
+                    fill_round_rect(rx, ry + 8, 4, rh - 16, 0, FL_WHITE);
+                } else {
+                    fill_round_rect(rx, ry, rw, rh, 8, hot ? clr_card_sel() : clr_card());
+                }
+                draw_text(rx + 18, ry, rw - 26, rh, kCatNames[i],
+                          act ? FL_WHITE : clr_text(), act ? 15 : 14);
+            }
+        }
+
+        // 内容区：详情页占满，列表页在分类栏右侧
+        int cx = inDetail ? (x() + 24) : (x() + CAT_W + 16);
+        int cw = inDetail ? (w() - 48) : (w() - CAT_W - 36);
+
+
+        // ---------- 搜索按钮 / 搜索框 / 来源切换（统一坐标）----------
+        int sy = y() + TOOLBAR_Y;
+        int tBtnX, tBoxX, tSrcX, tBoxW;
+        modToolbar(tBtnX, tBoxX, tSrcX, tBoxW);
+
+        // 搜索按钮
+        {
+            int bbw = 76;
+            bool hotB = inRect(tBtnX, sy, bbw, 32, Fl::event_x(), Fl::event_y());
+            fill_round_rect(tBtnX, sy, bbw, 32, 6, hotB ? clr_accent() : clr_accent2());
+            draw_text_center(tBtnX, sy, bbw, 32, "搜索", FL_WHITE, 13);
+        }
+
+        // 搜索框由 modSearch 控件绘制，这里只画底色（控件在其上）
+        fill_round_rect(tBoxX, sy, tBoxW, 32, 6, clr_inputbg());
+
+        // 来源切换
+        {
+            const char* srcName = (g_modSource == 1) ? "CurseForge" : "Modrinth";
+            bool hotS = inRect(tSrcX, sy, 104, 32, Fl::event_x(), Fl::event_y());
+            fill_round_rect(tSrcX, sy, 104, 32, 6, hotS ? clr_card_sel() : clr_card());
+            draw_text(tSrcX + 8, sy, 90, 32, srcName, clr_dim(), 12);
+        }
+        // ---------- 模组详情 ----------
+        if (modDetail >= 0 && modDetail < (int)g_modHits.size()) {
+            drawModDetail(cx, cw);
+            return;
+        }
+
+        // ---------- 当前实例信息 ----------
+        std::string mc = CurrentMcVersion();
+        std::string ldr = CurrentLoaderTag();
+        std::string inst = (g_selVersion >= 0 && g_selVersion < (int)g_versions.size())
+                         ? g_versions[g_selVersion] : "（未选择实例）";
+        int top = y() + 62, bot = y() + h() - 30;
+
+        // ---------- 顶部：当前分类 + 实例信息 + 返回 ----------
+        draw_text(cx, top, 200, 22, kCatNames[g_modCat], clr_text(), 14);
+        draw_text(cx + 90, top, cw - 260, 22,
+                  "·  " + inst + "  ·  MC " + mc + " / " + ldr, clr_dim(), 11);
+
+        int listTop = top + 26;
+        int st = g_modState.load();
+
+        if (g_modHits.empty()) {
+            std::string msg = (st == 1) ? "正在获取模组列表…"
+                            : (st == 3) ? "没有找到模组（检查网络，或在搜索框输入关键词）"
+                                        : "点「搜索」获取模组";
+            draw_text(cx, listTop + 30, cw, 50, msg, clr_dim(), 13);
+            return;
+        }
+
+        // ---------- 模组列表（可滚动） ----------
+        const int ROW = 66;
+        int contentH = (int)g_modHits.size() * ROW;
+
+        fl_push_clip(cx, listTop, cw, bot - listTop);
+        for (int i = 0; i < (int)g_modHits.size(); ++i) {
+            int iy = listTop + i * ROW - modScroll;
+            if (iy + ROW < listTop || iy > bot) continue;
+
+            bool sel = (i == modSel);
+            fill_round_rect(cx, iy + 3, cw, ROW - 8, 8,
+                            sel ? clr_card_sel() : clr_card());
+            if (sel) fill_round_rect(cx + 2, iy + 11, 3, ROW - 26, 0, clr_accent2());
+
+            const ModHit& m = g_modHits[i];
+
+            // 标题（限制宽度，超出由 draw_text 自动加 …）
+            int textW = cw - 220;
+            if (textW < 80) textW = 80;
+            draw_text(cx + 16, iy + 6, textW, 24, m.title, clr_text(), 15);
+
+            // 简介（截断，不越界）
+            std::string desc = m.desc;
+            if (desc.size() > 84) desc = desc.substr(0, 82) + "…";
+            draw_text(cx + 16, iy + 30, textW, 22, desc, clr_dim(), 11);
+
+            // 下载量
+            draw_text_right(cx, iy + 6, cw - 24, 24,
+                            formatDownloads(m.downloads), clr_dim(), 11);
+
+            // 选择按钮
+            int dbx = cx + cw - 90, dby = iy + 14, dbw = 74, dbh = 30;
+            bool hotD = inRect(dbx, dby, dbw, dbh, Fl::event_x(), Fl::event_y());
+            fill_round_rect(dbx, dby, dbw, dbh, 6,
+                            hotD ? clr_accent() : clr_accent2());
+            draw_text_center(dbx, dby, dbw, dbh, "选择", FL_WHITE, 12);
+        }
+        fl_pop_clip();
+
+        drawScrollbar(cx, cw, listTop, bot, contentH, modScroll);
+
+        if (!g_status.empty())
+            draw_text(cx, y() + h() - 26, cw - 160, 22, g_status, clr_dim(), 11);
+    }
+
+    void drawModDetail(int cx, int cw) {
+        const ModHit& m = g_modHits[modDetail];
+
+        // 返回
+        int bbx = x() + w() - 110, bby = y() + TOOLBAR_Y, bbw = 90, bbh = 32;
+        bool hotBack = inRect(bbx, bby, bbw, bbh, Fl::event_x(), Fl::event_y());
+        fill_round_rect(bbx, bby, bbw, bbh, 6, hotBack ? clr_card_sel() : clr_card());
+        draw_text_center(bbx, bby, bbw, bbh, "返回", clr_text(), 13);
+
+        // 标题
+        draw_text(cx, y() + 62, cw - 130, 34, m.title, clr_text(), 20);
+
+        // 简介（限制两行高度）
+        std::string desc = m.desc;
+        if (desc.size() > 120) desc = desc.substr(0, 118) + "…";
+        draw_text(cx, y() + 98, cw - 20, 44, desc, clr_dim(), 12);
+
+        // 元信息
+        std::string mc = CurrentMcVersion();
+        std::string ldr = CurrentLoaderTag();
+        draw_text(cx, y() + 146, cw, 22,
+                  "下载量 " + formatDownloads(m.downloads) +
+                  "    ·    当前实例 MC " + mc + " / " + ldr,
+                  clr_dim(), 12);
+
+        // ---------- 版本列表 ----------
+        int vtop = y() + 180;
+        draw_text(cx, vtop, 240, 24,
+                  "可选版本 (" + std::to_string(g_modVerNames.size()) + ")",
+                  clr_dim(), 13);
+
+        int vst = g_modVerState.load();
+        int listTop = vtop + 28;
+        int listBot = y() + h() - 80;
+
+        if (vst == 1) {
+            draw_text(cx, listTop + 10, cw, 30, "正在获取版本列表…", clr_dim(), 12);
+        } else if (g_modVerNames.empty()) {
+            draw_text(cx, listTop + 10, cw, 50,
+                      "没有适配当前版本（" + mc + " / " + ldr + "）的模组文件",
+                      clr_err(), 12);
+        } else {
+            const int rowH = 36;
+            int contentH = (int)g_modVerNames.size() * rowH;
+
+            fl_push_clip(cx, listTop, cw, listBot - listTop);
+            for (int i = 0; i < (int)g_modVerNames.size(); ++i) {
+                int ry = listTop + i * rowH - modVerScroll;
+                if (ry + rowH < listTop || ry > listBot) continue;
+
+                bool sel = (i == modVerSel);
+                bool hot = inRect(cx, ry, cw, rowH - 4, Fl::event_x(), Fl::event_y());
+
+                fill_round_rect(cx, ry, cw, rowH - 4, 6,
+                                sel ? clr_card_sel() : (hot ? clr_card_sel() : clr_card()));
+                if (sel) fill_round_rect(cx + 2, ry + 6, 3, rowH - 16, 0, clr_accent2());
+
+                // 版本号（限制宽度）
+                std::string vn = g_modVerNames[i];
+                if (vn.size() > 90) vn = vn.substr(0, 88) + "…";
+                draw_text(cx + 16, ry, cw - 32, rowH - 4, vn,
+                          sel ? clr_text() : clr_dim(), 12);
+            }
+            fl_pop_clip();
+
+            drawScrollbar(cx, cw, listTop, listBot, contentH, modVerScroll);
+        }
+
+        // ---------- 下载按钮 ----------
+        int dbx = x() + w() - 170, dby = y() + h() - 60, dbw = 150, dbh = 42;
+        bool canDl = (modVerSel >= 0 && modVerSel < (int)g_modVerFiles.size());
+        bool hotD = canDl && inRect(dbx, dby, dbw, dbh, Fl::event_x(), Fl::event_y());
+        fill_round_rect(dbx, dby, dbw, dbh, 8,
+                        canDl ? (hotD ? clr_accent() : clr_accent2()) : clr_card());
+        draw_text_center(dbx, dby, dbw, dbh, "下载并安装",
+                         canDl ? FL_WHITE : clr_dim(), 14);
+
+        if (!g_status.empty())
+            draw_text(cx, y() + h() - 40, cw - 200, 24, g_status, clr_dim(), 12);
+    }
+
+    // 通用滚动条
+    void drawScrollbar(int cx, int cw, int top, int bot, int contentH, int scroll) {
+        int vis = bot - top;
+        if (contentH <= vis || vis < 10) return;
+        int barH = vis * vis / contentH;
+        if (barH < 30) barH = 30;
+        if (barH > vis) barH = vis;
+        int maxS = contentH - vis;
+        if (maxS < 1) return;
+        int barY = top + (vis - barH) * scroll / maxS;
+        if (barY < top) barY = top;
+        if (barY + barH > bot) barY = bot - barH;
+        fill_round_rect(x() + w() - 10, barY, 6, barH, 3, clr_card_sel());
+    }
+
+    // 触发模组搜索（UI 线程同步，1~2 秒）
+    void doModSearch(const std::string& q) {
+        std::string query = q;
+        if (query.empty() && modSearch) query = modSearch->value();
+        modQuery = query;
+
+        g_modState = 1;
+        { std::lock_guard<std::mutex> lk(g_modHitsMutex); g_modHits.clear(); }
+        modSel = -1;
+        modDetail = -1;
+        modScroll = 0;
+        modErr.clear();
+        modVerSel = -1;
+        redraw();
+
+        // ★ 后台搜索（不阻塞 UI，切到模组页不卡）
+        int gen = ++g_modGen;
+        std::thread([query, gen]() { FetchModSearchThread(query, gen); }).detach();
+    }
+
+    // 打开模组详情并拉取版本
+    void openModDetail(int idx) {
+        if (idx < 0 || idx >= (int)g_modHits.size()) return;
+        modDetail = idx;
+        modVerSel = -1;
+        modVerScroll = 0;
+        modDetailSlug = g_modHits[idx].slug;
+        { std::lock_guard<std::mutex> lk(g_modVerMutex); g_modVerNames.clear(); g_modVerFiles.clear(); }
+
+        // ★ 后台拉取版本列表（不阻塞 UI，避免点开就卡）
+        int gen = ++g_modVerGen;
+        std::string slug = modDetailSlug;
+        std::thread([slug, gen]() { FetchModVersThread(slug, gen); }).detach();
+        redraw();
+    }
+
+    // 下载选中的模组版本
+    void installModVersion() {
+        if (modVerSel < 0 || modVerSel >= (int)g_modVerFiles.size()) return;
+        const std::string& packed = g_modVerFiles[modVerSel];
+        size_t nl = packed.find('\n');
+        if (nl == std::string::npos) return;
+        std::string url  = packed.substr(0, nl);
+        std::string fnam = packed.substr(nl + 1);
+        if (url.empty() || fnam.empty()) return;
+
+        g_modDetailTitle = g_modHits[modDetail].title;
+        std::thread([url, fnam]() { InstallModVersionThread(url, fnam); }).detach();
+        g_status = L"正在下载：" + U8ToW(fnam);
+        redraw();
+    }
+
+    static std::string formatDownloads(long long n) {
+        if (n >= 100000000) return std::to_string(n / 100000000) + "亿+";
+        if (n >= 10000) {
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%.1f万", n / 10000.0);
+            return buf;
+        }
+        return std::to_string(n);
+    }
+
+
+
+    static void arrowSmall(int cx, int cy, Fl_Color c) {
+        fl_color(c);
+        fl_begin_polygon();
+        fl_vertex(cx - 4, cy - 2);
+        fl_vertex(cx + 4, cy - 2);
+        fl_vertex(cx,     cy + 3);
+        fl_end_polygon();
+    }
+
+    static void arrowDown(int cx, int cy, Fl_Color c) {
+        fl_color(c);
+        fl_begin_polygon();
+        fl_vertex(cx - 5, cy - 3);
+        fl_vertex(cx + 5, cy - 3);
+        fl_vertex(cx,     cy + 4);
+        fl_end_polygon();
+    }
+
+    // ---------- 事件 ----------
+    int handle(int e) override {
+        // ★ 先给子控件（输入框）机会，否则它们永远收不到 PUSH，无法获得焦点
+        if (e == FL_PUSH || e == FL_DRAG || e == FL_RELEASE ||
+            e == FL_KEYBOARD || e == FL_KEYUP || e == FL_FOCUS || e == FL_UNFOCUS) {
+            if (PageBase::handle(e)) return 1;
+        }
+
+        int mx = Fl::event_x(), my = Fl::event_y();
+
+        // 移动类事件不改状态（只在 PUSH 里处理点击）
+        if (e != FL_PUSH || Fl::event_button() != FL_LEFT_MOUSE) {
+            if (e == FL_MOVE || e == FL_ENTER || e == FL_LEAVE) { redraw(); return 1; }
+            if (e == FL_MOUSEWHEEL) {
+                if (dlTab == 1 && modDetail < 0) {
+                    int maxS = (int)g_modHits.size() * 66 - (h() - 92);
+                    if (maxS < 0) maxS = 0;
+                    modScroll += Fl::event_dy() * 40;
+                    if (modScroll < 0) modScroll = 0;
+                    if (modScroll > maxS) modScroll = maxS;
+                    redraw();
+                    return 1;
+                }
+            }
+            return PageBase::handle(e);
+        }
+
+        // ========== 顶部标签：版本 / 模组 ==========
+        for (int i = 0; i < 2; ++i) {
+            int tx, ty, tw, th;
+            dlTabRect(i, tx, ty, tw, th);
+            if (inRect(tx, ty, tw, th, mx, my)) {
+                dlTab = i;
+                syncSearchVisible();
+                if (dlTab == 1) enterModTab();   // 首次进模组页自动拉热门列表
+                redraw();
+                return 1;
+            }
+        }
+
+        // ========== 模组页点击 ==========
+        if (dlTab == 1) {
+
+            // ---------- 左侧分类栏 ----------
+            for (int k = 0; k < 5; ++k) {
+                int rx, ry, rw, rh;
+                catRect(k, rx, ry, rw, rh);
+                if (inRect(rx, ry, rw, rh, mx, my)) {
+                    if (g_modCat != k) {
+                        g_modCat = k;
+                        doModSearch(modSearch ? modSearch->value() : "");
+                    }
+                    return 1;
+                }
+            }
+
+            int cx = x() + CAT_W + 16, cw = w() - CAT_W - 36;
+
+            // 模组详情里的返回
+            if (modDetail >= 0) {
+                int bbx = x() + w() - 110, bby = y() + TOOLBAR_Y, bbw = 90, bbh = 32;
+                if (inRect(bbx, bby, bbw, bbh, mx, my)) {
+                    modDetail = -1;
+                    modVerSel = -1;
+                    redraw();
+                    return 1;
+                }
+                // 版本选择
+                int vtop = y() + 180 + 30;
+                int rowH = 34;
+                int maxRows = (y() + h() - vtop - 90) / rowH;
+                if (maxRows < 1) maxRows = 1;
+                for (int i = 0; i < (int)g_modVerNames.size() && i < maxRows; ++i) {
+                    int ry = vtop + i * rowH;
+                    if (inRect(cx, ry, cw, rowH - 4, mx, my)) {
+                        modVerSel = i;
+                        redraw();
+                        return 1;
+                    }
+                }
+                // 下载按钮
+                int dbx = x() + w() - 170, dby = y() + h() - 60, dbw = 150, dbh = 42;
+                if (inRect(dbx, dby, dbw, dbh, mx, my)) {
+                    installModVersion();
+                    return 1;
+                }
+                return 1;
+            }
+
+            // 搜索按钮 / 来源切换（统一坐标）
+            int sy = y() + TOOLBAR_Y;
+            int tBtnX, tBoxX, tSrcX, tBoxW;
+            modToolbar(tBtnX, tBoxX, tSrcX, tBoxW);
+            if (inRect(tBtnX, sy, 76, 32, mx, my)) {
+                doModSearch("");
+                return 1;
+            }
+            if (inRect(tSrcX, sy, 104, 32, mx, my)) {
+                g_modSource = (g_modSource == 0) ? 1 : 0;
+                doModSearch(modSearch ? modSearch->value() : "");
+                return 1;
+            }
+
+            // ---------- 模组卡片 / 选择按钮 ----------
+            int top = y() + 62;
+            int listTop = top + 26;   // 与 drawModTab 保持一致
+            for (int i = 0; i < (int)g_modHits.size(); ++i) {
+                int iy = listTop + i * 66 - modScroll;
+                if (iy + 60 < listTop) continue;
+                if (iy > y() + h() - 30) break;
+
+                int dbx = cx + cw - 90, dby = iy + 14, dbw = 74, dbh = 30;
+                if (inRect(dbx, dby, dbw, dbh, mx, my)) {
+                    modSel = i;
+                    openModDetail(i);
+                    return 1;
+                }
+                if (inRect(cx, iy + 3, cw, 58, mx, my)) {
+                    modSel = i;
+                    openModDetail(i);
+                    return 1;
+                }
+            }
+            return 1;
+        }
+        // ========== 版本页点击 ==========
+        if (dlTab == 0) {
+            // MC 版本详情页：返回按钮
+            if (detailIdx >= 0) {
+                int bx, by, bw, bh;
+                toolbarRect(1, bx, by, bw, bh);
+                if (inRect(bx, by, bw, bh, mx, my)) {
+                    detailIdx = -1;
+                    syncSearchVisible();
+                    redraw();
+                    return 1;
+                }
+            }
+
+            // ========== 详情页的加载器 / 版本下拉（优先处理）==========
+            if (detailIdx >= 0) {
+                int cx = x() + 20, cw = w() - 40;
+                int lx = cx, ly = y() + h() - 168;
+                int bx2 = lx + 76, by2 = ly + 2, bw2 = 200, bh2 = 28;
+                int vx = bx2 + bw2 + 10, vw = 180;
+
+                // ---------- 版本下拉已展开 ----------
+                if (ldrVerOpen) {
+                    int showN = (int)ldrVers.size() > 8 ? 8 : (int)ldrVers.size();
+                    int lh = showN * 26 + 8;
+                    int ly3 = by2 + bh2 + 2;
+                    if (ly3 + lh > y() + h() - 10) ly3 = by2 - lh - 2;
+                    if (mx >= vx && mx < vx + vw && my >= ly3 && my < ly3 + lh) {
+                        int k = (my - ly3 - 4) / 26;
+                        int i2 = k + ldrVerScroll;
+                        if (i2 >= 0 && i2 < (int)ldrVers.size()) {
+                            ldrSel = i2;
+                            ldrVerOpen = false;
+                            redraw();
+                        }
+                        return 1;
+                    }
+                    ldrVerOpen = false;
+                    redraw();
+                    return 1;
+                }
+
+                // ---------- 加载器下拉已展开 ----------
+                if (loaderDropOpen) {
+                    int listH = 7 * 28 + 8;
+                    int ly2 = by2 + bh2 + 2;
+                    if (ly2 + listH > y() + h() - 10) ly2 = by2 - listH - 2;
+                    if (mx >= bx2 && mx < bx2 + bw2 && my >= ly2 && my < ly2 + listH) {
+                        int k = (my - ly2 - 4) / 28;
+                        if (k >= 0 && k < 7) {
+                            if (loaderSel != k) {
+                                loaderSel = k;
+                                ldrVersLoaded = false;   // 换了加载器要重新拉版本
+                                ldrVers.clear();
+                                ldrSel = -1;
+                                ldrVersErr.clear();
+                            }
+                            loaderDropOpen = false;
+                            redraw();
+                        }
+                        return 1;
+                    }
+                    loaderDropOpen = false;
+                    redraw();
+                    return 1;
+                }
+
+                // ---------- 点加载器框 → 展开 ----------
+                if (inRect(bx2, by2, bw2, bh2, mx, my)) {
+                    loaderDropOpen = true;
+                    redraw();
+                    return 1;
+                }
+
+                // ---------- 点版本框 → 展开 ----------
+                if (loaderSel >= 1) {
+                    if (inRect(vx, by2, vw, bh2, mx, my)) {
+                        if (ldrVers.empty()) loadLoaderVersions();   // 首次点先拉取
+                        ldrVerOpen = !ldrVerOpen;
+                        ldrVerScroll = 0;
+                        redraw();
+                        return 1;
+                    }
+                }
+            }
+
+            // 返回按钮（详情页）
+            if (detailIdx >= 0) {
+                int bx, by, bw, bh;
+                toolbarRect(1, bx, by, bw, bh);
+                if (inRect(bx, by, bw, bh, mx, my)) {
+                    detailIdx = -1;
+                    redraw();
+                    return 1;
+                }
+            }
+
+            // ---------- 版本类型下拉 ----------
+            int bx, by, bw, bh;
+            toolbarRect(0, bx, by, bw, bh);
+
+            // 展开时：先判断点在哪一项
+            if (filterDropOpen) {
+                int ih = 30;
+                if (mx >= bx && mx < bx + bw && my >= by + bh && my < by + bh + 4 * ih) {
+                    int k = (my - by - bh) / ih;
+                    if (k >= 0 && k < 4) {
+                        filterType = k;
+                        filterDropOpen = false;
+                        rebuild();
+                        return 1;
+                    }
+                }
+                filterDropOpen = false;
+                redraw();
+                return 1;
+            }
+
+            if (inRect(bx, by, bw, bh, mx, my)) {
+                filterDropOpen = true;
+                redraw();
+                return 1;
+            }
+
+            // 列表项
+            if (detailIdx < 0 && my >= y() + ITEM_TOP() && my < y() + h() - 70) {
+                int i = (my - y() - ITEM_TOP() + scroll) / (ITEM_H + ITEM_GAP);
+                if (i >= 0 && i < (int)g_dlView.size()) {
+                    openDetail(i);
+                    return 1;
+                }
+            }
+            return 1;
+        }
+
+    }
+};
+
+
+const char* PageDownload::kCatNames[5] = {
+    "Mod", "整合包", "数据包", "资源包", "光影包"
+};
+
+const char* PageDownload::kLoaderNames[7] = {
+    "原版", "Fabric", "Quilt", "Forge", "NeoForge", "QSL", "Fabric API"
+};
+
+// ============================ 实例页 ============================
+class PageInstance : public PageBase {
+public:
+    RowList* list = nullptr;
+    RoundButton* btnRefresh = nullptr;
+    RoundButton* btnLaunch = nullptr;
+
+    PageInstance(int W, int H) : PageBase(W, H) {
+        list = new RowList(0, 0, W - 40, H - 150);
+        list->setRowHeight(48);
+        list->setDrawer([this](RowList* self, int idx, int rx, int ry, int rw, int rh, bool sel) {
+            fill_round_rect(rx, ry + 4, rw, rh - 8, 8, sel ? clr_card_sel() : clr_card());
+            if (sel) fill_round_rect(rx + 2, ry + 10, 3, rh - 20, 0, clr_accent2());
+            draw_text(rx + 18, ry + 4, rw - 36, rh - 8, self->label(idx),
+                      sel ? clr_text() : clr_dim(), 15);
+        });
+        list->callback([](Fl_Widget* w, void*) {
+            int i = ((RowList*)w)->value();
+            if (i >= 0 && i < (int)g_versions.size()) {
+                g_selVersion = i;
+                g_status = L"已切换到实例：" + U8ToW(g_versions[i]);
+            }
+        });
+        addTo(this, list, 20, 56);
+
+        btnRefresh = new RoundButton(0, 0, 100, 32, "刷新");
+        btnRefresh->callback([](Fl_Widget*, void* d) {
+    ReloadVersions();
+            ((PageInstance*)d)->refresh();
+            g_status = L"实例列表已刷新";
+        }, this);
+        addTo(this, btnRefresh, W - 120, 14);
+
+        btnLaunch = new RoundButton(0, 0, 150, 42, "启动此实例", true);
+        btnLaunch->callback([](Fl_Widget*, void*) { launchSelected(); });
+        addTo(this, btnLaunch, W - 170, H - 60);
+
+        end();
+        refresh();
+    }
+
+    void resize(int X, int Y, int W, int H) override {
+        PageBase::resize(X, Y, W, H);
+        if (list)       list->resize(X + 20, Y + 56, W - 40, H - 150);
+        if (btnRefresh) btnRefresh->resize(X + W - 120, Y + 14, 100, 32);
+        if (btnLaunch)  btnLaunch->resize(X + W - 170, Y + H - 60, 150, 42);
+    }
+
+    void refresh() override {
+        if (!list) return;
+        list->clear();
+        for (auto& v : g_versions) list->add(v);
+        list->value(g_selVersion);
+        redraw();
+    }
+
+    void draw() override {
+        fill_round_rect(x(), y(), w(), h(), 0, clr_bg());
+        draw_text(x() + 20, y() + 16, 300, 28,
+                  "实例 (" + std::to_string(g_versions.size()) + ")", clr_text(), 15);
+        if (g_versions.empty())
+            draw_text(x() + 20, y() + 90, 600, 24,
+                      "没有找到实例，请在「设置」里检查游戏目录", clr_err(), 13);
+        if (!g_status.empty())
+            draw_text(x() + 20, y() + h() - 40, w() - 200, 24, g_status, clr_dim(), 12);
+        PageBase::draw();
+    }
+};
+
+// ============================ 用户页 ============================
+class ModeBtn : public Fl_Button {
+public:
+    int idx_;
+    ModeBtn(int X, int Y, int W, int H, const char* L, int i)
+        : Fl_Button(X, Y, W, H, L), idx_(i) { box(FL_NO_BOX); }
+    void draw() override {
+        bool act = (idx_ == g_userMode);
+        bool hot = (Fl::belowmouse() == this);
+        fill_round_rect(x(), y(), w(), h(), 8, (act || hot) ? clr_card_sel() : clr_card());
+        draw_text_center(x(), y(), w(), h(), label() ? label() : "",
+                         act ? clr_text() : clr_dim(), 15);
+    }
+};
+
+class PageUser : public PageBase {
+public:
+    ModeBtn* modeBtn[3] = { nullptr, nullptr, nullptr };
+    RoundInput* edServer = nullptr;
+    RoundInput* edUser   = nullptr;
+    RoundInput* edPass   = nullptr;
+    RoundButton* btnGo   = nullptr;
+    RowList* accList     = nullptr;
+    int lastMode_        = -1;
+
+    PageUser(int W, int H) : PageBase(W, H) {
+        const char* names[3] = { "第三方登录", "离线登录", "微软登录" };
+        for (int i = 0; i < 3; ++i) {
+            modeBtn[i] = new ModeBtn(0, 0, 140, 36, names[i], i);
+            modeBtn[i]->callback([](Fl_Widget* w, void* d) {
+                g_userMode = ((ModeBtn*)w)->idx_;
+                ((PageUser*)d)->syncMode();
+            }, this);
+            addTo(this, modeBtn[i], 30 + i * 150, 20);
+        }
+
+        edServer = new RoundInput(0, 0, 340, 34);
+        edServer->value("https://littleskin.cn/api/yggdrasil");
+        addTo(this, edServer, 110, 84);
+
+        edUser = new RoundInput(0, 0, 260, 34);
+        edUser->value(g_cfg.playerName.c_str());
+        addTo(this, edUser, 110, 130);
+
+        edPass = new RoundInput(0, 0, 260, 34);
+        edPass->type(FL_SECRET_INPUT);
+        addTo(this, edPass, 110, 176);
+
+        btnGo = new RoundButton(0, 0, 150, 40, "登录", true);
+        btnGo->callback([](Fl_Widget*, void* d) { ((PageUser*)d)->doLogin(); }, this);
+        addTo(this, btnGo, 110, 226);
+
+        accList = new RowList(0, 0, 320, H - 120);
+        accList->setRowHeight(40);
+        accList->setDrawer([](RowList* self, int idx, int rx, int ry, int rw, int rh, bool sel) {
+            fill_round_rect(rx, ry + 3, rw, rh - 6, 6, sel ? clr_card_sel() : clr_card());
+            if (sel) fill_round_rect(rx + 2, ry + 8, 3, rh - 16, 0, clr_accent2());
+            draw_text(rx + 16, ry + 3, rw - 130, rh - 6, self->label(idx),
+                      sel ? clr_text() : clr_dim(), 14);
+            draw_text_right(rx + rw - 110, ry + 3, 90, rh - 6, self->sub(idx), clr_dim(), 11);
+        });
+        accList->callback([](Fl_Widget* w, void*) {
+            int i = ((RowList*)w)->value();
+            if (i >= 0 && i < (int)g_cfg.accounts.size()) {
+                SelectAccount(i);
+                g_status = L"已切换账户：" + U8ToW(g_cfg.accounts[i].name);
+            }
+        });
+        addTo(this, accList, W - 350, 84);
+
+        end();
+        syncMode();
+        refresh();
+    }
+
+    void resize(int X, int Y, int W, int H) override {
+        PageBase::resize(X, Y, W, H);
+        for (int i = 0; i < 3; ++i)
+            if (modeBtn[i]) modeBtn[i]->resize(X + 30 + i * 150, Y + 20, 140, 36);
+        if (edServer) edServer->resize(X + 110, Y + 84, 340, 34);
+        if (edUser)   edUser->resize(X + 110, Y + 130, 260, 34);
+        if (edPass)   edPass->resize(X + 110, Y + 176, 260, 34);
+        if (btnGo)    btnGo->resize(X + 110, Y + 226, 150, 40);
+        if (accList)  accList->resize(X + W - 350, Y + 84, 320, H - 120);
+    }
+
+    void syncMode() {
+        lastMode_ = g_userMode;
+        bool third = (g_userMode == 0);
+        bool ms    = (g_userMode == 2);
+
+        if (edServer) { if (third) edServer->show(); else edServer->hide(); }
+        if (edPass)   { if (third) edPass->show();   else edPass->hide(); }
+        if (edUser)   { if (!ms)   edUser->show();   else edUser->hide(); }
+        if (btnGo) {
+            btnGo->label(third ? "登录" : (ms ? "开始微软登录" : "创建账号"));
+            btnGo->redraw();
+        }
+        for (int i = 0; i < 3; ++i) if (modeBtn[i]) modeBtn[i]->redraw();
+        redraw();
+    }
+
+    void doLogin() {
+        if (g_userMode == 0) {
+            std::string srv = edServer ? edServer->value() : "";
+            std::string usr = edUser ? edUser->value() : "";
+            std::string pwd = edPass ? edPass->value() : "";
+            if (srv.empty() || usr.empty()) { g_status = L"服务器地址和用户名不能为空"; redraw(); return; }
+            g_status = L"正在登录…";
+            redraw();
+            std::thread([srv, usr, pwd]() {
+                std::string err;
+                if (ThirdPartyLogin(srv, usr, pwd, err)) g_status = L"登录成功：" + U8ToW(g_cfg.authName);
+                else                                     g_status = L"登录失败：" + U8ToW(err);
+            }).detach();
+        } else if (g_userMode == 1) {
+            std::string usr = edUser ? edUser->value() : "";
+            if (usr.empty()) { g_status = L"玩家名不能为空"; redraw(); return; }
+            CreateOfflineAccount(usr);
+            g_status = L"已创建离线账户：" + U8ToW(usr);
+        } else {
+            g_status = L"正在启动微软登录…";
+            redraw();
+            std::thread([]() { MicrosoftLoginThread(); }).detach();
+        }
+        redraw();
+    }
+
+    void refresh() override {
+        if (lastMode_ != g_userMode) syncMode();
+        if (accList) {
+            accList->clear();
+            for (auto& a : g_cfg.accounts) {
+                const char* ty = a.type == "microsoft" ? "微软"
+                               : a.type == "thirdparty" ? "外置" : "离线";
+                accList->add(a.name, ty);
+            }
+            accList->value(g_cfg.activeAcc);
+        }
+        redraw();
+    }
+
+    void draw() override {
+        fill_round_rect(x(), y(), w(), h(), 0, clr_bg());
+
+        bool third = (g_userMode == 0);
+        int rx = x() + 110;
+        int lx = x() + 30;
+        if (third) {
+            draw_text(lx, y() + 84, 80, 34, "服务器", clr_dim(), 13);
+            draw_text(lx, y() + 130, 80, 34, "用户名", clr_dim(), 13);
+            draw_text(lx, y() + 176, 80, 34, "密码", clr_dim(), 13);
+        } else if (g_userMode == 1) {
+            draw_text(lx, y() + 130, 80, 34, "玩家名", clr_dim(), 13);
+        } else {
+            draw_text(lx, y() + 84, w() - 60, 80,
+                      "微软登录会打开浏览器，按提示输入验证码完成授权。", clr_dim(), 13);
+        }
+
+        draw_text(x() + 30, y() + h() - 200, 200, 22,
+                  "账户 (" + std::to_string(g_cfg.accounts.size()) + ")", clr_dim(), 12);
+
+        if (!g_status.empty())
+            draw_text(x() + 30, y() + h() - 40, w() - 60, 24, g_status, clr_dim(), 12);
+
+        PageBase::draw();
+    }
+};
+
+// ============================ 设置页 ============================
+//  纯自绘：点整行任意位置都能展开下拉；内存/线程可直接手动输入数字
+class PageSettings : public PageBase {
+public:
+    int openDrop = -1;      // -1=无  0=游戏目录 1=Java 2=下载源 3=窗口 4=隔离
+    bool draggingSlider = false;   // 滑条是否正在拖动
+    int dropScroll = 0;
+    std::vector<Cand> dirCands, javaCands;
+    std::string jvCache_, jvFor_;
+    // 当前活动实例（供全局鼠标钩子使用）
+    static PageSettings* active;
+
+    // 全局鼠标钩子：滑条拖动时绕过 FLTK 的控件内派发
+    static int globalHook(int e) {
+        if (!active) return 0;
+
+        // ===== 数字输入中：全局接管键盘 =====
+        if (active->editing >= 0) {
+            if (e == FL_KEYBOARD) {
+                int k = Fl::event_key();
+                if (k == FL_Enter || k == FL_KP_Enter) { active->commitEdit(); return 1; }
+                if (k == FL_Escape) { active->editing = -1; active->editBuf.clear(); active->redraw(); return 1; }
+                if (k == FL_BackSpace) {
+                    if (!active->editBuf.empty()) active->editBuf.pop_back();
+                    active->redraw(); return 1;
+                }
+                if (k == FL_Delete) { active->editBuf.clear(); active->redraw(); return 1; }
+                const char* tx = Fl::event_text();
+                if (tx && *tx) {
+                    for (const char* q = tx; *q; ++q)
+                        if (active->editing >= 2) {
+                            if (*q >= 0x20 && *q < 0x7F && active->editBuf.size() < 200) active->editBuf += *q;
+                        } else {
+                            if (*q >= 0x30 && *q <= 0x39 && active->editBuf.size() < 6) active->editBuf += *q;
+                        }
+                    active->redraw();
+                }
+                return 1;
+            }
+            if (e == FL_PUSH) {
+                int fx, fw;
+                active->fieldRect(fx, fw);
+                int ry0 = active->y() + active->rowY(PageSettings::ROW_MEM);
+                bool onMem = PageSettings::inRect(fx, ry0, fw, 34, Fl::event_x(), Fl::event_y());
+                if (!onMem) { active->commitEdit(); }
+            }
+            return 0;
+        }
+
+        // ===== 滑条拖动中：接管鼠标移动 =====
+        if (!active->draggingSlider) return 0;
+        if (e == FL_DRAG || e == FL_MOVE) {
+            int fx, fw;
+            active->fieldRect(fx, fw);
+            active->sliderFromX(Fl::event_x(), fx, fw);
+            return 1;
+        }
+        if (e == FL_PUSH) return 1;   // 拖动中吞掉按下，避免误触别的行
+        if (e == FL_RELEASE) {
+            active->draggingSlider = false;
+            SaveConfig();
+            active->redraw();
+            return 1;
+        }
+        return 0;
+    }
+
+
+    // 数字输入状态：-1=无  0=内存  1=线程
+    int editing = -1;
+    std::string editBuf;
+
+    static const int LABEL_W = 110;
+    static const int FIELD_X = 130;
+    static const int FIELD_W = 380;
+    static const int ROW_H   = 46;
+    static const int ROW_TOP = 76;
+    static const int ARROW_W = 30;
+
+    // 0=游戏目录 1=Java 2=内存 3=线程 4=下载源 5=窗口 6=隔离
+    // 7=额外JVM参数 8=额外游戏参数 9=CF中转站 10=authlib
+    static const int ROW_DIR = 0, ROW_JAVA = 1, ROW_MEM = 2,
+                     ROW_THREAD = 3, ROW_SRC = 4, ROW_WIN = 5, ROW_ISO = 6,
+                     ROW_JVM = 7, ROW_GAMEARG = 8, ROW_CF = 9, ROW_AUTHLIB = 10;
+    static const int ROW_COUNT = 11;
+
+    static const char* kSourceOpts[3];
+    static const char* kWinOpts[3];
+    static const char* kIsoOpts[3];
+
+    PageSettings(int W, int H) : PageBase(W, H) { end(); }
+
+    // 行 y 坐标（含滚动偏移）
+    int rowY(int i) const { return ROW_TOP + i * ROW_H - pageScroll; }
+
+    // 物理内存（MB）
+    static long long totalRamMB() {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms)) return (long long)(ms.ullTotalPhys / 1048576ULL);
+        return 8192;
+    }
+
+    // 推荐内存：物理内存 × 50%，夹在 1024 ~ 该机器上限之间
+    static int recommendedMem() {
+        long long ram = totalRamMB();
+        long long rec = ram / 2;
+        if (rec > 32768) rec = 32768;
+        long long lo = 1024;
+        if (rec < lo) rec = lo;
+        // 向上取到 512 的倍数，更好看
+        rec = ((rec + 511) / 512) * 512;
+        return (int)rec;
+    }
+
+    static bool inRect(int rx, int ry, int rw, int rh, int mx, int my) {
+        return mx >= rx && mx < rx + rw && my >= ry && my < ry + rh;
+    }
+
+    void reload() {
+        RefreshDirCands();
+        dirCands = g_dirCands;
+        RefreshJavaCands();
+        javaCands = g_javaCands;
+        jvFor_.clear(); jvCache_.clear();
+    }
+
+    // 页面切换时复位下拉/编辑状态（防止切走后残留导致「没点自己展开」）
+    void onShown() override {
+        openDrop = -1;
+        dropScroll = 0;
+        editing = -1;
+        editBuf.clear();
+        draggingSlider = false;
+        redraw();
+    }
+
+    void resetState() {
+        openDrop = -1;
+        dropScroll = 0;
+        editing = -1;
+        editBuf.clear();
+        draggingSlider = false;
+        redraw();
+    }
+
+    void onHidden() override { resetState(); }
+
+    void refresh() override {
+        if (dirCands.empty() && javaCands.empty()) reload();
+        redraw();
+    }
+
+    std::string javaVerText() {
+        if (g_cfg.javaPath.empty()) return "";
+        if (jvFor_ != g_cfg.javaPath) {
+            jvFor_ = g_cfg.javaPath;
+            jvCache_ = JavaVersionOf(fs::u8path(g_cfg.javaPath));
+        }
+        return jvCache_;
+    }
+
+    int dropCount() const {
+        switch (openDrop) {
+            case ROW_DIR:  return (int)dirCands.size();
+            case ROW_JAVA: return (int)javaCands.size();
+            case ROW_SRC:  return 3;
+            case ROW_WIN:  return 3;
+            case ROW_ISO:  return 3;
+            default: return 0;
+        }
+    }
+
+    void fieldRect(int& fx, int& fw) const {
+        fx = x() + FIELD_X;
+        fw = FIELD_W;
+        if (fx + fw > x() + w() - 24) fw = x() + w() - 24 - fx;
+        if (fw < 160) fw = 160;
+    }
+
+    // 内容总高度：7 行 + 标题 + 底部按钮 + 间距
+    int contentHeight() override {
+        // 末尾留出底部按钮的高度，保证最后一行能滚到按钮上方
+        return ROW_TOP + ROW_COUNT * ROW_H + 96;
+    }
+
+    // 统一的滚轮
+    bool pageWheel(int e, int dy) { return handlePageWheel(e, dy); }
+
+    // ============ 绘制 ============
+    void draw() override {
+        fill_round_rect(x(), y(), w(), h(), 0, clr_bg());
+
+        int fx, fw;
+        fieldRect(fx, fw);
+
+        draw_text(x() + 30, y() + 26, 300, 30, "设置", clr_text(), 20);
+
+        const char* labels[ROW_COUNT] = {
+            "游戏目录", "Java 路径", "最大内存", "下载线程", "下载源", "窗口模式", "版本隔离",
+            "额外 JVM 参数", "额外游戏参数", "CF 中转站", "authlib-injector"
+        };
+
+        // 行区域裁剪：内容超出时只在可视区内绘制（底部按钮固定）
+        int rowsTop = y() + 66;
+        int rowsBot = y() + h() - 76;
+        fl_push_clip(x(), rowsTop, w(), rowsBot - rowsTop);
+
+        for (int i = 0; i < ROW_COUNT; ++i) {
+            int ry = y() + rowY(i);
+            draw_text(x() + 30, ry, LABEL_W, 34, labels[i], clr_dim(), 14);
+            int editRow = (editing == 0) ? ROW_MEM
+                        : (editing == 1) ? ROW_THREAD
+                        : (editing == 2) ? ROW_JVM
+                        : (editing == 3) ? ROW_GAMEARG
+                        : (editing == 4) ? ROW_CF : -1;
+            bool isEdit = (editing >= 0 && i == editRow);
+            fill_round_rect(fx, ry, fw, 34, 6,
+                            isEdit ? clr_card_sel() : clr_inputbg());
+
+            std::string val;
+            Fl_Color vc = clr_text();
+            std::string jvArg;
+            int jvW = 0;
+
+            if (isEdit) {
+                val = editBuf;
+                val += "_";   // 光标
+            } else {
+                switch (i) {
+                    case ROW_DIR:    val = g_cfg.gameDir; break;
+                    case ROW_JAVA:
+                        val = g_cfg.javaPath;
+                        jvArg = javaVerText();
+                        break;
+                    case ROW_MEM:    val = std::to_string(g_cfg.maxMemMB) + " MB"; break;
+                    case ROW_THREAD: val = ""; break;   // 滑条行，不画文字值
+                    case ROW_SRC:    val = kSourceOpts[g_cfg.dlSource]; break;
+                    case ROW_WIN:    val = kWinOpts[g_cfg.winMode]; break;
+                    case ROW_ISO:    val = kIsoOpts[g_cfg.isoMode]; break;
+                    case ROW_JVM:     val = g_cfg.extraJvm.empty() ? "（未设置）" : g_cfg.extraJvm; break;
+                    case ROW_GAMEARG: val = g_cfg.extraGame.empty() ? "（未设置）" : g_cfg.extraGame; break;
+                    case ROW_CF:      val = g_cfg.cfProxy; break;
+                    case ROW_AUTHLIB: val = g_cfg.authlibPath.empty() ? "（未设置，点下方自动检测）" : g_cfg.authlibPath; break;
+                }
+            }
+
+            int valW = fw - ARROW_W - 16;
+            if (valW < 60) valW = 60;
+
+            std::string shown = val;
+            if (i == ROW_JAVA && !isEdit && !val.empty()) {
+                size_t sp = val.find_last_of("\\/");
+                if (sp != std::string::npos) {
+                    std::string dir = val.substr(0, sp);
+                    size_t sp2 = dir.find_last_of("\\/");
+                    if (sp2 != std::string::npos)
+                        shown = "…\\" + dir.substr(sp2 + 1) + "\\" + val.substr(sp + 1);
+                }
+            }
+            draw_text(fx + 10, ry, valW, 34, shown, vc, 13);
+
+            if (!jvArg.empty()) {
+                // Java 版本号画在字段框外右侧（不压箭头）
+                draw_text(fx + fw + 12, ry, 120, 34, "Java " + jvArg, clr_ok(), 12);
+            }
+
+            // 内存 / 线程行不画箭头（这两行是手动输入，没有下拉）
+            // 只有下拉行画箭头（内存/线程/文本参数/authlib 行不画）
+            bool hasArrow = (i == ROW_DIR || i == ROW_JAVA || i == ROW_SRC ||
+                             i == ROW_WIN || i == ROW_ISO);
+            if (hasArrow) {
+                int ax = fx + fw - ARROW_W - 4;
+                bool hotA = inRect(ax, ry + 2, ARROW_W, 30, Fl::event_x(), Fl::event_y());
+                fill_round_rect(ax, ry + 2, ARROW_W, 30, 5, hotA ? clr_card_sel() : clr_card());
+                arrowDown(ax + ARROW_W / 2, ry + 17, hotA ? clr_text() : clr_dim());
+            }
+            // ---------- 下载线程：滑动条 ----------
+            if (i == ROW_THREAD) drawSlider(fx, ry, fw);
+
+            // ---------- authlib 行：操作按钮 ----------
+            if (i == ROW_AUTHLIB) {
+                int bx2 = fx + fw + 12, by2 = ry + 5, bw2 = 92, bh2 = 24;
+                bool hot = inRect(bx2, by2, bw2, bh2, Fl::event_x(), Fl::event_y());
+                fill_round_rect(bx2, by2, bw2, bh2, 6, hot ? clr_accent() : clr_card_sel());
+                draw_text_center(bx2, by2, bw2, bh2, "自动检测", hot ? FL_WHITE : clr_ok(), 11);
+            }
+        }   // for ROW_COUNT
+        fl_pop_clip();   // 结束行区域裁剪
+        {
+            int ry = y() + rowY(ROW_MEM);
+            int rec = recommendedMem();
+            long long ram = totalRamMB();
+            // 推荐值提示
+            std::string tip = "推荐 " + std::to_string(rec) + " MB（本机 " +
+                              std::to_string(ram / 1024) + " GB）";
+            // 提示文字放在按钮右侧，避免和按钮重叠
+            draw_text(fx + fw + 102, ry + 5, 200, 24, tip, clr_dim(), 10);
+            // 一键设为推荐
+            int rb = fx + fw + 12;
+            int rby = ry + 5;
+            bool hotR = inRect(rb, rby, 84, 24, Fl::event_x(), Fl::event_y());
+            fill_round_rect(rb, rby, 84, 24, 6, hotR ? clr_accent() : clr_card_sel());
+            draw_text_center(rb, rby, 84, 24, "使用推荐", hotR ? FL_WHITE : clr_ok(), 11);
+        }
+        // 线程行提示：点一下可手动输入
+        {
+            int ry = y() + rowY(ROW_THREAD);
+            draw_text(fx + fw + 12, ry, 200, 34, "点一下可手动输入", clr_dim(), 10);
+        }
+
+        // 底部按钮
+        int by = y() + h() - 64;
+        drawBtn(x() + 30,  by, 130, 40, "自动检测", false);
+        drawBtn(x() + 176, by, 130, 40, "保存",     true);
+        drawBtn(x() + 322, by, 110, 40, "关于",     false);
+
+        if (!g_status.empty())
+            draw_text(x() + 456, by, w() - 480, 40, g_status, clr_dim(), 12);
+        drawDropdown();
+        drawPageScrollbar();
+        PageBase::draw();
+    }
+
+    void drawBtn(int bx, int by, int bw, int bh, const char* label, bool accent) {
+        bool hot = inRect(bx, by, bw, bh, Fl::event_x(), Fl::event_y());
+        fill_round_rect(bx, by, bw, bh, 8,
+                        accent ? (hot ? clr_accent() : clr_accent2())
+                               : (hot ? clr_card_sel() : clr_card()));
+        draw_text_center(bx, by, bw, bh, label, accent ? FL_WHITE : clr_text(), 14);
+    }
+
+    static void arrowDown(int cx, int cy, Fl_Color c) {
+        fl_color(c);
+        fl_begin_polygon();
+        fl_vertex(cx - 5, cy - 3);
+        fl_vertex(cx + 5, cy - 3);
+        fl_vertex(cx,     cy + 4);
+        fl_end_polygon();
+    }
+
+    /// 下载线程滑条
+    static const int SL_MIN = 1;
+    static const int SL_MAX = 256;
+
+    void sliderTrack(int fx, int fw, int& x0, int& x1) {
+        x0 = fx + 10;
+        x1 = fx + fw - 100;      // 右侧留出数字
+        if (x1 < x0 + 40) x1 = x0 + 40;
+    }
+
+    static void drawCircleC(int cx, int cy, int r, Fl_Color c) {
+        fl_color(c);
+        fl_pie(cx - r, cy - r, r * 2, r * 2, 0, 360);
+    }
+
+    void drawSlider(int fx, int ry, int fw) {
+        int x0, x1;
+        sliderTrack(fx, fw, x0, x1);
+        int cy = ry + 17;
+
+        fill_round_rect(x0, cy - 3, x1 - x0, 6, 3, clr_card());
+
+        int v = g_cfg.dlThreads;
+        if (v < SL_MIN) v = SL_MIN;
+        if (v > SL_MAX) v = SL_MAX;
+        float t = (float)(v - SL_MIN) / (float)(SL_MAX - SL_MIN);
+        int px = x0 + (int)((x1 - x0) * t + 0.5f);
+        if (px > x0) fill_round_rect(x0, cy - 3, px - x0, 6, 3, clr_accent2());
+
+        bool hot = inRect(px - 9, cy - 9, 18, 18, Fl::event_x(), Fl::event_y());
+        drawCircleC(px, cy, 9, hot ? clr_accent() : clr_accent2());
+        drawCircleC(px, cy, 5, clr_bg());
+
+        draw_text_right(x1 + 6, ry, 90, 34,
+                        std::to_string(g_cfg.dlThreads) + " 线程", clr_text(), 12);
+    }
+
+    void sliderFromX(int mx, int fx, int fw) {
+        int x0, x1;
+        sliderTrack(fx, fw, x0, x1);
+        if (mx < x0) mx = x0;
+        if (mx > x1) mx = x1;
+        float t = (float)(mx - x0) / (float)(x1 - x0);
+        int v = SL_MIN + (int)(t * (SL_MAX - SL_MIN) + 0.5f);
+        if (v < SL_MIN) v = SL_MIN;
+        if (v > SL_MAX) v = SL_MAX;
+        g_cfg.dlThreads = v;
+        SaveConfig();
+        redraw();
+    }
+
+    // 「使用推荐」按钮统一坐标（draw 和 handle 共用，窗口拉伸也不会点不到）
+    void recBtnRect(int& bx, int& by, int& bw, int& bh) const {
+        int fx, fw;
+        fieldRect(fx, fw);
+        bx = fx + fw + 12;
+        by = y() + rowY(ROW_MEM) + 2;
+        bw = 150;
+        bh = 30;
+    }
+
+    void dropGeom(int& fx, int& fw, int& ry, int& mh, int& visible) {
+        fieldRect(fx, fw);
+        int n = dropCount();
+        ry = y() + rowY(openDrop) + 37;
+        const int ih = 28;
+        visible = n > 8 ? 8 : n;
+        if (visible < 1) visible = 1;
+        mh = visible * ih + 8;
+        if (ry + mh > y() + h() - 70) ry = y() + h() - 70 - mh;
+        if (ry < y() + 60) ry = y() + 60;
+    }
+
+    void drawDropdown() {
+        if (openDrop < 0) return;
+
+        int fx, fw, ry, mh, visible;
+        dropGeom(fx, fw, ry, mh, visible);
+        int n = dropCount();
+        const int ih = 28;
+
+        fill_round_rect(fx, ry, fw, mh, 8, clr_card_sel());
+        stroke_round_rect(fx, ry, fw, mh, 8, clr_accent());
+
+        if (n == 0) {
+            draw_text(fx + 12, ry + 4, fw - 24, ih, "（没有检测到候选）", clr_dim(), 12);
+            return;
+        }
+
+        for (int k = 0; k < visible; ++k) {
+            int i = k + dropScroll;
+            if (i >= n) break;
+            int iy = ry + 4 + k * ih;
+
+            std::string txt, sub;
+            bool cur = false;
+            switch (openDrop) {
+                case ROW_DIR:  txt = dirCands[i].path; sub = dirCands[i].label;
+                               cur = (dirCands[i].path == g_cfg.gameDir); break;
+                case ROW_JAVA: txt = javaCands[i].path; sub = javaCands[i].label;
+                               cur = (javaCands[i].path == g_cfg.javaPath); break;
+                case ROW_SRC:  txt = kSourceOpts[i]; cur = (g_cfg.dlSource == i); break;
+                case ROW_WIN:  txt = kWinOpts[i];    cur = (g_cfg.winMode == i); break;
+                case ROW_ISO:  txt = kIsoOpts[i];    cur = (g_cfg.isoMode == i); break;
+            }
+
+            bool hot = inRect(fx + 2, iy, fw - 4, ih - 2, Fl::event_x(), Fl::event_y());
+            if (hot)        fill_round_rect(fx + 2, iy, fw - 4, ih - 2, 5, clr_accent2());
+            else if (cur)   fill_round_rect(fx + 2, iy, fw - 4, ih - 2, 5, clr_card());
+
+            Fl_Color tc = hot ? FL_WHITE : (cur ? clr_ok() : clr_text());
+
+            if (!sub.empty()) {
+                draw_text(fx + 12, iy, 96, ih - 2, sub, hot ? FL_WHITE : clr_ok(), 11);
+                draw_text(fx + 112, iy, fw - 124, ih - 2, txt, tc, 12);
+            } else {
+                draw_text(fx + 12, iy, fw - 24, ih - 2, txt, tc, 12);
+            }
+        }
+
+        if (n > visible) {
+            draw_text_right(fx, ry + mh - 14, fw - 10, 14,
+                            std::to_string(dropScroll + 1) + "-" +
+                            std::to_string(std::min(n, dropScroll + visible)) +
+                            "/" + std::to_string(n), clr_dim(), 10);
+        }
+    }
+
+    // ============ 事件 ============
+    int handle(int e) override {
+        // 统一滚动（内容超出窗口时）
+        if (handlePageWheel(e, Fl::event_dy())) return 1;
+        int mx = Fl::event_x(), my = Fl::event_y();
+        int fx, fw;
+        fieldRect(fx, fw);
+
+        if (draggingSlider) {
+            if (e == FL_DRAG || e == FL_MOVE) {
+                sliderFromX(mx, fx, fw);
+                return 1;
+            }
+            if (e == FL_RELEASE) {
+                draggingSlider = false;
+                SaveConfig();
+                redraw();
+                return 1;
+            }
+            // 新的 FL_PUSH 说明上一轮拖动已结束（可能丢了 RELEASE），清掉残留状态
+            if (e == FL_PUSH) { draggingSlider = false; }
+        }
+
+        // ---------- 数字输入中 ----------
+        if (editing >= 0) {
+            if (e == FL_KEYBOARD || e == FL_KEYUP) {
+                int k = Fl::event_key();
+                if (k == FL_Enter || k == FL_KP_Enter) { commitEdit(); return 1; }
+                if (k == FL_Escape) { editing = -1; editBuf.clear(); redraw(); return 1; }
+                if (k == FL_BackSpace) {
+                    if (!editBuf.empty()) editBuf.pop_back();
+                    redraw(); return 1;
+                }
+                if (k == FL_Delete) { editBuf.clear(); redraw(); return 1; }
+                const char* t = Fl::event_text();
+                if (t && *t) {
+                    for (const char* p = t; *p; ++p) {
+                        // 数字字段只收数字；文本参数收任意可打印字符
+                        if (editing >= 2) {
+                            if (*p >= 0x20 && *p < 0x7F && editBuf.size() < 200) editBuf += *p;
+                        } else {
+                            if (*p >= '0' && *p <= '9' && editBuf.size() < 6) editBuf += *p;
+                        }
+                    }
+                    redraw();
+                }
+                return 1;
+            }
+            if (e == FL_UNFOCUS) { commitEdit(); return 1; }
+            if (e == FL_PUSH) {
+                int ry = y() + rowY(ROW_MEM);
+                // 只认整行（不只是字段框），点到行外就提交
+                if (!inRect(x() + 30, ry, w() - 54, 34, mx, my)) { commitEdit(); }
+                else return 1;
+            }
+            if (e == FL_MOVE || e == FL_ENTER || e == FL_LEAVE) return 1;
+            return 1;
+        }
+
+        // ---------- 下拉展开中 ----------
+        if (openDrop >= 0) {
+            int fx2, fw2, ry, mh, visible;
+            dropGeom(fx2, fw2, ry, mh, visible);
+            int n = dropCount();
+            const int ih = 28;
+
+            if (e == FL_MOUSEWHEEL) {
+                dropScroll += Fl::event_dy();   // FLTK: 向下滚 dy>0
+                int maxS = n - visible;
+                if (maxS < 0) maxS = 0;
+                if (dropScroll < 0) dropScroll = 0;
+                if (dropScroll > maxS) dropScroll = maxS;
+                redraw();
+                return 1;
+            }
+            if (e == FL_PUSH && Fl::event_button() == FL_LEFT_MOUSE) {
+                if (mx >= fx2 && mx < fx2 + fw2 && my >= ry && my < ry + mh) {
+                    int k = (my - ry - 4) / ih;
+                    int i = k + dropScroll;
+                    if (i >= 0 && i < n) pickDrop(i);
+                    redraw();
+                    return 1;
+                }
+                // 点到下拉以外 → 关闭
+                openDrop = -1;
+                dropScroll = 0;
+                redraw();
+                return 1;
+            }
+            // 展开中其它事件一律吞掉，绝不让 FL_MOVE 掉到下面的行点击逻辑
+            return 1;
+        }
+
+        // ============================================================
+        //  只有 FL_PUSH 才允许改 openDrop / editing / draggingSlider
+        //  鼠标移动类事件只负责触发重绘（hover 高亮），不改任何状态
+        // ============================================================
+        if (e != FL_PUSH || Fl::event_button() != FL_LEFT_MOUSE) {
+            if (e == FL_MOVE || e == FL_ENTER || e == FL_LEAVE || e == FL_DRAG) {
+                redraw();     // 让 inRect(..Fl::event_x()) 重新算 hover
+                return 1;
+            }
+            return PageBase::handle(e);
+        }
+
+        // ---------- 整行可点（内存/线程行除外，它们是字段内）----------
+        {
+            int rowX = x() + 30;
+            int rowW = x() + w() - 24 - rowX;
+            if (rowW < 100) rowW = 100;
+
+            for (int i = 0; i < ROW_COUNT; ++i) {
+                int ry = y() + rowY(i);
+                // 行在可视区外就跳过（滚动后）
+                if (ry + 34 < y() + 66 || ry > y() + h() - 76) continue;
+
+                if (i == ROW_THREAD) {
+                    // 线程行：只认字段框（滑条区域），避免误触
+                    if (!inRect(fx, ry, fw, 34, mx, my)) continue;
+                    draggingSlider = true;
+                    sliderFromX(mx, fx, fw);
+                    return 1;
+                }
+                if (i == ROW_MEM) {
+                    if (!inRect(fx, ry, fw, 34, mx, my)) continue;
+                    editing = 0;
+                    editBuf = std::to_string(g_cfg.maxMemMB);
+                    take_focus();
+                    if (Fl::focus() != this) Fl::focus(this);
+                    redraw();
+                    return 1;
+                }
+
+                // 额外参数行：点字段框进入文本编辑
+                if (i == ROW_JVM || i == ROW_GAMEARG || i == ROW_CF) {
+                    if (!inRect(fx, ry, fw, 34, mx, my)) continue;
+                    editing = (i == ROW_JVM) ? 2 : (i == ROW_GAMEARG) ? 3 : 4;
+                    editBuf = (i == ROW_JVM)      ? g_cfg.extraJvm
+                            : (i == ROW_GAMEARG)  ? g_cfg.extraGame
+                                                  : g_cfg.cfProxy;
+                    take_focus();
+                    if (Fl::focus() != this) Fl::focus(this);
+                    redraw();
+                    return 1;
+                }
+
+                // authlib 行：只有右侧按钮生效
+                if (i == ROW_AUTHLIB) {
+                    int bx2 = fx + fw + 12, by2 = ry + 5, bw2 = 92, bh2 = 24;
+                    if (inRect(bx2, by2, bw2, bh2, mx, my)) {
+                        g_cfg.authlibPath = DetectAuthlib();
+                        if (g_cfg.authlibPath.empty()) g_cfg.authlibPath = ExtractEmbeddedAuthlib();
+                        if (!g_cfg.authlibPath.empty()) {
+                            SaveConfig();
+                            g_status = L"已找到 authlib-injector";
+                        } else {
+                            g_status = L"没有找到 authlib-injector.jar";
+                        }
+                        redraw();
+                        return 1;
+                    }
+                    continue;
+                }
+
+                // 其余行：整行可点（下拉）
+                if (!inRect(rowX, ry, rowW, 34, mx, my)) continue;
+
+                if (i == ROW_DIR && dirCands.empty()) { RefreshDirCands(); dirCands = g_dirCands; }
+                if (i == ROW_JAVA && javaCands.empty()) { RefreshJavaCands(); javaCands = g_javaCands; }
+                openDrop = i;
+                dropScroll = 0;
+                redraw();
+                return 1;
+            }
+        }
+
+        // ---------- 底部按钮（同样只能 FL_PUSH 触发）----------
+        int by = y() + h() - 64;
+        if (inRect(x() + 30, by, 130, 40, mx, my)) {
+            std::string d = DetectGameDir();
+            if (d.empty()) {
+                g_status = L"没有找到 .minecraft 目录";
+            } else {
+                SetGameDir(d);
+                reload();
+                jvFor_.clear();
+                g_status = L"已检测到游戏目录";
+            }
+            redraw();
+            return 1;
+        }
+        if (inRect(x() + 176, by, 130, 40, mx, my)) {
+            SaveConfig();
+            g_status = L"设置已保存";
+            redraw();
+            return 1;
+        }
+        {
+            int rb, rby, rbw, rbh;
+            recBtnRect(rb, rby, rbw, rbh);
+            if (inRect(rb, rby, rbw, rbh, mx, my)) {
+                int rec = recommendedMem();
+                g_cfg.maxMemMB = rec;
+                SaveConfig();
+                g_status = L"已设为推荐内存 " + std::to_wstring(rec) + L" MB";
+                redraw();
+                return 1;
+            }
+        }
+        if (inRect(x() + 322, by, 110, 40, mx, my)) {
+            showAbout();
+            return 1;
+        }
+        return 1;
+    }
+    void commitEdit() {
+        if (editing < 0) return;
+
+        if (editing == 2) {              // 额外 JVM 参数（字符串）
+            g_cfg.extraJvm = editBuf;
+            g_status = L"额外 JVM 参数已保存";
+        } else if (editing == 3) {       // 额外游戏参数
+            g_cfg.extraGame = editBuf;
+            g_status = L"额外游戏参数已保存";
+        } else if (editing == 4) {       // CF 中转站
+            if (!editBuf.empty()) g_cfg.cfProxy = editBuf;
+            g_status = L"CurseForge 中转站已保存";
+        } else {
+            int v = editBuf.empty() ? 0 : std::atoi(editBuf.c_str());
+            if (editing == 0) {
+                if (v > 0) g_cfg.maxMemMB = v;
+            } else {
+                if (v >= 1 && v <= 256) g_cfg.dlThreads = v;
+                else if (v < 1) g_cfg.dlThreads = 1;
+                else g_cfg.dlThreads = 256;
+            }
+        }
+        SaveConfig();
+        editing = -1;
+        editBuf.clear();
+        redraw();
+    }
+
+    void pickDrop(int i) {
+        switch (openDrop) {
+            case ROW_DIR:
+                if (i < (int)dirCands.size()) {
+                    SetGameDir(dirCands[i].path);
+                    jvFor_.clear();
+                    g_status = L"游戏目录已切换";
+                }
+                break;
+            case ROW_JAVA:
+                if (i < (int)javaCands.size()) {
+                    g_cfg.javaPath = javaCands[i].path;
+                    jvFor_.clear();
+                    SaveConfig();
+                    g_status = L"Java 已切换";
+                }
+                break;
+            case ROW_SRC:
+                g_cfg.dlSource = i;
+                SaveConfig();
+                g_status = std::wstring(L"下载源：") + U8ToW(kSourceOpts[i]);
+                break;
+            case ROW_WIN:
+                g_cfg.winMode = i;
+                SaveConfig();
+                g_status = std::wstring(L"窗口模式：") + U8ToW(kWinOpts[i]);
+                break;
+            case ROW_ISO:
+                g_cfg.isoMode = i;
+                SaveConfig();
+                g_status = std::wstring(L"版本隔离：") + U8ToW(kIsoOpts[i]);
+                break;
+        }
+        openDrop = -1;
+        dropScroll = 0;
+        redraw();
+    }
+};
+
+const char* PageSettings::kSourceOpts[3] = { "自动", "仅官方", "仅 BMCLAPI" };
+const char* PageSettings::kWinOpts[3]    = { "窗口", "最大化", "全屏" };
+const char* PageSettings::kIsoOpts[3]    = { "隔离所有实例", "仅模组实例", "不隔离" };
+PageSettings* PageSettings::active = nullptr;
+
+// ============================ 关于页 ============================
+class PageAbout : public PageBase {
+public:
+    RoundButton* btnBack  = nullptr;
+    RoundButton* btnCheck = nullptr;
+
+    PageAbout(int W, int H) : PageBase(W, H) {
+        btnBack = new RoundButton(0, 0, 120, 40, "返回设置");
+        btnBack->callback([](Fl_Widget*, void*) { backFromAbout(); });
+        addTo(this, btnBack, 30, H - 60);
+
+        btnCheck = new RoundButton(0, 0, 130, 40, "检查更新");
+        btnCheck->callback([](Fl_Widget*, void* d) {
+            auto* self = (PageAbout*)d;
+            // 已有新版本 → 直接下载；否则先检查
+            if (g_updateState.load() == 2 && !g_newUrl.empty()) {
+                g_status = L"正在下载新版本…";
+                self->redraw();
+                std::thread([]() { StartUpdate(); }).detach();
+                return;
+            }
+            if (g_updateState.load() == 1) return;      // 正在检查
+            g_updateState = 1;
+            g_status = L"正在检查更新…";
+            self->redraw();
+            std::thread([]() { UpdateThread(true); }).detach();
+        }, this);
+        addTo(this, btnCheck, W - 170, H - 60);
+        end();
+    }
+
+    void resize(int X, int Y, int W, int H) override {
+        PageBase::resize(X, Y, W, H);
+        if (btnBack)  btnBack->resize(X + 30, Y + H - 60, 120, 40);
+        if (btnCheck) btnCheck->resize(X + W - 170, Y + H - 60, 130, 40);
+    }
+
+    // 链接区域（用于点击判定）
+    void linkRect(int& lx, int& ly, int& lw, int& lh) const {
+        lx = x() + 40;
+        ly = y() + 396;
+        lw = 420;
+        lh = 26;
+    }
+
+    void draw() override {
+        fill_round_rect(x(), y(), w(), h(), 0, clr_bg());
+
+        int cx = x() + 40, cy = y() + 30;
+        fill_round_rect(cx, cy, 72, 72, 14, clr_accent2());
+        draw_text_center(cx, cy, 72, 72, "RL", FL_WHITE, 24);
+
+        draw_text(cx + 90, cy + 2, 480, 34, "ReignLaunch", clr_text(), 22);
+        draw_text(cx + 90, cy + 40, 480, 24, "Minecraft 启动器", clr_dim(), 14);
+
+        // ---------- 基本信息 ----------
+        int ly = y() + 130;
+        struct KV { const char* k; std::string v; };
+        KV rows[] = {
+            { "版本",     APP_VER_STR },
+            { "制作人",   "ShadowForgekin" },
+            { "游戏目录", g_cfg.gameDir },
+        };
+        for (auto& r : rows) {
+            draw_text(cx, ly, 100, 26, r.k, clr_dim(), 13);
+            draw_text(cx + 110, ly, w() - 200, 26, r.v, clr_text(), 13);
+            ly += 34;
+        }
+
+        draw_text(cx, ly + 14, w() - 120, 22, "从零自制的 Minecraft 启动器。", clr_dim(), 12);
+        draw_text(cx, ly + 38, w() - 120, 22, "支持多账户、加载器安装、Java 自动匹配。", clr_dim(), 12);
+
+        // ---------- 开源地址（可点击） ----------
+        int lx, lkY, lw, lh;
+        linkRect(lx, lkY, lw, lh);
+        draw_text(cx, lkY - 30, 200, 22, "开源地址", clr_dim(), 12);
+
+        bool hotLink = inRect(lx, lkY, lw, lh, Fl::event_x(), Fl::event_y());
+        draw_text(lx, lkY, lw, lh,
+                  "https://github.com/ShadowForgekin/ReignLaunch",
+                  hotLink ? clr_accent() : clr_accent2(), 13);
+        if (hotLink) {
+            // 悬停时画下划线
+            fl_color(clr_accent());
+            fl_line(lx, lkY + 22, lx + 340, lkY + 22);
+        }
+
+        // ---------- 特别鸣谢 ----------
+        int ty = lkY + 42;
+        draw_text(cx, ty, 200, 22, "特别鸣谢", clr_dim(), 12);
+        draw_text(cx, ty + 24, w() - 80, 20,
+                  "Powered by FLTK 1.4.5 · miniz 3.1.2 · nlohmann/json 3.12.0",
+                  clr_dim(), 11);
+        draw_text(cx, ty + 48, w() - 80, 20,
+                  "数据源 MCIM · BMCLAPI · Modrinth · CurseForge",
+                  clr_dim(), 11);
+
+        // ---------- 更新状态 ----------
+        {
+            int st = g_updateState.load();
+            std::string msg;
+            Fl_Color mc = clr_dim();
+            switch (st) {
+                case 1: msg = "正在检查更新…"; break;
+                case 2:
+                    msg = "发现新版本 " + WToU8(g_newTag) + "，点「检查更新」下载";
+                    mc = clr_ok();
+                    break;
+                case 3: msg = std::string("已是最新版本 (") + APP_VER_STR + ")"; mc = clr_ok(); break;
+                case 4: msg = "检查失败（网络问题或未发布 Release）"; mc = clr_err(); break;
+                default: break;
+            }
+            if (!msg.empty())
+                draw_text(cx, y() + h() - 96, w() - 240, 24, msg, mc, 12);
+        }
+
+        if (!g_status.empty())
+            draw_text(cx, y() + h() - 36, w() - 200, 22, g_status, clr_dim(), 12);
+
+        PageBase::draw();
+    }
+
+    int handle(int e) override {
+        // 先给子控件（按钮）
+        if (e == FL_PUSH || e == FL_RELEASE || e == FL_MOVE || e == FL_ENTER || e == FL_LEAVE) {
+            if (PageBase::handle(e)) return 1;
+        }
+
+        int mx = Fl::event_x(), my = Fl::event_y();
+
+        if (e == FL_PUSH && Fl::event_button() == FL_LEFT_MOUSE) {
+            int lx, ly, lw, lh;
+            linkRect(lx, ly, lw, lh);
+            if (inRect(lx, ly, lw, lh, mx, my)) {
+                // 打开 GitHub 页面
+                ShellExecuteW(nullptr, L"open",
+                              L"https://github.com/ShadowForgekin/ReignLaunch",
+                              nullptr, nullptr, SW_SHOWNORMAL);
+                g_status = L"已在浏览器中打开项目主页";
+                redraw();
+                return 1;
+            }
+            return 1;
+        }
+
+        if (e == FL_MOVE || e == FL_ENTER || e == FL_LEAVE) { redraw(); return 1; }
+        return PageBase::handle(e);
+    }
+
+    static bool inRect(int rx, int ry, int rw, int rh, int mx, int my) {
+        return mx >= rx && mx < rx + rw && my >= ry && my < ry + rh;
+    }
+};
+
+// ============================ 主窗口 ============================
+static PageLaunch*   pageLaunch   = nullptr;
+static PageDownload* pageDownload = nullptr;
+static PageInstance* pageInstance = nullptr;
+static PageUser*     pageUser     = nullptr;
+static PageSettings* pageSettings = nullptr;
+
+// ============================ 全局事件过滤器 ============================
+// FLTK 的 Fl_Group 会先把事件分派给子控件，
+// 启动页左侧导航栏没有对应子控件，所以要在这里拦截。
+static PageLaunch* g_pageLaunchPtr = nullptr;
+
+static int global_handler(int e) {
+    if (g_pageLaunchPtr && (e == FL_PUSH || e == FL_RELEASE || e == FL_MOVE)) {
+        int mx = Fl::event_x(), my = Fl::event_y();
+        Fl_Widget* pw = Fl::belowmouse();
+        // 只有当鼠标在启动页区域、且没被其它控件处理时才转给启动页
+        if (g_curPage == P_LAUNCH && pw == (Fl_Widget*)g_pageLaunchPtr) {
+            if (g_pageLaunchPtr->handle(e)) return 1;
+        }
+    }
+    if (g_pageLaunchPtr && e == FL_PUSH) {
+        int mx = Fl::event_x(), my = Fl::event_y();
+        if (g_curPage == P_LAUNCH &&
+            mx >= g_pageLaunchPtr->x() && mx < g_pageLaunchPtr->x() + LP_SIDEBAR) {
+            if (g_pageLaunchPtr->handle(e)) return 1;
+        }
     }
     return 0;
+}
+
+static bool g_rebuildPending = false;
+static void ui_tick(void*) {
+    // ★ 后台搜索/拉版本完成后，通知 UI 刷新（不用手动点）
+    static int lastModState = -1, lastModVerState = -1;
+    int ms = g_modState.load(), mvs = g_modVerState.load();
+    if (ms != lastModState || mvs != lastModVerState) {
+        lastModState = ms;
+        lastModVerState = mvs;
+        if (g_curPage == P_DOWNLOAD && pageDownload) pageDownload->redraw();
+    }
+
+    // ★ 更新检查完成后刷新关于页
+    static int lastUpdState = -1;
+    int us = g_updateState.load();
+    if (us != lastUpdState) {
+        lastUpdState = us;
+        if (g_curPage == P_SETTINGS && g_aboutPage) g_aboutPage->redraw();
+        if (us == 2) g_status = L"发现新版本 " + g_newTag + L"，点「检查更新」下载";
+        else if (us == 3) g_status = L"已是最新版本";
+        else if (us == 4) g_status = L"更新检查失败（网络问题）";
+    }
+
+    Fl::repeat_timeout(0.15, ui_tick, nullptr);
+}
+
+int main(int argc, char** argv) {
+    // 预初始化 C++ locale（MinGW 下工作线程首次构造 locale 会崩溃）
+    try { std::locale::classic(); (void)std::locale(); } catch (...) {}
+    // ---- 初始化 core ----
+    wchar_t appdata[MAX_PATH] = { 0 };
+    SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, appdata);
+    g_dataDir = WToU8((fs::path(appdata) / L"ReignLaunch").wstring());
+    g_cfgPath = WToU8((fs::path(appdata) / L"ReignLaunch" / L"config.json").wstring());
+    LoadConfig();
+    ReloadVersions();
+    g_hwnd = nullptr;
+
+    // ---- 界面 ----
+    apply_theme();
+
+    const int W = 1060, H = 680, HEADER_H = 66;
+
+    g_win = new Fl_Double_Window(W, H, "ReignLaunch - Minecraft 启动器");
+    g_win->color(clr_bg());
+    g_win->size_range(900, 600);
+    g_win->begin();
+
+    Fl_Box* headerBg = new Fl_Box(0, 0, W, HEADER_H);
+    headerBg->box(FL_FLAT_BOX);
+    headerBg->color(clr_header());
+
+    Fl_Box* logo = new Fl_Box(24, 0, 200, HEADER_H, "ReignLaunch");
+    logo->labelfont(FL_HELVETICA_BOLD);
+    logo->labelsize(20);
+    logo->labelcolor(clr_text());
+    logo->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+
+    int tx = 220;
+    for (int i = 0; i < P_COUNT; ++i) {
+        new TabButton(tx, 17, 86, 32, kTabNames[i], i);
+        tx += 92;
+    }
+
+    const int CH = H - HEADER_H;
+
+    pageLaunch   = new PageLaunch(W, CH);
+    pageDownload = new PageDownload(W, CH);
+    (void)0;   // 实例页已并入启动页左侧列表
+    pageUser     = new PageUser(W, CH);
+    pageSettings = new PageSettings(W, CH);
+    PageSettings::active = pageSettings;
+    g_resetSettings = []() { PageSettings::active->resetState(); };
+    PageAbout* pageAbout = new PageAbout(W, CH);
+
+    g_pages[P_LAUNCH]   = pageLaunch;
+    g_pages[P_DOWNLOAD] = pageDownload;
+
+    g_pages[P_USER]     = pageUser;
+    g_pages[P_SETTINGS] = pageSettings;
+    g_aboutPage         = pageAbout;
+
+    for (int i = 0; i < P_COUNT; ++i) {
+        g_pages[i]->position(0, HEADER_H);
+        g_pages[i]->size(W, CH);
+        setPageVisible(g_pages[i], false);
+    }
+    pageAbout->position(0, HEADER_H);
+    pageAbout->size(W, CH);
+    setPageVisible(pageAbout, false);
+
+    // 浮层（最后创建，保证在最上层）
+    // 浮层（最后创建，保证在最上层）
+    g_overlay = new Overlay(0, HEADER_H, W, CH);
+    g_overlay->onCancel = []() {
+        g_cancelLaunch = true;
+        g_status = L"已取消";
+        if (g_overlay) g_overlay->hide();
+        g_launching = false;
+    };
+    g_overlay->onClose = []() {
+        if (g_overlay) g_overlay->hide();
+    };
+    g_overlay->hide();
+    g_win->show(argc, argv);
+    // 设置窗口图标（任务栏 + 标题栏），图标资源 ID 100 来自 res.rc
+    if (HWND hwndMain = (HWND)fl_xid(g_win)) {
+        HICON hi = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(100));
+        if (!hi) hi = LoadIconW(nullptr, (LPCWSTR)IDI_APPLICATION);
+        if (hi) {
+            SendMessageW(hwndMain, WM_SETICON, ICON_BIG,   (LPARAM)hi);
+            SendMessageW(hwndMain, WM_SETICON, ICON_SMALL, (LPARAM)hi);
+        }
+    }
+
+    // 启动时就异步拉版本清单（修复「下载页一打开是空的」）
+    // 清单拉取放在 UI 线程（工作线程里 JSON 解析会导致 locale 崩溃）
+    // 用定时器延迟，先让窗口画出来
+    Fl::add_timeout(0.5, [](void*) { FetchManifestThread(); });
+
+    doSwitch(P_LAUNCH);
+    g_win->redraw();
+
+    g_pageLaunchPtr = pageLaunch;
+
+    Fl::add_handler(PageSettings::globalHook);   // 滑条拖动（绕过控件内派发）
+    Fl::add_timeout(0.15, ui_tick);
+    int rc = Fl::run();
+    return rc;
 }

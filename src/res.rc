@@ -1,2 +1,52 @@
+#pragma code_page(65001)
+#include <winver.h>
+
 100 ICON "reign.ico"
 101 RCDATA "authlib-injector.jar"
+
+1 VERSIONINFO
+FILEVERSION     1,3,0,0
+PRODUCTVERSION  1,3,0,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        /* 0804 = 简体中文, 04B0 = Unicode */
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName",      "加纳Brightchaserove"
+            VALUE "FileDescription",  "ReignLaunch 1.3.0 RC 1 — 轻量级 Minecraft 启动器"
+            VALUE "FileVersion",      "1.3.0.0"
+            VALUE "InternalName",     "ReignLaunch"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 加纳Brightchaserove. MIT License."
+            VALUE "LegalTrademarks",  "ReignLaunch"
+            VALUE "OriginalFilename", "ReignLaunch.exe"
+            VALUE "ProductName",      "ReignLaunch"
+            VALUE "ProductVersion",   "1.3.0.0"
+            VALUE "Comments",         "C++17 + Win32 手写的 Minecraft 启动器"
+        END
+        /* 0409 = 英文（美国），给非中文系统一个可读的兜底 */
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Brightchaserove"
+            VALUE "FileDescription",  "ReignLaunch - Lightweight Minecraft Launcher"
+            VALUE "FileVersion",      "1.3.0.0"
+            VALUE "InternalName",     "ReignLaunch"
+            VALUE "LegalCopyright",   "Copyright (C) 2026 Brightchaserove. MIT License."
+            VALUE "LegalTrademarks",  "ReignLaunch"
+            VALUE "OriginalFilename", "ReignLaunch.exe"
+            VALUE "ProductName",      "ReignLaunch"
+            VALUE "ProductVersion",   "1.3.0.0"
+            VALUE "Comments",         "Minecraft launcher written in C++17 + Win32"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        /* 0x0804 = 简体中文 */
+        VALUE "Translation", 0x0804, 1200
+    END
+END
