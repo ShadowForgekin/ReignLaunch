@@ -5254,12 +5254,14 @@ public:
         bool verTab = (dlTab == 0);
         bool showInstall = (verTab && detailIdx >= 0);
 
-        search->hidden_ = !verTab;
-        modSearch->hidden_ = verTab;
+        // 版本详情页也要隐藏搜索框（否则盖住「返回」按钮）
+        bool verList = (verTab && detailIdx < 0 && modDetail < 0);
+        search->hidden_ = !verList;
+        modSearch->hidden_ = !(verTab == false && modDetail < 0);
         btnInstall->hidden_ = !showInstall;
 
         // 版本页搜索框：右上角（筛选框左边留空，不重叠）
-        if (verTab) {
+        if (verList) {
             search->resize(x() + w() - 250, y() + TOOLBAR_Y, 230, 32);
             modSearch->resize(-9999, -9999, 240, 32);
         } else {
@@ -6065,6 +6067,8 @@ public:
         }
 
         // ---------- 下载按钮 ----------
+        // 版本列表后台加载完成后，默认选中第一个（否则按钮一直是灰的）
+        if (modVerSel < 0 && !g_modVerNames.empty()) modVerSel = 0;
         int dbx = x() + w() - 170, dby = y() + h() - 60, dbw = 150, dbh = 42;
         bool canDl = (modVerSel >= 0 && modVerSel < (int)g_modVerFiles.size());
         bool hotD = canDl && inRect(dbx, dby, dbw, dbh, Fl::event_x(), Fl::event_y());
@@ -7601,6 +7605,38 @@ static PageInstance* pageInstance = nullptr;
 static PageUser*     pageUser     = nullptr;
 static PageSettings* pageSettings = nullptr;
 
+// ============================ 自适应布局 ============================
+// 窗口最大化/拉伸时，把所有页面、浮层、标题栏都重新铺满
+static Fl_Box*    g_headerBg = nullptr;
+static const int  HDR_H = 66;
+
+static void layoutAll(int W, int H) {
+    if (W < 800) W = 800;
+    if (H < 500) H = 500;
+    if (g_headerBg) g_headerBg->resize(0, 0, W, HDR_H);
+
+    int CH = H - HDR_H;
+    if (CH < 100) CH = 100;
+
+    for (int i = 0; i < P_COUNT; ++i) {
+        if (!g_pages[i]) continue;
+        g_pages[i]->resize(0, HDR_H, W, CH);   // 虚函数，触发各页自己的重排
+    }
+    if (g_aboutPage) g_aboutPage->resize(0, HDR_H, W, CH);
+    if (g_overlay)   g_overlay->resize(0, HDR_H, W, CH);
+    if (g_win)       g_win->redraw();
+}
+
+// 自定义窗口：resize 时重新布局
+class MainWindow : public Fl_Double_Window {
+public:
+    MainWindow(int W, int H, const char* t) : Fl_Double_Window(W, H, t) {}
+    void resize(int X, int Y, int W, int H) override {
+        Fl_Double_Window::resize(X, Y, W, H);
+        layoutAll(W, H);
+    }
+};
+
 // ============================ 全局事件过滤器 ============================
 // FLTK 的 Fl_Group 会先把事件分派给子控件，
 // 启动页左侧导航栏没有对应子控件，所以要在这里拦截。
@@ -7667,14 +7703,14 @@ int main(int argc, char** argv) {
 
     const int W = 1060, H = 680, HEADER_H = 66;
 
-    g_win = new Fl_Double_Window(W, H, "ReignLaunch - Minecraft 启动器");
+    g_win = new MainWindow(W, H, "ReignLaunch - Minecraft 启动器");
     g_win->color(clr_bg());
     g_win->size_range(900, 600);
     g_win->begin();
 
-    Fl_Box* headerBg = new Fl_Box(0, 0, W, HEADER_H);
-    headerBg->box(FL_FLAT_BOX);
-    headerBg->color(clr_header());
+    g_headerBg = new Fl_Box(0, 0, W, HEADER_H);
+    g_headerBg->box(FL_FLAT_BOX);
+    g_headerBg->color(clr_header());
 
     Fl_Box* logo = new Fl_Box(24, 0, 200, HEADER_H, "ReignLaunch");
     logo->labelfont(FL_HELVETICA_BOLD);
